@@ -22,7 +22,7 @@
  *
  * The export sets of all fifteen modules were enumerated with the TypeScript
  * compiler API (`checker.getExportsOfModule`) rather than by reading them, and
- * diffed for duplicate names. Across the 794 module-level exports counted at
+ * diffed for duplicate names. Across the 807 module-level exports counted at
  * the time of writing there is exactly **one** collision, and it is a genuine
  * difference of meaning rather than an accident: `intake.ts` and `referral.ts`
  * both declare `MAX_REFERRAL_CODE_LENGTH`.
@@ -106,6 +106,32 @@
  * fail if a hoisted name stops being published from *here*, and they pin the
  * values, so they fail if a future edit re-declares one of them somewhere else
  * with a different number.
+ *
+ * ## Names that arrived in MCV-030
+ *
+ * `referral.ts` gained the standing-programme schemas —
+ * `referralProgramKeySchema`, `referralProgramReadSchema`,
+ * `referralProgramUpsertSchema`, their inferred types, and the two constants
+ * `REFERRAL_PROGRAM_KEY` and `MAX_PROGRAM_EXPIRY_DAYS` — together with the
+ * anti-abuse pair `normalizeEmailIdentity` / `sharesEmailIdentity`.
+ *
+ * They reach this barrel through `export * from './referral'` and needed no
+ * edit here to do so; the export surface was enumerated with
+ * `checker.getExportsOfModule` after the pass and all of them were present.
+ * What the assertions at the foot of this file add is what they add for every
+ * other guarded name: they are read off `Barrel`, so they fail if one of these
+ * ever becomes *ambiguous* — a second starred module declaring the same name
+ * makes it inaccessible through here rather than picking a winner — and they
+ * fail if the star form is ever narrowed back to an enumerated list that
+ * forgets one. What they cannot see is the name being deleted from
+ * `referral.ts` outright, and they are not asked to: that breaks
+ * `apps/web/src/server/actions/referral-program.ts` at its import, loudly, in
+ * the same build.
+ *
+ * These are guarded rather than left to the star export alone because they are
+ * the schemas standing in front of the money a client-minted invitation is
+ * worth. A reward figure that stops being validated is not a compile error
+ * anywhere; it is a payload the action would have accepted.
  *
  * `verbatimModuleSyntax` is on, so type-only re-exports use `export type`.
  */
@@ -296,5 +322,64 @@ export type _BarrelPublishesUserActivation = Assert<
 export type _BarrelPublishesSelfDeactivationGuard = Assert<
   typeof Barrel.isSelfDeactivation extends typeof UserModule.isSelfDeactivation
     ? true
+    : false
+>
+
+// =============================================================================
+// Compile-time guard on the MCV-030 programme surface
+//
+// Same technique again, third failure mode: a name that is new rather than
+// contended or moved. `export * from './referral'` already publishes all of
+// these — see the MCV-030 section of the docblock for what these lines do and
+// do not catch — and each one is compared against `ReferralModule`'s own
+// declaration rather than against a structural shape, so publishing a
+// *different* schema of the same name fails here too.
+// =============================================================================
+
+/** The singleton key every present-day caller relies on defaulting to. */
+export type _BarrelProgramKeyIsDefault = Assert<
+  typeof Barrel.REFERRAL_PROGRAM_KEY extends 'default' ? true : false
+>
+
+/** Ten years, in days. The ceiling on `ReferralProgram.defaultExpiryDays`. */
+export type _BarrelProgramExpiryDaysIsTenYears = Assert<
+  typeof Barrel.MAX_PROGRAM_EXPIRY_DAYS extends 3_650 ? true : false
+>
+
+export type _BarrelPublishesProgramKeySchema = Assert<
+  typeof Barrel.referralProgramKeySchema extends typeof ReferralModule.referralProgramKeySchema
+    ? true
+    : false
+>
+
+export type _BarrelPublishesProgramReadSchema = Assert<
+  typeof Barrel.referralProgramReadSchema extends typeof ReferralModule.referralProgramReadSchema
+    ? true
+    : false
+>
+
+/**
+ * The one that matters most: this is the schema in front of the figures a
+ * client-minted invitation copies. `updateReferralProgram` is the only writer
+ * of that row, and this is the only thing standing between its payload and it.
+ */
+export type _BarrelPublishesProgramUpsertSchema = Assert<
+  typeof Barrel.referralProgramUpsertSchema extends typeof ReferralModule.referralProgramUpsertSchema
+    ? true
+    : false
+>
+
+/**
+ * The self-referral deterrent. `redeemReferralCode` is its only caller today,
+ * and a `sharesEmailIdentity` that quietly stopped being published would fail
+ * that import rather than this line — but a *second* declaration of the name in
+ * another starred module would make the barrel's copy ambiguous, and that is
+ * the direction this covers.
+ */
+export type _BarrelPublishesEmailIdentityHelpers = Assert<
+  typeof Barrel.normalizeEmailIdentity extends typeof ReferralModule.normalizeEmailIdentity
+    ? typeof Barrel.sharesEmailIdentity extends typeof ReferralModule.sharesEmailIdentity
+      ? true
+      : false
     : false
 >

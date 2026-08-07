@@ -10,7 +10,9 @@
     "lint": "eslint .",
     "typecheck": "tsc --noEmit",
     "test": "node --experimental-strip-types --disable-warning=ExperimentalWarning --import ./scripts/register.mjs --test \"src/**/*.test.ts\"",
-    "verify": "pnpm run test",
+    "verify:referral": "node --experimental-strip-types --disable-warning=ExperimentalWarning --import ./scripts/stub-register.mjs ./scripts/verify-referral-privilege.ts",
+    "verify:superadmin": "node --experimental-strip-types --disable-warning=ExperimentalWarning --import ./scripts/race-register.mjs ./scripts/verify-superadmin-race.ts",
+    "verify": "pnpm run test && pnpm run verify:referral",
     "db:generate": "turbo run db:generate --filter=@mannachef/db"
   },
   "dependencies": {

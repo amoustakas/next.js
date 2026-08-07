@@ -149,9 +149,13 @@ across ~140 object schemas, ~6,400 pairs, a few seconds end to end.
 The summary line names the four numbers worth watching:
 
 ```text
-schemas: 298   object schemas: 138   fields: 1161   field pairs: 6375 (103 declared cross-field)
-cases: 18302   rejection assertions: 8456   throws: 0   failures: 0
+schemas: 305   object schemas: 143   fields: 1198   field pairs: 6519 (103 declared cross-field)
+cases: 18728   rejection assertions: 8672   throws: 0   failures: 0
 ```
+
+(The figures above are a real run, taken after MCV-030 added the standing
+referral programme's three schemas. They are a measurement and they move; what
+matters is the direction they move in.)
 
 `cases` counts every `safeParse` the run performed, including the small probes
 that choose each field's hostile value — those go through the same recorder, so

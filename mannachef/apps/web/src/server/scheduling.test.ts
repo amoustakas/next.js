@@ -41,6 +41,7 @@ import {
   findConflicts,
   isWithinAvailability,
   MAX_EXPANSION_DAYS,
+  MAX_TRAVEL_BUFFER_MINUTES,
   occupiedInterval,
   resolveWallClock,
   suggestAlternatives,
@@ -276,6 +277,37 @@ describe('resolveWallClock', () => {
     assert.equal(resolved.instant.toISOString(), '2024-03-10T07:30:00.000Z')
   })
 
+  it('shifts BY the width of the gap rather than clamping to its far edge', () => {
+    // The two are only the same thing for a bound sitting exactly on the near
+    // edge. 02:00 shifted forward by the missing hour happens to land on the
+    // far edge, 03:00 EDT. 02:30 is half an hour into the gap, so the same
+    // shift lands half an hour PAST that edge, at 03:30 EDT. A clamp would have
+    // collapsed both onto 07:00Z, and a `02:30–04:00` rule would then have
+    // yielded an hour of availability the chef does not have.
+    const nearEdge = resolveWallClock(
+      { year: 2024, month: 3, day: 10 },
+      2 * 60,
+      TORONTO
+    )
+    const insideTheGap = resolveWallClock(
+      { year: 2024, month: 3, day: 10 },
+      2 * 60 + 30,
+      TORONTO
+    )
+
+    assert.equal(nearEdge.disambiguation, 'GAP_SHIFTED_FORWARD')
+    assert.equal(nearEdge.instant.toISOString(), '2024-03-10T07:00:00.000Z')
+
+    assert.equal(insideTheGap.disambiguation, 'GAP_SHIFTED_FORWARD')
+    assert.equal(insideTheGap.instant.toISOString(), '2024-03-10T07:30:00.000Z')
+
+    assert.equal(
+      insideTheGap.instant.getTime() - nearEdge.instant.getTime(),
+      HOUR / 2,
+      'the half hour between the two bounds survives the transition'
+    )
+  })
+
   it('resolves a repeated wall clock to the first (pre-transition) occurrence', () => {
     // 01:30 on 2024-11-03 happened twice: once as EDT, once as EST.
     const resolved = resolveWallClock(
@@ -411,6 +443,36 @@ describe('expandAvailability', () => {
     )
 
     assert.deepEqual(windows, [])
+  })
+
+  it('produces thirty minutes, not sixty, for 02:30–04:00 on the spring-forward day', () => {
+    const windows = expandAvailability(
+      // Sunday 02:30–04:00 local. 02:30 never happened, and the bound is
+      // shifted forward BY the missing hour rather than clamped to the end of
+      // it, so the window opens at 03:30 EDT and closes at 04:00 EDT.
+      [
+        rule({
+          id: 'sunday',
+          dayOfWeek: 0,
+          startMinute: 2 * 60 + 30,
+          endMinute: 4 * 60,
+        }),
+      ],
+      range('2024-03-10T00:00:00Z', '2024-03-11T00:00:00Z'),
+      TORONTO
+    )
+
+    assert.deepEqual(isoWindows(windows), [
+      '2024-03-10T07:30:00.000Z/2024-03-10T08:00:00.000Z',
+    ])
+
+    const first = windows[0]
+    assert.ok(first !== undefined)
+    assert.equal(
+      first.end.getTime() - first.start.getTime(),
+      HOUR / 2,
+      'ninety nominal minutes, thirty real ones'
+    )
   })
 
   it('produces two real hours for a one-hour window across the fall-back overlap', () => {
@@ -1180,6 +1242,50 @@ describe('validateBookingTiming', () => {
     )
   })
 
+  it('refuses a travel buffer beyond the eight-hour ceiling', () => {
+    assert.deepEqual(
+      validateBookingTiming(
+        booking('2024-06-11T15:00:00Z', '2024-06-11T17:00:00Z', {
+          travelBufferBeforeMinutes: MAX_TRAVEL_BUFFER_MINUTES,
+          travelBufferAfterMinutes: MAX_TRAVEL_BUFFER_MINUTES,
+        })
+      ),
+      [],
+      'the ceiling itself is a legal buffer'
+    )
+
+    const conflicts = validateBookingTiming(
+      booking('2024-06-11T15:00:00Z', '2024-06-11T17:00:00Z', {
+        travelBufferBeforeMinutes: MAX_TRAVEL_BUFFER_MINUTES + 1,
+        // The value that used to reach expandAvailability and throw there.
+        travelBufferAfterMinutes: 580_000,
+      })
+    )
+
+    assert.equal(conflicts.length, 2)
+    assert.deepEqual(
+      conflicts.map((conflict) => conflict.field),
+      ['travelBuffer', 'travelBuffer']
+    )
+    assert.match(
+      conflicts[0]?.message ?? '',
+      new RegExp(`tops out at ${String(MAX_TRAVEL_BUFFER_MINUTES)} minutes`)
+    )
+  })
+
+  it('reports an out-of-range buffer once, not twice', () => {
+    // A fractional buffer is not comparable against the ceiling, so it must not
+    // collect both complaints.
+    const conflicts = validateBookingTiming(
+      booking('2024-06-11T15:00:00Z', '2024-06-11T17:00:00Z', {
+        travelBufferBeforeMinutes: 900.5,
+      })
+    )
+
+    assert.equal(conflicts.length, 1)
+    assert.match(conflicts[0]?.message ?? '', /whole number of minutes/)
+  })
+
   it('refuses invalid dates', () => {
     const conflicts = validateBookingTiming({
       startsAt: new Date('not a date'),
@@ -1348,6 +1454,73 @@ describe('suggestAlternatives', () => {
       ),
       []
     )
+  })
+
+  it('offers nothing when the window it would book into is sold out', () => {
+    // Every position the engine could shift to is in the same slot, and that
+    // slot has no seats. Three times that are just as sold out is a worse
+    // answer than none.
+    assert.deepEqual(
+      suggestAlternatives(
+        booking('2024-06-11T16:00:00Z', '2024-06-11T18:00:00Z'),
+        windows,
+        existing,
+        3,
+        {
+          now: BEFORE_EVERYTHING,
+          maxConcurrentEvents: 1,
+          bookingSlot: slot({ capacity: 2, bookedCount: 2 }),
+        }
+      ),
+      []
+    )
+  })
+
+  it('suggests as usual when the window has room for the seats requested', () => {
+    const roomy = slot({ capacity: 4, bookedCount: 1 })
+    const request = booking('2024-06-11T16:00:00Z', '2024-06-11T18:00:00Z')
+
+    assert.deepEqual(
+      suggestAlternatives(request, windows, existing, 1, {
+        now: BEFORE_EVERYTHING,
+        maxConcurrentEvents: 1,
+        bookingSlot: roomy,
+        requestedSeats: 3,
+      }).map((alternative) => alternative.startsAt.toISOString()),
+      ['2024-06-11T17:00:00.000Z'],
+      'three of the three remaining seats: capacity is not the obstruction'
+    )
+
+    assert.deepEqual(
+      suggestAlternatives(request, windows, existing, 1, {
+        now: BEFORE_EVERYTHING,
+        maxConcurrentEvents: 1,
+        bookingSlot: roomy,
+        requestedSeats: 4,
+      }),
+      [],
+      'one seat too many, and no shift in time can supply it'
+    )
+  })
+
+  it('falls silent, rather than throwing, on a seat count checkCapacity rejects', () => {
+    assert.doesNotThrow(() => {
+      assert.deepEqual(
+        suggestAlternatives(
+          booking('2024-06-11T16:00:00Z', '2024-06-11T18:00:00Z'),
+          windows,
+          existing,
+          3,
+          {
+            now: BEFORE_EVERYTHING,
+            maxConcurrentEvents: 1,
+            bookingSlot: slot({ capacity: 4 }),
+            requestedSeats: 0,
+          }
+        ),
+        []
+      )
+    })
   })
 
   it('returns nothing for a non-positive limit or a degenerate candidate', () => {
@@ -1622,6 +1795,76 @@ describe('evaluateBooking', () => {
 
     assert.equal(lapsed.ok, true)
     assert.equal(lapsed.capacity?.remaining, 2)
+  })
+
+  it('offers no alternatives when the only reason is a sold-out window', () => {
+    const result = evaluateBooking({
+      ...base,
+      bookingSlot: slot({ capacity: 2, bookedCount: 2 }),
+      candidate: booking('2024-06-11T15:00:00Z', '2024-06-11T17:00:00Z'),
+    })
+
+    assert.ok(!result.ok)
+    assert.deepEqual(kinds(result.reasons), ['CAPACITY'])
+    // The suggestions used to be computed from the times alone, so a refusal
+    // whose sole cause was capacity came back with three starts that were every
+    // bit as sold out — and re-evaluating any of them refused with CAPACITY
+    // again.
+    assert.deepEqual(result.alternatives, [])
+    assert.equal(result.capacity?.remaining, 0)
+  })
+
+  it('only offers alternatives it would itself accept, slot included', () => {
+    const withRoom = {
+      ...base,
+      bookingSlot: slot({ capacity: 5, bookedCount: 1 }),
+      existingAppointments: [
+        appointment('a1', '2024-06-11T15:00:00Z', '2024-06-11T17:00:00Z'),
+      ],
+      candidate: booking('2024-06-11T16:00:00Z', '2024-06-11T18:00:00Z'),
+    }
+
+    const result = evaluateBooking(withRoom)
+
+    assert.ok(!result.ok)
+    assert.deepEqual(kinds(result.reasons), ['CORE_OVERLAP'])
+    assert.ok(result.alternatives.length > 0)
+
+    for (const alternative of result.alternatives) {
+      const replay = evaluateBooking({
+        ...withRoom,
+        candidate: {
+          ...withRoom.candidate,
+          startsAt: alternative.startsAt,
+          endsAt: alternative.endsAt,
+        },
+      })
+
+      assert.equal(
+        replay.ok,
+        true,
+        `re-evaluating ${alternative.startsAt.toISOString()} against the same slot must be accepted`
+      )
+    }
+  })
+
+  it('refuses an absurd travel buffer instead of throwing', () => {
+    // 580 000 minutes is a whole number and not negative, so every structural
+    // check except the ceiling accepts it. Before the ceiling existed, widening
+    // the search range to contain the occupied interval pushed it past
+    // MAX_EXPANSION_DAYS and expandAvailability threw a RangeError — an
+    // INTERNAL error shown to a guest who should simply have been refused.
+    const result = evaluateBooking({
+      ...base,
+      candidate: booking('2024-06-11T15:00:00Z', '2024-06-11T17:00:00Z', {
+        travelBufferBeforeMinutes: 580_000,
+      }),
+    })
+
+    assert.ok(!result.ok)
+    assert.deepEqual(kinds(result.reasons), ['INVALID_INTERVAL'])
+    assert.deepEqual(result.windows, [])
+    assert.deepEqual(result.alternatives, [])
   })
 
   it('does not let an engagement being amended conflict with itself', () => {

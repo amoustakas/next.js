@@ -76,6 +76,22 @@
  * object ids and types; the response body carries an acknowledgement and
  * nothing else. `errorMessage` on the ledger is a truncated exception summary
  * for an operator and is never returned to the caller.
+ *
+ * ## 6. Attribution is evidence, not resemblance
+ *
+ * Verifying the signature proves the event came from Stripe. It does not prove
+ * *whose* it is, and the two are easy to conflate: a Stripe account holds
+ * customers created by things other than this platform, and one of them
+ * resembling a MannaChef account is not the same as belonging to one.
+ *
+ * {@link resolveUserId} therefore accepts only evidence this platform itself
+ * produced — the `mannachefUserId` metadata, the checkout
+ * `client_reference_id`, or a `UserSubscription` row already linked to the
+ * customer. A customer whose sole connection to an account is a **shared email
+ * address** is refused and quarantined instead: nothing is attached, the ledger
+ * row is marked for a human, and one line is logged naming the customer id.
+ * See {@link resolveUserIdFromCustomer} for the reasoning and
+ * {@link RECONCILE_PREFIX} for how to find the queue.
  */
 
 import { createHash } from 'node:crypto'
@@ -153,7 +169,11 @@ interface AcknowledgementBody {
   readonly duplicate?: boolean
   /** `false` when the event is one this platform has no opinion about. */
   readonly handled?: boolean
-  /** Present when an ordering guard or a missing linkage skipped the write. */
+  /**
+   * Present when an ordering guard, a missing linkage or a refused attribution
+   * skipped the write. A fixed vocabulary — `stale-event`, `unknown-user`,
+   * `unattributed-customer` and the like — never free text about the payload.
+   */
   readonly skipped?: string
 }
 
@@ -260,9 +280,15 @@ export async function POST(request: Request): Promise<Response> {
     // Stripe id, and a `P2025` here — if the row were swept between admission
     // and completion — must not turn a completed effect into a 500 that asks
     // Stripe to run it again.
+    // `errorMessage` is cleared on success, unless the handler asked for a
+    // reconciliation note — see `RECONCILE_PREFIX` for why that note shares a
+    // column with the failure summaries, and why the row is still `processed`.
     await prisma.stripeEvent.updateMany({
       where: { stripeEventId: event.id },
-      data: { processedAt: new Date(), errorMessage: null },
+      data: {
+        processedAt: new Date(),
+        errorMessage: outcome.reconcile ?? null,
+      },
     })
 
     return acknowledge({
@@ -457,6 +483,11 @@ interface HandlerOutcome {
   readonly handled: boolean
   /** Why nothing was written, when nothing was. */
   readonly skipped?: string
+  /**
+   * A note for a human, persisted to `StripeEvent.errorMessage` alongside
+   * `processedAt`. See {@link RECONCILE_PREFIX}.
+   */
+  readonly reconcile?: string
 }
 
 const HANDLED: HandlerOutcome = { handled: true }
@@ -464,6 +495,67 @@ const UNHANDLED: HandlerOutcome = { handled: false }
 
 function skipped(reason: string): HandlerOutcome {
   return { handled: true, skipped: reason }
+}
+
+/**
+ * How a row that needs a human is marked in the ledger.
+ *
+ * `StripeEvent` has no column for "processed, but somebody should look at
+ * this", and adding one is a migration this task does not own — the same
+ * position `actions/user.ts` takes about the absent `AuditLog`. So the note
+ * goes in `errorMessage` behind a fixed, greppable prefix, and the
+ * reconciliation queue is:
+ *
+ * ```sql
+ * SELECT "stripeEventId", "type", "receivedAt", "errorMessage"
+ *   FROM "StripeEvent"
+ *  WHERE "errorMessage" LIKE 'reconcile: %'
+ *  ORDER BY "receivedAt" DESC;
+ * ```
+ *
+ * `processedAt` **is** set on these rows, deliberately. Redelivery cannot
+ * change the outcome — the customer will still have no metadata — so leaving
+ * them unprocessed would put permanent residents in the dead-letter sweep that
+ * `@@index([processedAt])` exists to keep short, and would tell an operator to
+ * retry something no retry can fix.
+ */
+const RECONCILE_PREFIX = 'reconcile: '
+
+/**
+ * Nothing was attached, and here is what to say about it.
+ *
+ * The `unknown` case is the long-standing behaviour: log it, skip it. The
+ * `quarantined` case is MCV-031's — a customer whose *only* link to an account
+ * is a shared email address, which this platform declines to treat as
+ * evidence. It differs in exactly two ways: the ledger row is marked for an
+ * operator, and the skip reason names the real cause so the acknowledgement
+ * body does not claim the user was merely unknown.
+ *
+ * `subject` is the Stripe object under discussion, already rendered by the
+ * caller — `charge ch_123`, `invoice in_456`. Ids only: no email address, no
+ * amount, no payload. `CONTRACT.md` §5.
+ */
+function declineAttribution(
+  attribution: Exclude<Attribution, { kind: 'resolved' }>,
+  subject: string
+): HandlerOutcome {
+  if (attribution.kind === 'unknown') {
+    console.error(
+      `[stripe-webhook] ${subject}: no MannaChef user could be resolved.`
+    )
+
+    return skipped('unknown-user')
+  }
+
+  const note = `${RECONCILE_PREFIX}customer ${attribution.customerId} matches an account by email address only; nothing was attached.`
+
+  console.warn(`[stripe-webhook] ${subject}: ${note}`)
+
+  return {
+    handled: true,
+    skipped: 'unattributed-customer',
+    reconcile: note.slice(0, MAX_LEDGER_ERROR_LENGTH),
+  }
 }
 
 /** The id of a Stripe reference that may or may not have been expanded. */
@@ -641,6 +733,31 @@ function paymentMethodFor(charge: Stripe.Charge | null): PaymentMethodType {
 }
 
 /**
+ * What could be established about who a Stripe object belongs to.
+ *
+ * Three answers rather than two, because "we found a plausible account and are
+ * deliberately not using it" is not the same event as "we found nothing", and
+ * filing them under one `null` is what made the email fallback dangerous.
+ */
+type Attribution =
+  /** A confirmed `User.id`. The only value a handler may write against. */
+  | { readonly kind: 'resolved'; readonly userId: string }
+  /** Nothing matched. The event is skipped. */
+  | { readonly kind: 'unknown' }
+  /**
+   * An account matched **by email address alone**, and was refused. See
+   * {@link resolveUserIdFromCustomer} for why, and {@link declineAttribution}
+   * for what is recorded instead.
+   */
+  | { readonly kind: 'quarantined'; readonly customerId: string }
+
+const UNKNOWN_ATTRIBUTION: Attribution = { kind: 'unknown' }
+
+function attributed(userId: string): Attribution {
+  return { kind: 'resolved', userId }
+}
+
+/**
  * The MannaChef user behind a Stripe object.
  *
  * Four sources, cheapest and most trustworthy first. Every candidate is
@@ -653,31 +770,34 @@ function paymentMethodFor(charge: Stripe.Charge | null): PaymentMethodType {
  *  2. `client_reference_id` — the Checkout session's own copy of the same id.
  *  3. The local `UserSubscription` rows for this customer. Any existing
  *     subscriber resolves here with no network call.
- *  4. The Stripe customer: its metadata, then its email address.
+ *  4. The Stripe customer's own metadata.
+ *
+ * The customer's **email address** used to be a fifth source. It is not any
+ * more; it now quarantines instead — see {@link resolveUserIdFromCustomer}.
  */
 async function resolveUserId(args: {
   metadata?: Stripe.Metadata | null
   clientReferenceId?: string | null
   customer?: string | Stripe.Customer | Stripe.DeletedCustomer | null
-}): Promise<string | null> {
+}): Promise<Attribution> {
   const fromMetadata = await confirmUserId(
     args.metadata?.[STRIPE_CUSTOMER_USER_ID_KEY]
   )
 
   if (fromMetadata !== null) {
-    return fromMetadata
+    return attributed(fromMetadata)
   }
 
   const fromReference = await confirmUserId(args.clientReferenceId)
 
   if (fromReference !== null) {
-    return fromReference
+    return attributed(fromReference)
   }
 
   const customerId = stripeIdOf(args.customer ?? null)
 
   if (customerId === null) {
-    return null
+    return UNKNOWN_ATTRIBUTION
   }
 
   const local = await prisma.userSubscription.findFirst({
@@ -687,10 +807,10 @@ async function resolveUserId(args: {
   })
 
   if (local !== null) {
-    return local.userId
+    return attributed(local.userId)
   }
 
-  return resolveUserIdFromCustomer(args.customer ?? customerId)
+  return resolveUserIdFromCustomer(args.customer ?? customerId, customerId)
 }
 
 async function confirmUserId(
@@ -712,12 +832,58 @@ async function confirmUserId(
  * The user behind a Stripe customer, from the customer object itself.
  *
  * Retrieves the customer when only an id was delivered. A deleted customer has
- * neither metadata nor an email, so it resolves to `null` and the event is
+ * neither metadata nor an email, so it resolves to `unknown` and the event is
  * skipped rather than misattributed.
+ *
+ * ## Why an email match is refused (MCV-031)
+ *
+ * The customer's metadata carries `mannachefUserId` because
+ * `createCheckoutSession` put it there. That is a claim *this platform* made
+ * about *this customer*, and it is trustworthy for the same reason the
+ * signature check is: nobody else could have written it.
+ *
+ * An email address is not that. A Stripe account can hold customers created
+ * anywhere — the dashboard, an invoice typed by hand, a Payment Link, a second
+ * product sharing the same Stripe account, an import from a previous system —
+ * and any of them may carry an address that also belongs to a MannaChef
+ * account. Matching on it was a guess dressed as a lookup, and the cost of
+ * guessing wrong is not an abstraction: `handlePaymentIntentChanged` and
+ * `handleChargeRefunded` write a `PaymentHistory` row with the amount, the card
+ * brand, the last four digits and the Stripe receipt URL. A stranger's payment
+ * would appear in a household's billing history, and the receipt URL would show
+ * them the rest.
+ *
+ * Nothing about the ranking saved it. Being fourth behind metadata,
+ * `client_reference_id` and a local subscription only means the fallback fires
+ * exactly when the platform has *no* evidence at all — which is precisely when
+ * a guess is least defensible. Nor does the sign-in method: magic link and
+ * OAuth prove the *account holder* controls the mailbox, and prove nothing
+ * whatsoever about who created some customer object in Stripe.
+ *
+ * ## What happens instead
+ *
+ * The match is found and then deliberately dropped. `quarantined` carries the
+ * customer id up to {@link declineAttribution}, which attaches nothing, marks
+ * the ledger row for an operator, and logs one line naming the customer.
+ *
+ * The alternative considered was deleting the fallback outright and requiring
+ * the metadata unconditionally. It was rejected because it is the same
+ * behaviour with less information: a concierge who raises an invoice for an
+ * existing household from the Stripe dashboard creates a customer with no
+ * metadata, and that is a legitimate thing to do. Under a hard requirement the
+ * payment simply vanishes from the platform with a log line nobody reads; under
+ * quarantine it lands in a queue an administrator can work through and attach
+ * by hand. Neither version ever attributes on the strength of an email address,
+ * which is the whole of the security property — quarantine just declines to
+ * throw away the operator's ability to fix it.
+ *
+ * The email address itself is never logged and never returned: `CONTRACT.md`
+ * §5, and the same rule `recordAccountAudit` follows in `actions/user.ts`.
  */
 async function resolveUserIdFromCustomer(
-  customer: string | Stripe.Customer | Stripe.DeletedCustomer
-): Promise<string | null> {
+  customer: string | Stripe.Customer | Stripe.DeletedCustomer,
+  customerId: string
+): Promise<Attribution> {
   let resolved: Stripe.Customer | Stripe.DeletedCustomer
 
   if (typeof customer === 'string') {
@@ -727,7 +893,7 @@ async function resolveUserIdFromCustomer(
   }
 
   if (resolved.deleted === true) {
-    return null
+    return UNKNOWN_ATTRIBUTION
   }
 
   const fromMetadata = await confirmUserId(
@@ -735,11 +901,11 @@ async function resolveUserIdFromCustomer(
   )
 
   if (fromMetadata !== null) {
-    return fromMetadata
+    return attributed(fromMetadata)
   }
 
   if (resolved.email === null || resolved.email.length === 0) {
-    return null
+    return UNKNOWN_ATTRIBUTION
   }
 
   const byEmail = await prisma.user.findUnique({
@@ -747,7 +913,13 @@ async function resolveUserIdFromCustomer(
     select: { id: true },
   })
 
-  return byEmail?.id ?? null
+  if (byEmail === null) {
+    return UNKNOWN_ATTRIBUTION
+  }
+
+  // A match, and therefore a decision — not a resolution. The id is
+  // intentionally dropped here and never travels further.
+  return { kind: 'quarantined', customerId }
 }
 
 // =============================================================================
@@ -825,19 +997,20 @@ async function handleCheckoutCompleted(
   session: Stripe.Checkout.Session,
   eventCreatedAt: Date
 ): Promise<HandlerOutcome> {
-  const userId = await resolveUserId({
+  const attribution = await resolveUserId({
     metadata: session.metadata,
     clientReferenceId: session.client_reference_id,
     customer: session.customer,
   })
 
-  if (userId === null) {
-    console.error(
-      `[stripe-webhook] checkout.session.completed ${session.id}: no MannaChef user could be resolved.`
+  if (attribution.kind !== 'resolved') {
+    return declineAttribution(
+      attribution,
+      `checkout.session.completed ${session.id}`
     )
-
-    return skipped('unknown-user')
   }
+
+  const userId = attribution.userId
 
   const subscriptionId = stripeIdOf(session.subscription)
 
@@ -1017,20 +1190,19 @@ async function handleSubscriptionChanged(
     return skipped('unknown-plan')
   }
 
-  const userId =
-    existing?.userId ??
-    (await resolveUserId({
-      metadata: subscription.metadata,
-      customer: subscription.customer,
-    }))
+  const attribution =
+    existing === null
+      ? await resolveUserId({
+          metadata: subscription.metadata,
+          customer: subscription.customer,
+        })
+      : attributed(existing.userId)
 
-  if (userId === null) {
-    console.error(
-      `[stripe-webhook] subscription ${subscription.id}: no MannaChef user could be resolved.`
-    )
-
-    return skipped('unknown-user')
+  if (attribution.kind !== 'resolved') {
+    return declineAttribution(attribution, `subscription ${subscription.id}`)
   }
+
+  const userId = attribution.userId
 
   const customerId = stripeIdOf(subscription.customer)
 
@@ -1152,20 +1324,19 @@ async function handleInvoiceChanged(
     return skipped('stale-event')
   }
 
-  const userId =
-    existing?.userId ??
-    (await resolveUserId({
-      metadata: invoice.metadata,
-      customer: invoice.customer,
-    }))
+  const attribution =
+    existing === null
+      ? await resolveUserId({
+          metadata: invoice.metadata,
+          customer: invoice.customer,
+        })
+      : attributed(existing.userId)
 
-  if (userId === null) {
-    console.error(
-      `[stripe-webhook] invoice ${invoice.id}: no MannaChef user could be resolved.`
-    )
-
-    return skipped('unknown-user')
+  if (attribution.kind !== 'resolved') {
+    return declineAttribution(attribution, `invoice ${invoice.id}`)
   }
+
+  const userId = attribution.userId
 
   const subscriptionId = await resolveLocalSubscriptionId(invoice.subscription)
   const number = await resolveInvoiceNumber(invoice)
@@ -1296,20 +1467,19 @@ async function handlePaymentIntentChanged(
     return skipped('stale-event')
   }
 
-  const userId =
-    existing?.userId ??
-    (await resolveUserId({
-      metadata: intent.metadata,
-      customer: intent.customer,
-    }))
+  const attribution =
+    existing === null
+      ? await resolveUserId({
+          metadata: intent.metadata,
+          customer: intent.customer,
+        })
+      : attributed(existing.userId)
 
-  if (userId === null) {
-    console.error(
-      `[stripe-webhook] payment_intent ${intent.id}: no MannaChef user could be resolved.`
-    )
-
-    return skipped('unknown-user')
+  if (attribution.kind !== 'resolved') {
+    return declineAttribution(attribution, `payment_intent ${intent.id}`)
   }
+
+  const userId = attribution.userId
 
   const charge =
     intent.status === 'succeeded'
@@ -1494,18 +1664,16 @@ async function handleChargeRefunded(
     return HANDLED
   }
 
-  const userId = await resolveUserId({
+  const attribution = await resolveUserId({
     metadata: charge.metadata,
     customer: charge.customer,
   })
 
-  if (userId === null) {
-    console.error(
-      `[stripe-webhook] charge ${charge.id}: refunded, but no MannaChef user could be resolved.`
-    )
-
-    return skipped('unknown-user')
+  if (attribution.kind !== 'resolved') {
+    return declineAttribution(attribution, `charge ${charge.id} (refunded)`)
   }
+
+  const userId = attribution.userId
 
   const card = charge.payment_method_details?.card ?? null
 

@@ -54,6 +54,7 @@ import {
   canTransition,
   DEFAULT_BLOCKING_APPOINTMENT_STATUSES,
   isTerminalAppointmentStatus,
+  MAX_TRAVEL_BUFFER_MINUTES,
   TERMINAL_APPOINTMENT_STATUSES,
 } from '@mannachef/validators'
 import type {
@@ -114,6 +115,17 @@ const MINUTES_PER_DAY = 1_440
  * for more is a bug in the caller rather than an unusual booking.
  */
 export const MAX_EXPANSION_DAYS = 400
+
+/**
+ * The ceiling `validateBookingTiming` puts on either travel buffer.
+ *
+ * Imported from `@mannachef/validators` (`src/booking.ts`) and re-exported
+ * rather than restated, for the same reason the transition table is: two
+ * authorities would drift, and the drift would show up as a form that accepts a
+ * buffer the engine refuses. See `validateBookingTiming` for why the engine
+ * needs the bound at all rather than trusting the schema in front of it.
+ */
+export { MAX_TRAVEL_BUFFER_MINUTES }
 
 /** Slot statuses that take a window off the market whatever the arithmetic says. */
 export const UNBOOKABLE_SLOT_STATUSES: readonly BookingSlotStatus[] = [
@@ -370,7 +382,9 @@ export type WallClockDisambiguation =
   /**
    * The wall clock never happened — it fell in the hour a spring-forward
    * transition skipped. The instant returned is the requested time shifted
-   * **forward** by the size of the gap, which is the end of the gap.
+   * **forward** by the size of the gap. Only a bound sitting exactly on the
+   * near edge of the gap therefore lands on its far edge; a bound half an hour
+   * into the gap lands half an hour past that edge.
    */
   | 'GAP_SHIFTED_FORWARD'
   /**
@@ -403,12 +417,16 @@ export interface WallClockResolution {
  *
  * - **Spring forward (the gap).** On 2024-03-10 in Toronto the clocks jump
  *   02:00 EST → 03:00 EDT, so 02:30 local never occurs. A window whose bound
- *   lands in the gap is shifted **forward** to the far side of it: 02:30 becomes
- *   03:00 EDT (`07:00Z`), the same policy as `Temporal`'s `compatible`
- *   disambiguation. The consequence is deliberate and desirable: a window
- *   written `01:00–04:00` yields two real hours rather than three, and a window
- *   written `02:00–03:00` collapses to zero length and is **dropped entirely**,
- *   because that hour genuinely does not exist and no chef can work it.
+ *   lands in the gap is shifted **forward by the width of the gap** — it is not
+ *   clamped to the gap's far edge. 02:00 becomes 03:00 EDT (`07:00Z`) because
+ *   that bound sits exactly on the near edge; 02:30 becomes 03:**30** EDT
+ *   (`07:30Z`), half an hour past the edge. Both are the same policy as
+ *   `Temporal`'s `compatible` disambiguation. The consequence is deliberate and
+ *   desirable: a window written `01:00–04:00` yields two real hours rather than
+ *   three, a window written `02:30–04:00` yields **thirty minutes** rather than
+ *   sixty, and a window written `02:00–03:00` collapses to zero length and is
+ *   **dropped entirely**, because that hour genuinely does not exist and no
+ *   chef can work it.
  *
  * - **Fall back (the overlap).** On 2024-11-03 in Toronto the clocks repeat
  *   01:00–01:59 as EDT and then again as EST. A bound landing in the repeat
@@ -1182,6 +1200,30 @@ export function occupiedInterval(booking: BookingTiming): OccupiedInterval {
  * Returns every problem it finds rather than the first, so a form can show all
  * of them at once. An empty array means the candidate is well formed — it says
  * nothing about whether the chef is free.
+ *
+ * ## Why the travel buffers have a ceiling here as well as in the validators
+ *
+ * A buffer is minutes, and minutes multiply. `occupiedInterval` subtracts
+ * `travelBufferBeforeMinutes` from the start and adds
+ * `travelBufferAfterMinutes` to the end, and `evaluateBooking` then widens its
+ * `searchRange` to contain that occupied interval. A buffer of 580 000 minutes
+ * — a whole number, non-negative, and so acceptable to every other check in
+ * this function — pushes the widened range past `MAX_EXPANSION_DAYS` and makes
+ * `expandAvailability` **throw** where the guest should merely have been
+ * refused.
+ *
+ * The `travelBufferSchema` behind `appointmentMutableShape` in
+ * `@mannachef/validators` already caps both buffers at
+ * `MAX_TRAVEL_BUFFER_MINUTES`, so no request that came through the API can
+ * reach that state. But this function advertises itself as *the* structural
+ * gate — `evaluateBooking` runs it first and returns on any finding — and a
+ * gate that lets a value through only for the next stage to throw on it is not
+ * one. The same constant is enforced here so the engine refuses rather than
+ * raises, whatever path the candidate arrived by.
+ *
+ * Eight hours either side is far past any real drive; a row exceeding it is
+ * corrupt or hand-edited, and either way "we cannot schedule that" is the right
+ * answer rather than an `INTERNAL` error.
  */
 export function validateBookingTiming(
   candidate: BookingTiming
@@ -1224,6 +1266,18 @@ export function validateBookingTiming(
         kind: 'INVALID_INTERVAL',
         field: 'travelBuffer',
         message: `${field} must be a whole number of minutes, and cannot be negative.`,
+      })
+
+      // One complaint per field: a buffer that is not a whole number of minutes
+      // has nothing meaningful to compare against the ceiling.
+      continue
+    }
+
+    if (minutes > MAX_TRAVEL_BUFFER_MINUTES) {
+      conflicts.push({
+        kind: 'INVALID_INTERVAL',
+        field: 'travelBuffer',
+        message: `${field} tops out at ${String(MAX_TRAVEL_BUFFER_MINUTES)} minutes of travel; ${String(minutes)} were given.`,
       })
     }
   }
@@ -1654,6 +1708,16 @@ export interface AlternativeOptions {
   readonly maxConcurrentEvents: number
   readonly blockingStatuses?: readonly AppointmentStatus[] | undefined
   readonly excludeAppointmentId?: string | null | undefined
+  /**
+   * The window the alternatives would be booked into, when the booking came
+   * from the diary. Omit it — or pass `null` — for a booking that is not
+   * against a slot; every suggestion is then a pure question of time.
+   *
+   * See "Capacity is not a matter of timing" on `suggestAlternatives`.
+   */
+  readonly bookingSlot?: BookingSlotLike | null | undefined
+  /** Bookings taken from `bookingSlot`'s capacity. Defaults to 1. */
+  readonly requestedSeats?: number | undefined
 }
 
 /** Move a whole booking — prep, service, and buffers — by a fixed offset. */
@@ -1696,6 +1760,27 @@ function shiftTiming(booking: BookingTiming, deltaMs: number): BookingTiming {
  * buffers, and `findConflicts` under the chef's real concurrency limit — so a
  * suggestion is never something the engine would subsequently refuse.
  *
+ * ## Capacity is not a matter of timing
+ *
+ * The positions above all move the booking through time, and the one refusal
+ * moving through time cannot cure is a sold-out `BookingSlot`. A slot is a
+ * fixed window on the diary with a fixed number of seats; shifting the same
+ * booking an hour later does not give it a seat, it merely puts it somewhere
+ * that slot does not cover. Offering three such times is worse than offering
+ * none — the guest works through all three and is refused with `CAPACITY` every
+ * time.
+ *
+ * So when `options.bookingSlot` is given, capacity is settled **once, up
+ * front**, by the same `checkCapacity` the engine will use. If the slot cannot
+ * take `options.requestedSeats` at `options.now`, there are no alternatives
+ * *in that slot* and `[]` is returned; the caller's next move is to offer a
+ * different slot, which is a query this pure function cannot make. If the slot
+ * can take them, capacity is not the obstruction and the positions are tried as
+ * normal.
+ *
+ * Omitting `bookingSlot` preserves the older, time-only behaviour exactly,
+ * which is the right reading for a booking that is not against the diary at all.
+ *
  * Results are ordered by distance from the requested start; ties prefer the
  * later option, on the grounds that a guest offered "an hour earlier or an hour
  * later" usually means the later one.
@@ -1715,6 +1800,25 @@ export function suggestAlternatives(
 
   if (validateBookingTiming(candidate).length > 0) {
     return []
+  }
+
+  const slot = options.bookingSlot ?? null
+
+  if (slot !== null) {
+    const seats = options.requestedSeats ?? 1
+
+    // `checkCapacity` throws on a seat count like this, and rightly so — it is
+    // a caller bug. This function's own contract is quieter: it already falls
+    // silent on a non-positive limit and on a malformed candidate, and staying
+    // silent here keeps a refusal path from turning into an INTERNAL error
+    // purely because the engine tried to be helpful about it.
+    if (!Number.isInteger(seats) || seats < 1) {
+      return []
+    }
+
+    if (!checkCapacity(slot, seats, options.now).ok) {
+      return []
+    }
   }
 
   const own = occupiedInterval(candidate)
@@ -1943,8 +2047,12 @@ export type BookingEvaluation =
  * administrator who fixes the time only to be told about the capacity is being
  * made to guess.
  *
- * On refusal it also computes alternatives, so the caller always has something
- * to offer.
+ * On refusal it also computes alternatives, so the caller usually has something
+ * to offer. `bookingSlot` and `requestedSeats` are handed to
+ * `suggestAlternatives` along with the times: a booking refused because its
+ * window is sold out has no alternatives *in that window*, and returning three
+ * times that would be refused for exactly the same reason is a worse answer
+ * than returning none.
  *
  * @throws {RangeError} propagated from `expandAvailability` (bad zone, absurd
  * range) or `checkCapacity` (non-positive seat count). These are caller bugs;
@@ -2051,6 +2159,11 @@ export function evaluateBooking(
             maxConcurrentEvents: input.staff.maxConcurrentEvents,
             blockingStatuses: blocking,
             excludeAppointmentId: excluded,
+            // Without these the suggestions would be time-only, and a refusal
+            // whose sole cause was a sold-out window would come back with three
+            // times that are just as sold out.
+            bookingSlot: slot,
+            requestedSeats,
           }
         )
       : []

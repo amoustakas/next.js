@@ -89,6 +89,7 @@ import { z } from 'zod'
 import { fail, ok, type ActionResult } from '@/server/actions/types'
 import { Prisma } from '@/server/db'
 import { withAction, type AuthenticatedUser } from '@/server/guards'
+import { runSerializable } from '@/server/transaction'
 
 // =============================================================================
 // 0. Constants
@@ -102,6 +103,19 @@ const ACCOUNT_PATHS = [
 ] as const
 
 const ACCOUNT_TAGS = ['users', 'session'] as const
+
+/**
+ * What an administrator is told when every `Serializable` attempt has aborted.
+ *
+ * Reached only if two administrators keep colliding on the same account for
+ * longer than {@link runSerializable}'s retries. The ordinary outcome of a
+ * collision is *not* this sentence — it is the retry succeeding, or the retry
+ * discovering a real refusal such as the last-super-admin rule and returning
+ * that instead. See {@link wouldStrandTheKingdom} for why the isolation level
+ * is load-bearing here.
+ */
+const RACE_MESSAGE =
+  'Somebody else was changing this account at that exact moment. Please try again.'
 
 // =============================================================================
 // 1. Local input schemas
@@ -239,6 +253,14 @@ function toAccountView(row: AccountPayload): AccountView {
  *
  * The log line carries ids and the operator's own words. It never carries an
  * email address, a token, or anything else from `CONTRACT.md` §5's list.
+ *
+ * One consequence of the `Serializable` retry is worth knowing before reading
+ * the log: the `ClientNote` is transactional and therefore appears exactly once
+ * or not at all, but `console.info` is not, so an attempt that reached this
+ * point and *then* lost the serialization race leaves a line behind for a
+ * change that was rolled back. The durable row is the record; the log is a
+ * trace of attempts. Suppressing the line until after commit would mean losing
+ * it entirely whenever the commit is what failed, which is the worse trade.
  */
 async function recordAccountAudit(
   tx: Prisma.TransactionClient,
@@ -279,9 +301,40 @@ async function recordAccountAudit(
  * active `SUPER_ADMIN` cannot be the last one, so the question short-circuits
  * to `false` and costs one query rather than two.
  *
- * Read inside the same transaction as the write it guards, so two
- * simultaneous demotions of the last two super administrators cannot both see a
- * peer and both proceed.
+ * ## Why the enclosing transaction must be `Serializable`
+ *
+ * Being read inside the same transaction as the write it guards is **not**
+ * sufficient, and an earlier revision of this comment claimed that it was. A
+ * transaction buys atomicity; on its own it buys no mutual exclusion at all.
+ * PostgreSQL's default is `READ COMMITTED`, and at that level the last two
+ * super administrators can be demoted simultaneously:
+ *
+ *  1. `T1` demoting `A` counts the peers of `A`, sees `B`, and proceeds.
+ *  2. `T2` demoting `B` counts the peers of `B`, sees `A` — `T1` has not
+ *     committed, so `A` is still a live super administrator — and proceeds.
+ *  3. `T1` updates row `A`; `T2` updates row `B`. **Different rows**, so no row
+ *     lock ever brings the two into contact and neither blocks.
+ *  4. Both commit. Nobody holds `SUPER_ADMIN`.
+ *
+ * That is textbook write skew: two transactions each read what the other is
+ * about to write, and the invariant lives in the gap between the count and the
+ * update where no lock exists. It is unrecoverable from inside the
+ * application, because {@link assignUserRole} refuses to *grant* `SUPER_ADMIN`
+ * from within it by design — restoring the platform would need direct database
+ * access.
+ *
+ * The mechanism that actually holds the line is `Serializable` isolation.
+ * PostgreSQL's SSI takes predicate locks over the range each `count` reads,
+ * detects the rw-dependency cycle between the two transactions above, and
+ * aborts one of them with `40001`. {@link runSerializable} retries the loser,
+ * whose second attempt counts the peers again against a world that now
+ * contains the winner's commit, finds none, and refuses with the honest
+ * `CONFLICT` — the same refusal a lone administrator stepping down would get.
+ *
+ * Both callers therefore go through {@link runSerializable}, never a bare
+ * `$transaction`. The `tx` parameter below cannot enforce that — a
+ * `Prisma.TransactionClient` carries no evidence of the isolation level it was
+ * opened at — so it is stated here and honoured at the two call sites.
  */
 async function wouldStrandTheKingdom(
   tx: Prisma.TransactionClient,
@@ -367,7 +420,10 @@ export const updateUserProfile = withAction(
  *
  * `SUPER_ADMIN`, and the single most consequential write in the application.
  * The four refusals are tabulated in the file docblock; this is where each one
- * is applied, in that order, inside one transaction against freshly-read rows.
+ * is applied, in that order, inside one `Serializable` transaction against
+ * freshly-read rows. The isolation level is not decoration — see
+ * {@link wouldStrandTheKingdom} for the write skew a bare `$transaction` lets
+ * through, and {@link runSerializable} for what happens to the loser.
  *
  * ## The actor is the session, never the payload
  *
@@ -438,7 +494,7 @@ export const assignUserRole = withAction(
       )
     }
 
-    const outcome = await ctx.db.$transaction(async (tx) => {
+    const outcome = await runSerializable(ctx.db, RACE_MESSAGE, async (tx) => {
       const subject = await tx.user.findUnique({
         where: { id: input.userId },
         select: {
@@ -567,7 +623,11 @@ export const assignUserRole = withAction(
  *  - **Not a peer or a superior.** The same rank rule the role change applies,
  *    for the same reason: `ADMIN` closing a `SUPER_ADMIN`'s account is a
  *    privilege escalation with extra steps.
- *  - **Not the last super administrator**, whoever is asking.
+ *  - **Not the last super administrator**, whoever is asking. Enforced at
+ *    `Serializable`, exactly as the role change enforces it: closing the last
+ *    two super administrators' accounts at the same instant is the same write
+ *    skew as demoting them at the same instant, and the two actions race each
+ *    other as readily as each races itself. See {@link wouldStrandTheKingdom}.
  *  - **Not a no-op**, so the audit trail contains only real changes.
  *
  * ## What the write does
@@ -611,7 +671,7 @@ export const setUserActive = withAction(
     const actorRank = ROLE_HIERARCHY[ctx.user.role]
     const now = new Date()
 
-    const outcome = await ctx.db.$transaction(async (tx) => {
+    const outcome = await runSerializable(ctx.db, RACE_MESSAGE, async (tx) => {
       const subject = await tx.user.findUnique({
         where: { id: input.userId },
         select: {

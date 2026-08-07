@@ -106,6 +106,7 @@ import {
   type BookingSlotLike,
   type BookingTiming,
 } from '@/server/scheduling'
+import { runSerializable } from '@/server/transaction'
 
 // =============================================================================
 // 0. Constants
@@ -141,12 +142,6 @@ const SUGGESTION_LOOKAHEAD_MS = 7 * MS_PER_DAY
 
 /** Alternatives offered on a refusal. */
 const SUGGESTION_LIMIT = 3
-
-/** How many times a `Serializable` abort is retried before the caller is told. */
-const SERIALIZATION_RETRIES = 3
-
-/** Backoff between those retries. Short: the winner has already committed. */
-const SERIALIZATION_BACKOFF_MS = 25
 
 /** Ceiling on how long a concierge may freeze a window while a guest decides. */
 const MAX_HOLD_MINUTES = 120
@@ -586,72 +581,18 @@ function conflictFailure(
 // =============================================================================
 
 /**
- * `Serializable` transactions abort. That is not a failure — it is the isolation
- * level doing the job it was chosen for.
+ * What a guest is told when every `Serializable` attempt has aborted.
  *
- * PostgreSQL raises `40001` (`could not serialize access…`) when its predicate
- * locks show that two concurrent transactions read ranges the other wrote;
- * Prisma surfaces it as `P2034`. The documented remedy is to retry the whole
- * transaction, and the loser is usually retrying against a calendar that now
- * has one more booking in it, so the second attempt either succeeds or refuses
- * for a real reason.
- *
- * Without this, the guest who lost a two-way race would be shown "something
- * went wrong on our end" for a booking that was simply a fraction of a second
- * late. After the retries are spent it becomes a `CONFLICT` — never an
- * `INTERNAL`, because nothing internal went wrong.
+ * The runner itself is {@link runSerializable} in `@/server/transaction`. It
+ * moved out of this file when `actions/user.ts` needed the same mechanism for
+ * its last-super-admin rule — see that module's docblock for why a helper
+ * shared between two action files cannot live in either of them. What stays
+ * here is the sentence, because the runner deliberately refuses to invent one:
+ * losing a race for a Saturday sitting and losing a race to step down are
+ * different disappointments, and are owed different apologies.
  */
-async function runSerializable<T>(
-  db: PrismaClient,
-  run: (tx: Prisma.TransactionClient) => Promise<T>
-): Promise<T> {
-  let lastError: unknown = null
-
-  for (let attempt = 0; attempt <= SERIALIZATION_RETRIES; attempt += 1) {
-    try {
-      // The parameter is the *root* client rather than `Prisma.TransactionClient`
-      // on purpose: `$transaction` is denied on an interactive client, so
-      // asking for the root type is what makes an accidental nested
-      // transaction a compile error instead of a runtime one.
-      return await db.$transaction(run, {
-        isolationLevel: 'Serializable',
-        timeout: 15_000,
-      })
-    } catch (error) {
-      if (!isSerializationFailure(error) || attempt === SERIALIZATION_RETRIES) {
-        lastError = error
-        break
-      }
-
-      await sleep(SERIALIZATION_BACKOFF_MS * (attempt + 1))
-    }
-  }
-
-  if (isSerializationFailure(lastError)) {
-    throw new ActionError(
-      'CONFLICT',
-      'Somebody else was booking the same window at that exact moment. Please try again.'
-    )
-  }
-
-  throw lastError
-}
-
-function isSerializationFailure(error: unknown): boolean {
-  if (error instanceof Prisma.PrismaClientKnownRequestError) {
-    // P2034 is Prisma's "write conflict or deadlock"; P2028 is a transaction
-    // that expired while the retry was waiting for its turn.
-    return error.code === 'P2034' || error.code === 'P2028'
-  }
-
-  return false
-}
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => {
-    setTimeout(resolve, ms)
-  })
-}
+const RACE_MESSAGE =
+  'Somebody else was booking the same window at that exact moment. Please try again.'
 
 // =============================================================================
 // 5. Calendar state, read fresh
@@ -1015,7 +956,7 @@ export const requestAppointment = withAction(
     const now = new Date()
 
     // --- 3. Decide and write, in one serializable transaction ---------------
-    const outcome = await runSerializable(ctx.db, async (tx) => {
+    const outcome = await runSerializable(ctx.db, RACE_MESSAGE, async (tx) => {
       const calendar = await loadCalendarState(
         tx,
         input.staffProfileId,
@@ -1415,7 +1356,7 @@ export const rescheduleAppointment = withAction(
 
     const now = new Date()
 
-    const outcome = await runSerializable(ctx.db, async (tx) => {
+    const outcome = await runSerializable(ctx.db, RACE_MESSAGE, async (tx) => {
       const current = await tx.chefAppointment.findUnique({
         where: { id: owned.data.id },
         select: {
@@ -1795,7 +1736,7 @@ async function performTransition(
 
   const occurredAt = input.occurredAt ?? new Date()
 
-  const outcome = await runSerializable(ctx.db, async (tx) => {
+  const outcome = await runSerializable(ctx.db, RACE_MESSAGE, async (tx) => {
     const current = await tx.chefAppointment.findUnique({
       where: { id: owned.data.id },
       select: { id: true, status: true, bookingSlotId: true },

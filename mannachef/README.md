@@ -73,17 +73,18 @@ pnpm dev
 
 ### Common scripts (root)
 
-| Script          | What it does                                      |
-| ---------------- | -------------------------------------------------- |
-| `pnpm dev`        | Runs all workspace `dev` tasks via Turbo           |
-| `pnpm build`       | Builds all workspace packages/apps via Turbo       |
-| `pnpm lint`        | Lints all workspaces via Turbo                     |
-| `pnpm typecheck`   | Type-checks all workspaces via Turbo                |
-| `pnpm format`      | Formats the repo with Prettier                      |
-| `pnpm db:generate` | Regenerates the Prisma client (`@mannachef/db`)     |
-| `pnpm db:migrate`  | Runs `prisma migrate dev`                            |
-| `pnpm db:push`     | Pushes the Prisma schema without a migration        |
-| `pnpm db:studio`   | Opens Prisma Studio                                  |
+| Script             | What it does                                    |
+| ------------------ | ----------------------------------------------- |
+| `pnpm dev`         | Runs all workspace `dev` tasks via Turbo        |
+| `pnpm build`       | Builds all workspace packages/apps via Turbo    |
+| `pnpm lint`        | Lints all workspaces via Turbo                  |
+| `pnpm typecheck`   | Type-checks all workspaces via Turbo            |
+| `pnpm verify`      | Runs every workspace's own correctness harness  |
+| `pnpm format`      | Formats the repo with Prettier                  |
+| `pnpm db:generate` | Regenerates the Prisma client (`@mannachef/db`) |
+| `pnpm db:migrate`  | Runs `prisma migrate dev`                       |
+| `pnpm db:push`     | Pushes the Prisma schema without a migration    |
+| `pnpm db:studio`   | Opens Prisma Studio                             |
 
 ### Working on the web app only
 
@@ -91,4 +92,38 @@ pnpm dev
 pnpm --filter=@mannachef/web dev
 pnpm --filter=@mannachef/web build
 pnpm --filter=@mannachef/web typecheck
+
+# The web app's own harnesses. The first two are run by `pnpm verify`:
+pnpm --filter=@mannachef/web test             # unit tests under src/**/*.test.ts
+pnpm --filter=@mannachef/web verify:referral  # the MCV-030 privilege regression
+pnpm --filter=@mannachef/web verify:superadmin # the MCV-031 concurrency regression
 ```
+
+`verify:referral` drives the real referral Server Actions — the real guard
+wrapper, the real schemas — against an in-memory database, and asserts that a
+`CLIENT` cannot state what their own invitation code is worth. It needs no
+PostgreSQL instance and no `DATABASE_URL`. See the docblock at the head of
+`apps/web/scripts/verify-referral-privilege.ts`.
+
+`verify:superadmin` asserts that two administrators acting at the same instant
+cannot between them leave the platform with no `SUPER_ADMIN`. Unlike every other
+harness here it needs a **real PostgreSQL**, because the property under test is
+one of PostgreSQL's isolation levels rather than one of the application's —
+write skew that `READ COMMITTED` permits and Serializable Snapshot Isolation
+refuses. It runs the same actions at both levels and prints the two outcomes
+side by side:
+
+```bash
+createdb mannachef_race
+DATABASE_URL='postgresql://…@localhost:5432/mannachef_race' \
+  pnpm --filter=@mannachef/db exec prisma db push
+DATABASE_URL='postgresql://…@localhost:5432/mannachef_race' \
+  pnpm --filter=@mannachef/web verify:superadmin
+```
+
+It **empties the identity tables** on every scenario, so it refuses to start
+unless the database name contains `race`, `test` or `harness`. That is also why
+it is deliberately _not_ wired into `pnpm verify`: the other harnesses need no
+services, and a `verify` that silently required a database would be a worse
+default than one extra command. See the docblock at the head of
+`apps/web/scripts/verify-superadmin-race.ts`.

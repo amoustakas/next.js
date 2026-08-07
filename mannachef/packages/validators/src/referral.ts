@@ -756,6 +756,75 @@ export type ReferralProgramUpsertRawInput = z.input<
 // =============================================================================
 
 /**
+ * An email address reduced to the mailbox it most likely reaches.
+ *
+ * Lower-cased, `+tag` suffixes dropped, and dots removed from the local part,
+ * so `Ada.Lovelace+dinner@Example.com` and `adalovelace@example.com` reduce to
+ * the same string. Returns `null` for anything that is not shaped like an
+ * address, and for the `null` a nullable `User.email` column yields, so a
+ * missing address never matches another missing address.
+ *
+ * ## This is a heuristic, and deliberately an over-broad one
+ *
+ * Dot-insensitivity is a *provider* convention — Gmail honours it, RFC 5321
+ * does not, and a mail host is entitled to treat `j.smith` and `jsmith` as two
+ * different people. Reducing every address this way therefore has false
+ * positives by construction. That is the trade this function is making: it
+ * exists for {@link sharesEmailIdentity}, whose job is to make the cheapest
+ * self-referral inconvenient rather than to prove kinship, and the cost of a
+ * false positive is one guest being told to use a different invitation.
+ */
+export function normalizeEmailIdentity(
+  email: string | null | undefined
+): string | null {
+  if (typeof email !== 'string') {
+    return null
+  }
+
+  const trimmed = email.trim().toLowerCase()
+  const at = trimmed.lastIndexOf('@')
+
+  if (at <= 0 || at === trimmed.length - 1) {
+    return null
+  }
+
+  const local = trimmed.slice(0, at)
+  const domain = trimmed.slice(at + 1)
+  /** `split(sep, 1)` keeps the head, so an untagged address is unchanged. */
+  const untagged = local.split('+', 1)[0] ?? ''
+  const undotted = untagged.replace(/\./g, '')
+
+  if (undotted.length === 0) {
+    return null
+  }
+
+  return `${undotted}@${domain}`
+}
+
+/**
+ * Do two addresses look like the same mailbox?
+ *
+ * `false` whenever either address is absent or malformed — the answer is "we
+ * cannot tell", and the caller must not read that as "they are different
+ * people" any more than as "they are the same". A `true` is a *deterrent*: it
+ * is what lets an action refuse the five-second version of a self-referral, in
+ * which the inviter signs a second account up to a plus-addressed alias of
+ * their own inbox. It proves nothing, and it is trivially defeated by a second
+ * genuine address, so nothing downstream of it may treat a `false` as a
+ * clearance. Deciding whether a referral was really earned stays where it was:
+ * with the administrator running the settlement sweep.
+ */
+export function sharesEmailIdentity(
+  left: string | null | undefined,
+  right: string | null | undefined
+): boolean {
+  const a = normalizeEmailIdentity(left)
+  const b = normalizeEmailIdentity(right)
+
+  return a !== null && b !== null && a === b
+}
+
+/**
  * Redeeming an invitation.
  *
  * The invited guest is normally the signed-in caller, so `referredUserId` is
@@ -764,8 +833,10 @@ export type ReferralProgramUpsertRawInput = z.input<
  * caller is entitled to act for them.
  *
  * The action additionally checks — inside the same transaction as the write —
- * that the code is active, unexpired, has redemptions left, and does not belong
- * to the guest redeeming it. None of those can be settled here.
+ * that the code is active, unexpired, has redemptions left, does not belong to
+ * the guest redeeming it, and is not being redeemed from an address that
+ * reduces to the owner's own mailbox ({@link sharesEmailIdentity}). None of
+ * those can be settled here.
  */
 export const referralRedemptionCreateSchema = z
   .object({

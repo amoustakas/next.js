@@ -16,25 +16,59 @@
  *    future reward, not a reward.
  *  - {@link settleReferralRedemptions} is the only automatic path to a credit,
  *    and it will not move a redemption off `PENDING` until it has found a real
- *    `Invoice` for the referred user with `status = 'PAID'`. The amount is
- *    computed from the code and that invoice — the operator running the sweep
- *    does not choose it.
+ *    `Invoice` for the referred user with `status = 'PAID'` **and an
+ *    `amountPaidCents` clearing the programme's
+ *    `minimumQualifyingInvoiceCents`**. The amount is computed from the code
+ *    and that invoice — the operator running the sweep does not choose it.
  *  - {@link updateReferralRedemption} is the manual path, and its `QUALIFY` and
  *    `REWARD` branches perform the *same* database check before they will do
  *    anything. An administrator cannot qualify a redemption by asserting it.
+ *
+ * ## What a code is worth is the house's to say (MCV-030)
+ *
+ * A reward is a liability, and below `ADMIN` the caller does not get to state
+ * one. {@link createReferralCode} discards `rewardType`, `rewardValueCents`,
+ * `rewardValuePercent`, `refereeRewardCents`, `currency`, `maxRedemptions` and
+ * `expiresAt` from the payload of anybody who is not staff and takes all seven
+ * from the standing `ReferralProgram` instead — the same shape as
+ * `booking.ts`'s `totalCents: staffCaller ? input.totalCents : 0` and
+ * `client.ts`'s staff-only `vipNotes`. {@link updateReferralCode} discards the
+ * same seven, because a strip on the create path is worth nothing if the amend
+ * path will raise the figure afterwards. With no active programme a subscriber
+ * is **refused**, never defaulted to something generous. See
+ * `@/server/referral-program` for the offer itself and for what the exploit
+ * looked like before it existed.
+ *
+ * Those are the only two. The rest of this file's mutations were audited in the
+ * same pass: {@link deactivateReferralCode} writes one boolean behind the
+ * ownership guard, {@link redeemReferralCode} writes a `PENDING` row whose
+ * every figure is copied from the code, and everything that touches the ledger
+ * — {@link settleReferralRedemptions}, {@link updateReferralRedemption},
+ * {@link payReferralReward}, {@link recordRewardAdjustment} and
+ * {@link recomputeRewardBalance} — is `ADMIN` or `SUPER_ADMIN` already. No
+ * other action below `ADMIN` writes a number the caller supplied.
  *
  * ## Anti-abuse, stated explicitly
  *
  * `redeemReferralCode` refuses, each with its own sentence on the `code` field:
  *
- * | Rule                        | Why                                          |
- * | --------------------------- | -------------------------------------------- |
- * | self-referral               | `ReferralCode.ownerId === referredUserId`     |
+ * | Rule                         | Why                                          |
+ * | ---------------------------- | -------------------------------------------- |
+ * | self-referral                | `ReferralCode.ownerId === referredUserId`     |
+ * | same mailbox as the owner    | {@link sharesEmailIdentity}, below `ADMIN`    |
  * | one redemption per user      | any live redemption already names them        |
  * | one redemption per code/user | `@@unique([referralCodeId, referredUserId])`  |
- * | `maxRedemptions`            | `redemptionCount` may not pass it             |
- * | `expiresAt`                 | an expired invitation is not an invitation    |
- * | `isActive`                  | a withdrawn code is not redeemable            |
+ * | `maxRedemptions`             | `redemptionCount` may not pass it             |
+ * | `expiresAt`                  | an expired invitation is not an invitation    |
+ * | `isActive`                   | a withdrawn code is not redeemable            |
+ *
+ * The second of those is a **deterrent, not a proof**: it catches the inviter
+ * who signs a second account up to a plus-addressed alias of their own inbox,
+ * and it is defeated by anybody willing to use a second real address. Nothing
+ * downstream may read its silence as a clearance. The control point for a
+ * referral that was not really earned remains where it has always been — an
+ * administrator, running or declining to run the settlement sweep, and
+ * `REVOKE` with `reverseLedgerEntry` when one gets through.
  *
  * The counter is bumped with a compare-and-swap on its own prior value, so two
  * guests redeeming the last seat of a capped code produce one redemption and
@@ -81,8 +115,10 @@ import {
   rewardAdjustmentSchema,
   rewardLedgerFilterSchema,
   rewardPayoutSchema,
+  sharesEmailIdentity,
   signedLedgerAmountCents,
   MAX_REWARD_CENTS,
+  type ReferralCodeCreateInput,
   type ReferralCodeSortBy,
   type ReferralRedemptionStatus,
   type RewardLedgerDirection,
@@ -111,6 +147,13 @@ import {
   withAction,
   type AuthenticatedUser,
 } from '@/server/guards'
+import {
+  readQualifyingFloorCents,
+  resolveProgramCodeTerms,
+  NO_PROGRAM_OFFER_MESSAGE,
+  PROGRAM_MISCONFIGURED_MESSAGE,
+  type ReferralCodeTerms,
+} from '@/server/referral-program'
 
 // =============================================================================
 // 0. Constants
@@ -650,7 +693,8 @@ interface QualifyingInvoice {
 }
 
 /**
- * The referred person's **first genuinely paid** invoice, or `null`.
+ * The referred person's **first genuinely paid, genuinely qualifying** invoice,
+ * or `null`.
  *
  * `status = 'PAID'` and `paidAt IS NOT NULL` together, because an invoice can
  * be marked paid by a webhook that has not yet stamped the moment, and the
@@ -660,16 +704,34 @@ interface QualifyingInvoice {
  *
  * This function is the whole of the "not at signup" rule. Every path that
  * credits a referral calls it, and none of them takes the caller's word for it.
+ *
+ * ## The floor (MCV-030)
+ *
+ * `minimumQualifyingInvoiceCents` is the programme's, read by
+ * {@link readQualifyingFloorCents}, and it is a **required argument**: `0` is
+ * the permissive reading, and defaulting to it here would put the permissive
+ * branch behind a forgotten parameter rather than behind a decision. Without a
+ * floor, a household paying a one-dollar invoice earns the inviter a full
+ * reward, which is the second half of the abuse this task closed.
+ *
+ * The floor filters rather than gates — the earliest invoice **that clears it**
+ * qualifies, not "the earliest invoice, if it happens to clear it". A household
+ * whose first bill was a two-dollar delivery and whose second was a four-figure
+ * dinner has converted; dating the referral to the dinner is both the truthful
+ * reading and the one that cannot be gamed by asking a referred guest to buy
+ * something trivial first.
  */
 async function findQualifyingInvoice(
   tx: Prisma.TransactionClient,
-  referredUserId: string
+  referredUserId: string,
+  minimumQualifyingInvoiceCents: number
 ): Promise<QualifyingInvoice | null> {
   const invoice = await tx.invoice.findFirst({
     where: {
       userId: referredUserId,
       status: 'PAID',
       paidAt: { not: null },
+      amountPaidCents: { gte: minimumQualifyingInvoiceCents },
     },
     orderBy: [{ paidAt: 'asc' }, { id: 'asc' }],
     select: {
@@ -792,6 +854,74 @@ async function mintReferralCode(
 }
 
 /**
+ * The seven fields on an invitation code that cost the business money, as an
+ * `ADMIN` stated them.
+ *
+ * Narrowed on the discriminant itself rather than through a boolean, so the two
+ * value columns are read from the branch that actually declares them, and both
+ * are written explicitly with one of them null so a code can never carry a
+ * stale percentage from a shape it no longer has.
+ */
+function statedCodeTerms(input: ReferralCodeCreateInput): ReferralCodeTerms {
+  const reward =
+    input.rewardType === 'PERCENT_DISCOUNT'
+      ? {
+          rewardValueCents: null,
+          rewardValuePercent: input.rewardValuePercent,
+        }
+      : {
+          rewardValueCents: input.rewardValueCents,
+          rewardValuePercent: null,
+        }
+
+  return {
+    rewardType: input.rewardType,
+    ...reward,
+    refereeRewardCents: input.refereeRewardCents ?? null,
+    currency: input.currency,
+    maxRedemptions: input.maxRedemptions ?? null,
+    expiresAt: input.expiresAt ?? null,
+  }
+}
+
+/**
+ * Decide what the code being minted is worth — from the payload for staff, from
+ * the standing offer for everybody else.
+ *
+ * Returns an `ActionResult` rather than the terms, because the two ways this
+ * can fail are refusals with their own sentences rather than exceptions, and
+ * because that is the shape every guard in `@/server/guards` already speaks.
+ */
+async function resolveCodeTerms(
+  db: Prisma.TransactionClient,
+  input: ReferralCodeCreateInput,
+  privileged: boolean,
+  now: Date
+): Promise<ActionResult<ReferralCodeTerms>> {
+  if (privileged) {
+    return ok(statedCodeTerms(input))
+  }
+
+  const outcome = await resolveProgramCodeTerms(db, now)
+
+  switch (outcome.kind) {
+    case 'terms':
+      return ok(outcome.terms)
+
+    case 'noOffer':
+      return fail('CONFLICT', NO_PROGRAM_OFFER_MESSAGE)
+
+    case 'misconfigured':
+      return fail('CONFLICT', PROGRAM_MISCONFIGURED_MESSAGE)
+
+    default: {
+      const exhaustive: never = outcome
+      return exhaustive
+    }
+  }
+}
+
+/**
  * Issue an invitation code.
  *
  * ## Whose code it is
@@ -810,12 +940,31 @@ async function mintReferralCode(
  * the database, which turns a clash into a field error on `code` rather than a
  * Prisma message.
  *
- * ## The reward
+ * ## The reward (MCV-030)
  *
  * `referralCodeCreateSchema` is a discriminated union over `rewardType`, so the
- * measure and its value already travel together. Both columns are written
- * explicitly, one of them null, so a code can never carry a stale percentage
- * from a shape it no longer has.
+ * measure and its value travel together and a well-formed payload always states
+ * a coherent pair. That is a statement about *shape*, and it was never a
+ * statement about *authority*: a `CLIENT` posting `rewardValueCents:
+ * 1_000_000` with `maxRedemptions: null` passes the schema perfectly, and
+ * before this change the action wrote it.
+ *
+ * So the payload's seven money-bearing fields are only honoured for `ADMIN` and
+ * above. For everybody else {@link resolveCodeTerms} reads them off the
+ * standing `ReferralProgram` and the payload's are discarded in silence — the
+ * same treatment `booking.ts` gives a guest-quoted `totalCents` and `client.ts`
+ * gives a guest-written `vipNotes`, and silent for the same reason: the form a
+ * subscriber submits legitimately renders the offer's figures back to us, so
+ * refusing the request would break the ordinary case in order to scold the
+ * hostile one.
+ *
+ * What is *not* discarded, because none of it is worth anything: `label`,
+ * `code`, `isActive`, and the `ownerId` the check above has already pinned to
+ * the caller.
+ *
+ * With no active programme, a subscriber is refused. There is no built-in
+ * fallback figure, and adding one would put a number nobody chose behind a
+ * payout.
  */
 export const createReferralCode = withAction(
   {
@@ -844,33 +993,26 @@ export const createReferralCode = withAction(
       return fail('NOT_FOUND', 'We could not find that account.')
     }
 
-    // Narrowed on the discriminant itself rather than through a boolean, so the
-    // two value columns are read from the branch that actually declares them.
-    const reward =
-      input.rewardType === 'PERCENT_DISCOUNT'
-        ? {
-            rewardValueCents: null,
-            rewardValuePercent: input.rewardValuePercent,
-          }
-        : {
-            rewardValueCents: input.rewardValueCents,
-            rewardValuePercent: null,
-          }
+    const now = new Date()
+    const terms = await resolveCodeTerms(ctx.db, input, privileged, now)
+
+    if (!terms.ok) {
+      return terms
+    }
 
     const shared = {
       ownerId: owner.id,
       label: input.label ?? null,
-      rewardType: input.rewardType,
-      ...reward,
-      refereeRewardCents: input.refereeRewardCents ?? null,
-      currency: input.currency,
-      maxRedemptions: input.maxRedemptions ?? null,
-      expiresAt: input.expiresAt ?? null,
+      rewardType: terms.data.rewardType,
+      rewardValueCents: terms.data.rewardValueCents,
+      rewardValuePercent: terms.data.rewardValuePercent,
+      refereeRewardCents: terms.data.refereeRewardCents,
+      currency: terms.data.currency,
+      maxRedemptions: terms.data.maxRedemptions,
+      expiresAt: terms.data.expiresAt,
       isActive: input.isActive,
       redemptionCount: 0,
     } satisfies Omit<Prisma.ReferralCodeUncheckedCreateInput, 'code'>
-
-    const now = new Date()
 
     if (input.code === undefined) {
       const minted = await ctx.db.$transaction((tx) =>
@@ -911,6 +1053,25 @@ export const createReferralCode = withAction(
  * code belonging to somebody else is indistinguishable from one that does not
  * exist.
  *
+ * ## Below `ADMIN`, the terms are not amendable at all (MCV-030)
+ *
+ * The same seven money-bearing fields {@link createReferralCode} takes from the
+ * standing programme are discarded here for the same callers: `rewardType`,
+ * `rewardValueCents`, `rewardValuePercent`, `refereeRewardCents`, `currency`,
+ * `maxRedemptions` and `expiresAt`. Stripping them on the create path alone
+ * would have been theatre — the code would be minted at the programme's figure
+ * and raised to a million cents by the very next call.
+ *
+ * Note that they are discarded in *both* directions, not merely clamped
+ * upwards. "A client code's terms are the programme's" is an invariant an
+ * auditor can check against one row; "a client may move the terms, but only in
+ * the house's favour" is a rule that has to be re-derived every time somebody
+ * adds a field. `currency` is in the list on the same grounds: re-denominating
+ * a CAD code as USD changes what it is worth without touching a figure.
+ *
+ * A subscriber keeps `label` and `isActive`, which is enough to rename an
+ * invitation and to withdraw one.
+ *
  * ## The two rules the schema cannot reach
  *
  * `referralCodeUpdateSchema` checks the reward pairing *within the payload*.
@@ -948,15 +1109,35 @@ export const updateReferralCode = withAction(
       return fail('NOT_FOUND')
     }
 
-    const mergedType: RewardType = input.rewardType ?? stored.rewardType
+    const privileged = hasRoleAtLeast(ctx.user.role, 'ADMIN')
+
+    /**
+     * The amendment as it will actually be applied. Every money-bearing key is
+     * read through this rather than off `input`, so a field added to
+     * `referralCodeUpdatableShape` later cannot reach the row by being wired up
+     * one line below the privilege check and nowhere near it.
+     */
+    const amend = {
+      rewardType: privileged ? input.rewardType : undefined,
+      rewardValueCents: privileged ? input.rewardValueCents : undefined,
+      rewardValuePercent: privileged ? input.rewardValuePercent : undefined,
+      refereeRewardCents: privileged ? input.refereeRewardCents : undefined,
+      currency: privileged ? input.currency : undefined,
+      maxRedemptions: privileged ? input.maxRedemptions : undefined,
+      expiresAt: privileged ? input.expiresAt : undefined,
+      label: input.label,
+      isActive: input.isActive,
+    } as const
+
+    const mergedType: RewardType = amend.rewardType ?? stored.rewardType
     const mergedCents =
-      input.rewardValueCents === undefined
+      amend.rewardValueCents === undefined
         ? stored.rewardValueCents
-        : input.rewardValueCents
+        : amend.rewardValueCents
     const mergedPercent =
-      input.rewardValuePercent === undefined
+      amend.rewardValuePercent === undefined
         ? stored.rewardValuePercent
-        : input.rewardValuePercent
+        : amend.rewardValuePercent
 
     const coherence = mergedRewardIsCoherent(
       mergedType,
@@ -969,9 +1150,9 @@ export const updateReferralCode = withAction(
     }
 
     if (
-      input.maxRedemptions !== undefined &&
-      input.maxRedemptions !== null &&
-      input.maxRedemptions < stored.redemptionCount
+      amend.maxRedemptions !== undefined &&
+      amend.maxRedemptions !== null &&
+      amend.maxRedemptions < stored.redemptionCount
     ) {
       return fail(
         'CONFLICT',
@@ -987,23 +1168,23 @@ export const updateReferralCode = withAction(
     const updated = await ctx.db.referralCode.update({
       where: { id: stored.id },
       data: {
-        ...(input.label === undefined ? {} : { label: input.label }),
-        ...(input.currency === undefined ? {} : { currency: input.currency }),
-        ...(input.refereeRewardCents === undefined
+        ...(amend.label === undefined ? {} : { label: amend.label }),
+        ...(amend.currency === undefined ? {} : { currency: amend.currency }),
+        ...(amend.refereeRewardCents === undefined
           ? {}
-          : { refereeRewardCents: input.refereeRewardCents }),
-        ...(input.maxRedemptions === undefined
+          : { refereeRewardCents: amend.refereeRewardCents }),
+        ...(amend.maxRedemptions === undefined
           ? {}
-          : { maxRedemptions: input.maxRedemptions }),
-        ...(input.expiresAt === undefined
+          : { maxRedemptions: amend.maxRedemptions }),
+        ...(amend.expiresAt === undefined
           ? {}
-          : { expiresAt: input.expiresAt }),
-        ...(input.isActive === undefined ? {} : { isActive: input.isActive }),
+          : { expiresAt: amend.expiresAt }),
+        ...(amend.isActive === undefined ? {} : { isActive: amend.isActive }),
         // The reward is written as a coherent triple whenever any part of it
         // moved, so the two value columns can never disagree with the type.
-        ...(input.rewardType === undefined &&
-        input.rewardValueCents === undefined &&
-        input.rewardValuePercent === undefined
+        ...(amend.rewardType === undefined &&
+        amend.rewardValueCents === undefined &&
+        amend.rewardValuePercent === undefined
           ? {}
           : {
               rewardType: mergedType,
@@ -1343,7 +1524,7 @@ export const redeemReferralCode = withAction(
     const receipt = await ctx.db.$transaction(async (tx) => {
       const account = await tx.user.findUnique({
         where: { id: referredUserId },
-        select: { id: true, isActive: true },
+        select: { id: true, isActive: true, email: true },
       })
 
       if (account === null || !account.isActive) {
@@ -1374,6 +1555,32 @@ export const redeemReferralCode = withAction(
         throw codeIssue(
           'An invitation code cannot be redeemed by its own owner.'
         )
+      }
+
+      // The identity check above catches one account redeeming its own code.
+      // It does not catch the five-second version of the same thing: mint a
+      // code, sign a second account up with a plus-addressed alias of the same
+      // inbox, redeem it there. `sharesEmailIdentity` refuses that, and it is a
+      // DETERRENT RATHER THAN A PROOF — it reduces both addresses to a likely
+      // mailbox (see its docblock), which has false positives by construction
+      // and is defeated outright by a second real address. Nothing downstream
+      // may read its silence as evidence a referral was earned; the control
+      // point remains an administrator, who chooses whether to run the
+      // settlement sweep and can `REVOKE` with `reverseLedgerEntry` afterwards.
+      //
+      // Skipped for `ADMIN` and above, who are the escape hatch when the
+      // heuristic is simply wrong about two members of one household.
+      if (!privileged) {
+        const owner = await tx.user.findUnique({
+          where: { id: code.ownerId },
+          select: { email: true },
+        })
+
+        if (sharesEmailIdentity(owner?.email, account.email)) {
+          throw codeIssue(
+            'That invitation appears to have been issued to this same household.'
+          )
+        }
       }
 
       const sameCode = await tx.referralRedemption.findUnique({
@@ -1451,7 +1658,8 @@ export const redeemReferralCode = withAction(
  *
  * Because it has no discretion. It cannot choose who is paid, or how much: the
  * population is "`PENDING` redemptions whose referred household has a paid
- * invoice", and the amount is `ownerRewardCents(code, invoice)`. Everything an
+ * invoice clearing the programme's floor", and the amount is
+ * `ownerRewardCents(code, invoice)`. Everything an
  * operator *can* decide — a goodwill grant, a hand-set figure, a reversal —
  * lives in the `SUPER_ADMIN` actions further down. Running the sweep is
  * operations; deciding an amount is finance.
@@ -1485,6 +1693,12 @@ export const settleReferralRedemptions = withAction(
       select: { id: true },
     })
 
+    // Read once for the batch rather than once per redemption: the floor is a
+    // property of the programme, not of the household, and a sweep that used
+    // two different floors because somebody saved the admin form halfway
+    // through would be a sweep nobody could reconcile afterwards.
+    const floorCents = await readQualifyingFloorCents(ctx.db)
+
     let qualified = 0
     let rewarded = 0
     let creditedCents = 0
@@ -1507,7 +1721,8 @@ export const settleReferralRedemptions = withAction(
 
         const invoice = await findQualifyingInvoice(
           tx,
-          redemption.referredUserId
+          redemption.referredUserId,
+          floorCents
         )
 
         if (invoice === null) {
@@ -1669,6 +1884,7 @@ export const updateReferralRedemption = withAction(
       }
 
       const code = redemption.referralCode
+      const floorCents = await readQualifyingFloorCents(tx)
 
       switch (input.action) {
         case 'QUALIFY': {
@@ -1681,7 +1897,8 @@ export const updateReferralRedemption = withAction(
 
           const invoice = await findQualifyingInvoice(
             tx,
-            redemption.referredUserId
+            redemption.referredUserId,
+            floorCents
           )
 
           if (invoice === null) {
@@ -1719,7 +1936,8 @@ export const updateReferralRedemption = withAction(
 
           const invoice = await findQualifyingInvoice(
             tx,
-            redemption.referredUserId
+            redemption.referredUserId,
+            floorCents
           )
 
           if (invoice === null) {
@@ -2078,7 +2296,11 @@ export const payReferralReward = withAction(
         )
       }
 
-      const invoice = await findQualifyingInvoice(tx, redemption.referredUserId)
+      const invoice = await findQualifyingInvoice(
+        tx,
+        redemption.referredUserId,
+        await readQualifyingFloorCents(tx)
+      )
 
       if (invoice === null) {
         throw new ActionError(
