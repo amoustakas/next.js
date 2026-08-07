@@ -1,0 +1,1533 @@
+// mannachef/apps/web/src/app/api/webhooks/stripe/route.ts
+
+/**
+ * The Stripe webhook endpoint — the only route on this platform that accepts a
+ * write from outside without a session behind it.
+ *
+ * `mannachef/CONTRACT.md` §5 states the four rules this file exists to keep:
+ * verify `stripe-signature` with `constructEvent`, run on the Node runtime,
+ * read the **raw** body, and be idempotent through a persisted `StripeEvent`
+ * ledger. Each is implemented below, in that order, and none of them is
+ * optional.
+ *
+ * ## 1. The raw body, and why `runtime = 'nodejs'`
+ *
+ * Stripe signs the exact bytes it sent. Anything that parses the body first —
+ * `req.json()`, a body-parsing middleware, a re-serialisation — changes those
+ * bytes (key order, whitespace, unicode escaping) and the signature will not
+ * verify. The handler therefore reads `await req.text()` **once**, before
+ * anything else looks at the request, and hands that same string to
+ * `constructEvent`. It never calls `req.json()`.
+ *
+ * The Node runtime is required rather than merely preferred: signature
+ * verification uses `node:crypto`, and so does the SHA-256 digest of the
+ * payload that the ledger stores in place of the payload itself.
+ *
+ * ## 2. Nothing is processed unverified
+ *
+ * A missing or bad signature is a **400** and stops there. An event object is
+ * just JSON until `constructEvent` has proved it came from Stripe; every field
+ * read below — the customer id, the amounts, the metadata that decides which
+ * user a subscription belongs to — would otherwise be attacker-controlled.
+ *
+ * ## 3. Idempotency: record first, then process
+ *
+ * The event id is inserted into the `StripeEvent` ledger **before** any effect
+ * runs, and the unique index on `stripeEventId` is what rejects a replay. The
+ * ordering is the interesting part:
+ *
+ *  - **Record-then-process** (what this does). A crash between the insert and
+ *    the effect leaves a row with `processedAt IS NULL`. Stripe redelivers, we
+ *    find that row, increment `attempts`, and run the effect again. Nothing is
+ *    dropped. The cost is that an effect may run more than once, which is why
+ *    every handler below is written to be idempotent — upserts keyed on the
+ *    Stripe id, monotonic guards, no blind increments.
+ *  - **Process-then-record** would lose the memory of a completed effect if the
+ *    crash landed the other side of it, replaying a non-idempotent write with
+ *    no record that it had already happened.
+ *  - **Both in one transaction** does not help either: the commit can succeed
+ *    and the process still die before the 200 reaches Stripe, so redelivery is
+ *    unavoidable no matter where the ledger write sits.
+ *
+ * So the semantics are deliberately **at-least-once**, and idempotency is the
+ * handlers' job rather than the transaction's. `attempts` is what makes that
+ * visible: a row whose `attempts` keeps climbing while `processedAt` stays null
+ * is an effect that cannot succeed, and after {@link MAX_PROCESSING_ATTEMPTS}
+ * it is left as a dead letter for an operator to sweep — see
+ * {@link admitEvent}.
+ *
+ * A replay of an already-processed event returns **200 immediately** and runs
+ * nothing.
+ *
+ * ## 4. Stripe delivers out of order
+ *
+ * Stripe makes no ordering guarantee, and retries make it worse: an event
+ * created at 10:00 that failed twice can arrive after one created at 10:05. A
+ * `customer.subscription.updated` carrying older state must not overwrite newer
+ * state, so every handler compares `event.created` against a watermark before
+ * it writes. See {@link isStaleAgainst} for the watermark, its one known
+ * imprecision, and the migration that would remove it.
+ *
+ * ## 5. Never logged, never persisted
+ *
+ * No secret, no raw payload, no card number. The ledger stores a SHA-256 digest
+ * of the body — `StripeEvent.payloadHash`, exactly as the schema comment
+ * requires — and the body itself is discarded. Log lines carry event ids,
+ * object ids and types; the response body carries an acknowledgement and
+ * nothing else. `errorMessage` on the ledger is a truncated exception summary
+ * for an operator and is never returned to the caller.
+ */
+
+import { createHash } from 'node:crypto'
+
+import {
+  paymentStatusAfterRefund,
+  type InvoiceStatus,
+  type PaymentMethodType,
+  type PaymentStatus,
+  type SubscriptionStatus,
+} from '@mannachef/validators'
+import type Stripe from 'stripe'
+
+import { Prisma, prisma } from '@/server/db'
+import { getStripe, STRIPE_CUSTOMER_USER_ID_KEY } from '@/server/stripe'
+
+/**
+ * Required. Signature verification and the payload digest both use
+ * `node:crypto`, which the edge runtime does not provide in the form the
+ * Stripe SDK expects.
+ */
+export const runtime = 'nodejs'
+
+/**
+ * A webhook is never cached and never prerendered. `POST` handlers are dynamic
+ * by default; this states it so a future `export const revalidate` somewhere in
+ * the segment tree cannot quietly change it.
+ */
+export const dynamic = 'force-dynamic'
+
+// =============================================================================
+// 1. Constants
+// =============================================================================
+
+/**
+ * How many times an event may fail before it is abandoned.
+ *
+ * Beyond this the handler answers 200 so Stripe stops redelivering, and the
+ * ledger row — `processedAt IS NULL`, `errorMessage` set, `attempts` at the
+ * ceiling — becomes the dead letter. `@@index([processedAt])` exists on
+ * `StripeEvent` precisely so that queue can be swept.
+ *
+ * The alternative, answering 500 forever, hands the alerting to Stripe's own
+ * dashboard but re-runs a broken effect roughly fifteen more times over three
+ * days. Failing loudly into a table we own is the better trade for a platform
+ * whose effects touch money.
+ */
+const MAX_PROCESSING_ATTEMPTS = 5
+
+/** How much of an exception summary the ledger keeps. Operator-facing only. */
+const MAX_LEDGER_ERROR_LENGTH = 400
+
+/** Stripe payment-method type strings we have an enum member for. */
+const PAYMENT_METHOD_TYPES: Readonly<Record<string, PaymentMethodType>> = {
+  card: 'CARD',
+  card_present: 'CARD',
+  link: 'CARD',
+  us_bank_account: 'ACH_DEBIT',
+  ach_debit: 'ACH_DEBIT',
+  acss_debit: 'ACH_DEBIT',
+  au_becs_debit: 'ACH_DEBIT',
+  bacs_debit: 'ACH_DEBIT',
+  sepa_debit: 'ACH_DEBIT',
+  customer_balance: 'BANK_TRANSFER',
+  interac_present: 'INTERAC',
+}
+
+// =============================================================================
+// 2. The route
+// =============================================================================
+
+interface AcknowledgementBody {
+  readonly received: boolean
+  /** `true` when the ledger recognised the event and nothing was re-run. */
+  readonly duplicate?: boolean
+  /** `false` when the event is one this platform has no opinion about. */
+  readonly handled?: boolean
+  /** Present when an ordering guard or a missing linkage skipped the write. */
+  readonly skipped?: string
+}
+
+function acknowledge(body: AcknowledgementBody, status = 200): Response {
+  return Response.json(body, { status })
+}
+
+function refuse(reason: string, status: number): Response {
+  // The reason is a fixed string chosen from the four below — never an
+  // exception message, which could carry detail about our configuration.
+  return Response.json({ received: false, error: reason }, { status })
+}
+
+export async function POST(request: Request): Promise<Response> {
+  const signature = request.headers.get('stripe-signature')
+
+  if (signature === null || signature.length === 0) {
+    return refuse('missing signature', 400)
+  }
+
+  const webhookSecret = readWebhookSecret()
+
+  if (webhookSecret === null) {
+    // A deployment that receives Stripe webhooks without a signing secret
+    // cannot verify anything, and must never fall back to trusting the body.
+    console.error(
+      '[stripe-webhook] STRIPE_WEBHOOK_SECRET is not configured; refusing the delivery.'
+    )
+
+    return refuse('webhook unavailable', 500)
+  }
+
+  // The client is obtained *before* the verification try/catch on purpose.
+  // `getStripe()` throws when `STRIPE_SECRET_KEY` is absent, and folding that
+  // throw into the catch below would answer 400 — which Stripe reads as a
+  // permanent rejection and stops retrying. A missing key is a deployment
+  // fault that will be fixed, so it must be a retryable 500.
+  let stripe: Stripe
+
+  try {
+    stripe = getStripe()
+  } catch (error) {
+    console.error('[stripe-webhook] Stripe client unavailable', {
+      reason: summariseError(error),
+    })
+
+    return refuse('webhook unavailable', 500)
+  }
+
+  // The raw bytes, read exactly once and never re-parsed. `request.json()` is
+  // deliberately not called anywhere in this file.
+  const rawBody = await request.text()
+
+  let event: Stripe.Event
+
+  try {
+    event = stripe.webhooks.constructEvent(rawBody, signature, webhookSecret)
+  } catch (error) {
+    // The exception carries the reason verification failed. It is logged
+    // without the payload and never returned.
+    console.error('[stripe-webhook] signature verification failed', {
+      reason: summariseError(error),
+    })
+
+    return refuse('invalid signature', 400)
+  }
+
+  const payloadHash = createHash('sha256').update(rawBody).digest('hex')
+  const eventCreatedAt = new Date(event.created * 1000)
+
+  let admission: Admission
+
+  try {
+    admission = await admitEvent(event, payloadHash)
+  } catch (error) {
+    // The ledger is unreachable. Refusing to process is the only safe answer:
+    // running the effect without a ledger row would leave no memory of it and
+    // let the redelivery run it a second time.
+    console.error(`[stripe-webhook] ledger write failed for ${event.id}`, {
+      reason: summariseError(error),
+    })
+
+    return refuse('processing failed', 500)
+  }
+
+  if (admission === 'duplicate') {
+    // Already processed. Acknowledge and run nothing — this is the whole point
+    // of the ledger.
+    return acknowledge({ received: true, duplicate: true })
+  }
+
+  if (admission === 'exhausted') {
+    console.error(
+      `[stripe-webhook] abandoning ${event.type} ${event.id} after ${MAX_PROCESSING_ATTEMPTS} failed attempts; left unprocessed in the ledger.`
+    )
+
+    return acknowledge({ received: true, handled: false, skipped: 'abandoned' })
+  }
+
+  try {
+    const outcome = await processEvent(event, eventCreatedAt)
+
+    // `updateMany` rather than `update`: the ledger row is addressed by its
+    // Stripe id, and a `P2025` here — if the row were swept between admission
+    // and completion — must not turn a completed effect into a 500 that asks
+    // Stripe to run it again.
+    await prisma.stripeEvent.updateMany({
+      where: { stripeEventId: event.id },
+      data: { processedAt: new Date(), errorMessage: null },
+    })
+
+    return acknowledge({
+      received: true,
+      handled: outcome.handled,
+      ...(outcome.skipped !== undefined ? { skipped: outcome.skipped } : {}),
+    })
+  } catch (error) {
+    const summary = summariseError(error)
+
+    console.error(`[stripe-webhook] ${event.type} ${event.id} failed`, {
+      reason: summary,
+    })
+
+    await prisma.stripeEvent
+      .updateMany({
+        where: { stripeEventId: event.id },
+        data: { errorMessage: summary },
+      })
+      .catch(() => {
+        // The ledger write is best-effort. Losing the note must not mask the
+        // 500 that asks Stripe to redeliver.
+      })
+
+    // 500 tells Stripe to retry. `processedAt` is still null, so the retry
+    // will be admitted rather than treated as a duplicate.
+    return refuse('processing failed', 500)
+  }
+}
+
+function readWebhookSecret(): string | null {
+  const raw = process.env['STRIPE_WEBHOOK_SECRET']
+
+  if (raw === undefined) {
+    return null
+  }
+
+  const trimmed = raw.trim()
+  return trimmed.length > 0 ? trimmed : null
+}
+
+/**
+ * A short, operator-facing summary of a thrown value.
+ *
+ * Deliberately not the whole error: no stack, no cause chain, truncated. It is
+ * written to `StripeEvent.errorMessage` and to the server log, and it is never
+ * part of a response body.
+ */
+function summariseError(error: unknown): string {
+  if (error instanceof Prisma.PrismaClientKnownRequestError) {
+    return `PrismaClientKnownRequestError (${error.code})`.slice(
+      0,
+      MAX_LEDGER_ERROR_LENGTH
+    )
+  }
+
+  if (error instanceof Error) {
+    return `${error.name}: ${error.message}`.slice(0, MAX_LEDGER_ERROR_LENGTH)
+  }
+
+  return 'unknown error'
+}
+
+// =============================================================================
+// 3. The idempotency ledger
+// =============================================================================
+
+/** What {@link admitEvent} decided. */
+type Admission =
+  /** Run the effect. Either the first delivery, or a retry of a failed one. */
+  | 'admitted'
+  /** Already processed successfully. Acknowledge, run nothing. */
+  | 'duplicate'
+  /** Failed too many times. Acknowledge, run nothing, leave a dead letter. */
+  | 'exhausted'
+
+/**
+ * Insert the event into the ledger, or decide what to do with the row that is
+ * already there.
+ *
+ * The insert is attempted **first and unconditionally**, so the unique index on
+ * `StripeEvent.stripeEventId` — not a read-then-write, which two concurrent
+ * deliveries of the same event would both pass — is what serialises the
+ * decision. Only the loser of that race takes the `P2002` branch.
+ *
+ * `attempts` starts at 1 on the first admission and is incremented on every
+ * subsequent one, so it counts *attempts to process*, not deliveries received.
+ */
+async function admitEvent(
+  event: Stripe.Event,
+  payloadHash: string
+): Promise<Admission> {
+  try {
+    await prisma.stripeEvent.create({
+      data: {
+        stripeEventId: event.id,
+        type: event.type,
+        apiVersion: event.api_version,
+        livemode: event.livemode,
+        payloadHash,
+        attempts: 1,
+      },
+    })
+
+    return 'admitted'
+  } catch (error) {
+    if (
+      !(error instanceof Prisma.PrismaClientKnownRequestError) ||
+      error.code !== 'P2002'
+    ) {
+      throw error
+    }
+  }
+
+  const existing = await prisma.stripeEvent.findUnique({
+    where: { stripeEventId: event.id },
+    select: { id: true, processedAt: true, attempts: true },
+  })
+
+  if (existing === null) {
+    // The row lost the insert race and then disappeared — only possible if a
+    // sweep deleted it in between. Treat the delivery as new; the handlers are
+    // idempotent, so re-running is safe, and the completion write below uses
+    // `updateMany`, which tolerates the absent row.
+    return 'admitted'
+  }
+
+  if (existing.processedAt !== null) {
+    return 'duplicate'
+  }
+
+  if (existing.attempts >= MAX_PROCESSING_ATTEMPTS) {
+    return 'exhausted'
+  }
+
+  await prisma.stripeEvent.update({
+    where: { id: existing.id },
+    data: { attempts: { increment: 1 } },
+  })
+
+  return 'admitted'
+}
+
+// =============================================================================
+// 4. Ordering guards
+// =============================================================================
+
+/**
+ * `true` when this event describes state older than what is already stored.
+ *
+ * ## The watermark
+ *
+ * `lastWrittenAt` is the row's `updatedAt`, which is the moment we last wrote
+ * it — from a webhook or from a Server Action. An event created before that
+ * moment is describing a world we have already moved past, so applying it would
+ * be a regression: a retried `customer.subscription.updated` from an hour ago
+ * resurrecting a subscription that has since been cancelled, for instance.
+ *
+ * ## The one imprecision, stated plainly
+ *
+ * `event.created` has one-second resolution, while `updatedAt` is a wall-clock
+ * instant that includes however long *we* took to process the previous event.
+ * If two events for the same object are created less than one processing
+ * latency apart, the second can look older than the first's write. Two things
+ * keep that from mattering:
+ *
+ *  1. The comparison floors the watermark to its second, so an event created in
+ *     the same second as the last write is **not** treated as stale.
+ *  2. Where the object carries its own monotonic field, that field is checked
+ *     as well and takes precedence — `current_period_start` for a subscription,
+ *     the cumulative `amount_refunded` for a charge. Those are exact.
+ *
+ * The clean fix is a dedicated `lastStripeEventAt DateTime?` column on
+ * `UserSubscription`, `Invoice` and `PaymentHistory`, written from
+ * `event.created` rather than from the clock, which would make the comparison
+ * exact in both directions. It needs a migration this task does not own, and it
+ * is the first thing to add when one is next cut.
+ */
+function isStaleAgainst(eventCreatedAt: Date, lastWrittenAt: Date): boolean {
+  const watermark = Math.floor(lastWrittenAt.getTime() / 1000) * 1000
+
+  return eventCreatedAt.getTime() < watermark
+}
+
+// =============================================================================
+// 5. Shared mapping helpers
+// =============================================================================
+
+/** What a handler did, for the acknowledgement body and the logs. */
+interface HandlerOutcome {
+  /** `false` for an event type this platform has no opinion about. */
+  readonly handled: boolean
+  /** Why nothing was written, when nothing was. */
+  readonly skipped?: string
+}
+
+const HANDLED: HandlerOutcome = { handled: true }
+const UNHANDLED: HandlerOutcome = { handled: false }
+
+function skipped(reason: string): HandlerOutcome {
+  return { handled: true, skipped: reason }
+}
+
+/** The id of a Stripe reference that may or may not have been expanded. */
+function stripeIdOf(
+  value: string | { id: string } | null | undefined
+): string | null {
+  if (value === null || value === undefined) {
+    return null
+  }
+
+  return typeof value === 'string' ? value : value.id
+}
+
+/** `null` for a Stripe timestamp that is absent. */
+function fromUnixSeconds(value: number | null | undefined): Date | null {
+  return value === null || value === undefined ? null : new Date(value * 1000)
+}
+
+/**
+ * Our `SubscriptionStatus` for a Stripe subscription.
+ *
+ * The schema keeps Stripe's American single-L `CANCELED` on the billing enums
+ * deliberately, so all eight of Stripe's statuses uppercase straight across.
+ * Do not confuse this with the *domain* enums — `AppointmentStatus.CANCELLED`
+ * and `BookingSlotStatus.CANCELLED` are double-L, because they are ours rather
+ * than Stripe's, and a mapping that reached for the wrong spelling would not
+ * compile.
+ *
+ * The only derivation is the pause. Stripe leaves `status` at `active` while
+ * `pause_collection` is set — `PAUSED` is our own state — so it is derived from
+ * the presence of that object, exactly as `changeSubscription` derives it when
+ * it sets the pause. Without this, the `customer.subscription.updated` that
+ * follows a pause would immediately un-pause the row we had just paused. A
+ * delinquent or terminal status always wins: a subscriber whose card has failed
+ * is `PAST_DUE`, resting or not.
+ */
+function subscriptionStatusFor(
+  subscription: Stripe.Subscription
+): SubscriptionStatus {
+  const mapped = subscriptionStatusName(subscription.status)
+
+  if (
+    subscription.pause_collection !== null &&
+    (mapped === 'ACTIVE' || mapped === 'TRIALING')
+  ) {
+    return 'PAUSED'
+  }
+
+  return mapped
+}
+
+/**
+ * Stripe's eight subscription statuses, written out rather than uppercased.
+ *
+ * The uppercase really is a straight mapping — that is why the schema keeps the
+ * single-L spelling — but writing it as a `switch` makes a ninth status Stripe
+ * might add a **compile error** instead of an invalid enum value handed to
+ * Postgres at three in the morning.
+ */
+function subscriptionStatusName(
+  status: Stripe.Subscription.Status
+): SubscriptionStatus {
+  switch (status) {
+    case 'active':
+      return 'ACTIVE'
+
+    case 'canceled':
+      return 'CANCELED'
+
+    case 'incomplete':
+      return 'INCOMPLETE'
+
+    case 'incomplete_expired':
+      return 'INCOMPLETE_EXPIRED'
+
+    case 'past_due':
+      return 'PAST_DUE'
+
+    case 'paused':
+      return 'PAUSED'
+
+    case 'trialing':
+      return 'TRIALING'
+
+    case 'unpaid':
+      return 'UNPAID'
+
+    default: {
+      const exhaustive: never = status
+      void exhaustive
+      return 'INCOMPLETE'
+    }
+  }
+}
+
+/**
+ * Our `InvoiceStatus` for a Stripe invoice.
+ *
+ * A `null` status is only ever seen on an *upcoming* invoice, which is never
+ * delivered by webhook; it becomes `DRAFT` rather than crashing the delivery.
+ */
+function invoiceStatusFor(invoice: Stripe.Invoice): InvoiceStatus {
+  switch (invoice.status) {
+    case 'draft':
+    case null:
+      return 'DRAFT'
+
+    case 'open':
+      return 'OPEN'
+
+    case 'paid':
+      return 'PAID'
+
+    case 'uncollectible':
+      return 'UNCOLLECTIBLE'
+
+    case 'void':
+      return 'VOID'
+
+    default: {
+      const exhaustive: never = invoice.status
+      void exhaustive
+      return 'DRAFT'
+    }
+  }
+}
+
+/**
+ * Our `PaymentStatus` for a Stripe payment intent.
+ *
+ * `requires_capture` has no member of its own — this platform never separates
+ * authorisation from capture — so it maps onto `REQUIRES_CONFIRMATION`, the
+ * nearest "waiting on us" state. Everything else is a straight uppercase, and
+ * the refund states are reached from `charge.refunded` rather than from here.
+ */
+function paymentStatusFor(status: Stripe.PaymentIntent.Status): PaymentStatus {
+  switch (status) {
+    case 'requires_payment_method':
+      return 'REQUIRES_PAYMENT_METHOD'
+
+    case 'requires_confirmation':
+    case 'requires_capture':
+      return 'REQUIRES_CONFIRMATION'
+
+    case 'requires_action':
+      return 'REQUIRES_ACTION'
+
+    case 'processing':
+      return 'PROCESSING'
+
+    case 'succeeded':
+      return 'SUCCEEDED'
+
+    case 'canceled':
+      return 'CANCELED'
+
+    default: {
+      // A new member of Stripe's status union is a compile error here rather
+      // than a payment silently filed as "processing" forever.
+      const exhaustive: never = status
+      void exhaustive
+      return 'PROCESSING'
+    }
+  }
+}
+
+function paymentMethodFor(charge: Stripe.Charge | null): PaymentMethodType {
+  const type = charge?.payment_method_details?.type
+
+  if (type === undefined) {
+    return 'OTHER'
+  }
+
+  return PAYMENT_METHOD_TYPES[type] ?? 'OTHER'
+}
+
+/**
+ * The MannaChef user behind a Stripe object.
+ *
+ * Four sources, cheapest and most trustworthy first. Every candidate is
+ * confirmed against the `User` table before it is used: the metadata is written
+ * by us, but a foreign key violation deep inside a handler is a far worse
+ * failure than a skipped event, and confirming costs one indexed read.
+ *
+ *  1. `metadata.mannachefUserId` — set by `createCheckoutSession` on both the
+ *     session and the subscription.
+ *  2. `client_reference_id` — the Checkout session's own copy of the same id.
+ *  3. The local `UserSubscription` rows for this customer. Any existing
+ *     subscriber resolves here with no network call.
+ *  4. The Stripe customer: its metadata, then its email address.
+ */
+async function resolveUserId(args: {
+  metadata?: Stripe.Metadata | null
+  clientReferenceId?: string | null
+  customer?: string | Stripe.Customer | Stripe.DeletedCustomer | null
+}): Promise<string | null> {
+  const fromMetadata = await confirmUserId(
+    args.metadata?.[STRIPE_CUSTOMER_USER_ID_KEY]
+  )
+
+  if (fromMetadata !== null) {
+    return fromMetadata
+  }
+
+  const fromReference = await confirmUserId(args.clientReferenceId)
+
+  if (fromReference !== null) {
+    return fromReference
+  }
+
+  const customerId = stripeIdOf(args.customer ?? null)
+
+  if (customerId === null) {
+    return null
+  }
+
+  const local = await prisma.userSubscription.findFirst({
+    where: { stripeCustomerId: customerId },
+    orderBy: { createdAt: 'desc' },
+    select: { userId: true },
+  })
+
+  if (local !== null) {
+    return local.userId
+  }
+
+  return resolveUserIdFromCustomer(args.customer ?? customerId)
+}
+
+async function confirmUserId(
+  candidate: string | null | undefined
+): Promise<string | null> {
+  if (candidate === undefined || candidate === null || candidate.length === 0) {
+    return null
+  }
+
+  const user = await prisma.user.findUnique({
+    where: { id: candidate },
+    select: { id: true },
+  })
+
+  return user?.id ?? null
+}
+
+/**
+ * The user behind a Stripe customer, from the customer object itself.
+ *
+ * Retrieves the customer when only an id was delivered. A deleted customer has
+ * neither metadata nor an email, so it resolves to `null` and the event is
+ * skipped rather than misattributed.
+ */
+async function resolveUserIdFromCustomer(
+  customer: string | Stripe.Customer | Stripe.DeletedCustomer
+): Promise<string | null> {
+  let resolved: Stripe.Customer | Stripe.DeletedCustomer
+
+  if (typeof customer === 'string') {
+    resolved = await getStripe().customers.retrieve(customer)
+  } else {
+    resolved = customer
+  }
+
+  if (resolved.deleted === true) {
+    return null
+  }
+
+  const fromMetadata = await confirmUserId(
+    resolved.metadata[STRIPE_CUSTOMER_USER_ID_KEY]
+  )
+
+  if (fromMetadata !== null) {
+    return fromMetadata
+  }
+
+  if (resolved.email === null || resolved.email.length === 0) {
+    return null
+  }
+
+  const byEmail = await prisma.user.findUnique({
+    where: { email: resolved.email },
+    select: { id: true },
+  })
+
+  return byEmail?.id ?? null
+}
+
+// =============================================================================
+// 6. Dispatch
+// =============================================================================
+
+/**
+ * Route a verified event to its handler.
+ *
+ * Anything not listed is acknowledged and ignored. Stripe sends a great deal
+ * this platform has no opinion about, and answering 500 to those would make
+ * Stripe retry them for three days apiece.
+ */
+async function processEvent(
+  event: Stripe.Event,
+  eventCreatedAt: Date
+): Promise<HandlerOutcome> {
+  switch (event.type) {
+    case 'checkout.session.completed':
+      return handleCheckoutCompleted(event.data.object, eventCreatedAt)
+
+    case 'customer.subscription.created':
+    case 'customer.subscription.updated':
+    case 'customer.subscription.deleted':
+    case 'customer.subscription.paused':
+    case 'customer.subscription.resumed':
+      return handleSubscriptionChanged(event.data.object, eventCreatedAt)
+
+    case 'invoice.finalized':
+    case 'invoice.paid':
+    case 'invoice.payment_succeeded':
+    case 'invoice.payment_failed':
+    case 'invoice.marked_uncollectible':
+    case 'invoice.voided':
+      return handleInvoiceChanged(event.data.object, eventCreatedAt)
+
+    case 'payment_intent.succeeded':
+    case 'payment_intent.processing':
+    case 'payment_intent.payment_failed':
+    case 'payment_intent.canceled':
+      return handlePaymentIntentChanged(event.data.object, eventCreatedAt)
+
+    case 'charge.refunded':
+      return handleChargeRefunded(event.data.object, eventCreatedAt)
+
+    default:
+      return UNHANDLED
+  }
+}
+
+// =============================================================================
+// 7. Checkout
+// =============================================================================
+
+/**
+ * A guest finished paying.
+ *
+ * Two effects, both idempotent:
+ *
+ *  1. **The subscription is written immediately** rather than waited for. The
+ *     `customer.subscription.created` event will arrive too and would do the
+ *     same upsert, but it may be seconds behind the browser redirect — and the
+ *     page the guest lands on is the billing page. Retrieving the subscription
+ *     here means it is already there when they arrive.
+ *  2. **The invitation code, if one was carried, is redeemed.** The code was
+ *     validated when the session was opened; this is where it becomes a
+ *     `ReferralRedemption`, because until now no money had changed hands.
+ *
+ * A session whose `payment_status` is still `unpaid` — an asynchronous method
+ * that has not settled — redeems nothing. `checkout.session.async_payment_
+ * succeeded` is the event for that case, and this platform does not yet offer
+ * such a method.
+ */
+async function handleCheckoutCompleted(
+  session: Stripe.Checkout.Session,
+  eventCreatedAt: Date
+): Promise<HandlerOutcome> {
+  const userId = await resolveUserId({
+    metadata: session.metadata,
+    clientReferenceId: session.client_reference_id,
+    customer: session.customer,
+  })
+
+  if (userId === null) {
+    console.error(
+      `[stripe-webhook] checkout.session.completed ${session.id}: no MannaChef user could be resolved.`
+    )
+
+    return skipped('unknown-user')
+  }
+
+  const subscriptionId = stripeIdOf(session.subscription)
+
+  if (subscriptionId !== null) {
+    const subscription =
+      await getStripe().subscriptions.retrieve(subscriptionId)
+
+    await handleSubscriptionChanged(subscription, eventCreatedAt)
+  }
+
+  const referralCodeId = session.metadata?.['mannachefReferralCodeId']
+
+  if (
+    referralCodeId !== undefined &&
+    referralCodeId.length > 0 &&
+    session.payment_status !== 'unpaid'
+  ) {
+    await recordReferralRedemption(referralCodeId, userId)
+  }
+
+  return HANDLED
+}
+
+/**
+ * Turn a validated invitation code into a `ReferralRedemption`.
+ *
+ * Idempotent twice over: the read inside the transaction returns early when the
+ * redemption already exists, and `@@unique([referralCodeId, referredUserId])`
+ * catches the concurrent case, which is swallowed because a duplicate here
+ * means the work is already done.
+ *
+ * Only the redemption and the code's counter are written. Crediting the reward
+ * — `RewardBalance`, `RewardLedgerEntry` — belongs to the referral domain,
+ * which owns the append-only ledger and the compensating-entry rules; writing
+ * a balance from here would fork that authority.
+ */
+async function recordReferralRedemption(
+  referralCodeId: string,
+  referredUserId: string
+): Promise<void> {
+  try {
+    await prisma.$transaction(async (tx) => {
+      const code = await tx.referralCode.findUnique({
+        where: { id: referralCodeId },
+        select: {
+          id: true,
+          ownerId: true,
+          isActive: true,
+          expiresAt: true,
+          maxRedemptions: true,
+          redemptionCount: true,
+          rewardValueCents: true,
+          currency: true,
+        },
+      })
+
+      if (code === null || !code.isActive || code.ownerId === referredUserId) {
+        return
+      }
+
+      if (code.expiresAt !== null && code.expiresAt.getTime() <= Date.now()) {
+        return
+      }
+
+      if (
+        code.maxRedemptions !== null &&
+        code.redemptionCount >= code.maxRedemptions
+      ) {
+        return
+      }
+
+      const existing = await tx.referralRedemption.findUnique({
+        where: {
+          referralCodeId_referredUserId: {
+            referralCodeId: code.id,
+            referredUserId,
+          },
+        },
+        select: { id: true },
+      })
+
+      if (existing !== null) {
+        return
+      }
+
+      await tx.referralRedemption.create({
+        data: {
+          referralCodeId: code.id,
+          referredUserId,
+          status: 'QUALIFIED',
+          qualifiedAt: new Date(),
+          rewardCents: code.rewardValueCents,
+          currency: code.currency,
+        },
+      })
+
+      await tx.referralCode.update({
+        where: { id: code.id },
+        data: { redemptionCount: { increment: 1 } },
+      })
+    })
+  } catch (error) {
+    if (
+      error instanceof Prisma.PrismaClientKnownRequestError &&
+      error.code === 'P2002'
+    ) {
+      // Two deliveries raced. The redemption exists, which is the outcome.
+      return
+    }
+
+    throw error
+  }
+}
+
+// =============================================================================
+// 8. Subscriptions
+// =============================================================================
+
+/**
+ * Mirror a Stripe subscription onto `UserSubscription`.
+ *
+ * Serves `created`, `updated`, `deleted`, `paused` and `resumed` alike, because
+ * all five carry a complete subscription object and the correct response to
+ * every one of them is "make our row say what Stripe says".
+ *
+ * ## Two ordering guards
+ *
+ *  1. `current_period_start` going **backwards** is decisive: an event
+ *     describing an earlier billing period is describing the past, whatever its
+ *     timestamp says. This is exact, because Stripe advances the field
+ *     monotonically.
+ *  2. {@link isStaleAgainst} on `event.created` catches the within-period case
+ *     — a retried `updated` arriving after a newer one.
+ *
+ * ## Two linkages that can fail
+ *
+ * The plan is resolved from the price on the subscription's first item; the
+ * user from the metadata, the customer, or an existing row. Either failing is a
+ * skip rather than an error: a subscription created directly in the Stripe
+ * dashboard on a price we do not sell has nothing to attach to, and retrying it
+ * for three days will not change that. Both are logged with ids.
+ */
+async function handleSubscriptionChanged(
+  subscription: Stripe.Subscription,
+  eventCreatedAt: Date
+): Promise<HandlerOutcome> {
+  const existing = await prisma.userSubscription.findUnique({
+    where: { stripeSubscriptionId: subscription.id },
+    select: {
+      id: true,
+      userId: true,
+      planId: true,
+      updatedAt: true,
+      currentPeriodStart: true,
+    },
+  })
+
+  const currentPeriodStart = new Date(subscription.current_period_start * 1000)
+
+  if (existing !== null) {
+    if (currentPeriodStart.getTime() < existing.currentPeriodStart.getTime()) {
+      return skipped('older-billing-period')
+    }
+
+    if (isStaleAgainst(eventCreatedAt, existing.updatedAt)) {
+      return skipped('stale-event')
+    }
+  }
+
+  const planId = await resolvePlanId(subscription, existing?.planId ?? null)
+
+  if (planId === null) {
+    console.error(
+      `[stripe-webhook] subscription ${subscription.id}: no SubscriptionPlan matches its price.`
+    )
+
+    return skipped('unknown-plan')
+  }
+
+  const userId =
+    existing?.userId ??
+    (await resolveUserId({
+      metadata: subscription.metadata,
+      customer: subscription.customer,
+    }))
+
+  if (userId === null) {
+    console.error(
+      `[stripe-webhook] subscription ${subscription.id}: no MannaChef user could be resolved.`
+    )
+
+    return skipped('unknown-user')
+  }
+
+  const customerId = stripeIdOf(subscription.customer)
+
+  if (customerId === null) {
+    console.error(
+      `[stripe-webhook] subscription ${subscription.id}: no customer on the object.`
+    )
+
+    return skipped('unknown-customer')
+  }
+
+  const item = subscription.items.data[0]
+  const status = subscriptionStatusFor(subscription)
+
+  // A `deleted` event always carries `canceled_at`, but Stripe has been known
+  // to omit `ended_at` on subscriptions cancelled from the dashboard. Falling
+  // back to the event's own clock keeps the column honest without inventing a
+  // moment out of nothing.
+  const endedAt =
+    fromUnixSeconds(subscription.ended_at) ??
+    (status === 'CANCELED' ? eventCreatedAt : null)
+
+  const shared = {
+    planId,
+    status,
+    quantity: item?.quantity ?? 1,
+    currency: subscription.currency.toUpperCase(),
+    currentPeriodStart,
+    currentPeriodEnd: new Date(subscription.current_period_end * 1000),
+    cancelAtPeriodEnd: subscription.cancel_at_period_end,
+    cancelAt: fromUnixSeconds(subscription.cancel_at),
+    canceledAt: fromUnixSeconds(subscription.canceled_at),
+    endedAt,
+    trialEndsAt: fromUnixSeconds(subscription.trial_end),
+    pausedUntil: fromUnixSeconds(
+      subscription.pause_collection?.resumes_at ?? null
+    ),
+  } satisfies Prisma.UserSubscriptionUncheckedUpdateInput
+
+  await prisma.userSubscription.upsert({
+    where: { stripeSubscriptionId: subscription.id },
+    create: {
+      ...shared,
+      userId,
+      stripeSubscriptionId: subscription.id,
+      stripeCustomerId: customerId,
+      startedAt: new Date(subscription.created * 1000),
+    },
+    // `userId`, `stripeCustomerId` and `startedAt` are deliberately not
+    // updated: the payer and the moment the relationship began do not change,
+    // and re-writing them from a late event is how a subscription ends up
+    // attached to the wrong household.
+    update: shared,
+  })
+
+  return HANDLED
+}
+
+/**
+ * Which of our plans this subscription is sold on.
+ *
+ * Matched on `stripePriceId`, which is unique on `SubscriptionPlan`. Falls back
+ * to the plan already recorded, so a price archived in Stripe after a
+ * subscriber joined does not detach them from their plan.
+ */
+async function resolvePlanId(
+  subscription: Stripe.Subscription,
+  fallbackPlanId: string | null
+): Promise<string | null> {
+  const priceId = subscription.items.data[0]?.price.id
+
+  if (priceId !== undefined) {
+    const plan = await prisma.subscriptionPlan.findUnique({
+      where: { stripePriceId: priceId },
+      select: { id: true },
+    })
+
+    if (plan !== null) {
+      return plan.id
+    }
+  }
+
+  return fallbackPlanId
+}
+
+// =============================================================================
+// 9. Invoices
+// =============================================================================
+
+/**
+ * Mirror a Stripe invoice onto `Invoice`.
+ *
+ * Serves the whole invoice lifecycle, `payment_succeeded` and `payment_failed`
+ * included, because each carries the complete invoice and the right response to
+ * all of them is the same upsert. The status comes from the object rather than
+ * from the event name: `invoice.payment_failed` leaves an invoice `open`, and
+ * inferring `UNCOLLECTIBLE` from the event name would be wrong.
+ *
+ * `isManual` is set to `false` on insert and **never touched on update**: a
+ * bespoke invoice raised by `createManualInvoice` and later pushed to Stripe
+ * must not lose the flag that says a person wrote it.
+ *
+ * The human-facing `number` is unique across the whole table, and Stripe's
+ * numbering scheme is not aware of the house one. A collision with a
+ * hand-written `MC-2026-0148` would fail the upsert, so it is checked for and
+ * the Stripe number dropped rather than the event failing — the Stripe id
+ * remains the authoritative reference either way.
+ */
+async function handleInvoiceChanged(
+  invoice: Stripe.Invoice,
+  eventCreatedAt: Date
+): Promise<HandlerOutcome> {
+  const existing = await prisma.invoice.findUnique({
+    where: { stripeInvoiceId: invoice.id },
+    select: { id: true, userId: true, updatedAt: true },
+  })
+
+  if (existing !== null && isStaleAgainst(eventCreatedAt, existing.updatedAt)) {
+    return skipped('stale-event')
+  }
+
+  const userId =
+    existing?.userId ??
+    (await resolveUserId({
+      metadata: invoice.metadata,
+      customer: invoice.customer,
+    }))
+
+  if (userId === null) {
+    console.error(
+      `[stripe-webhook] invoice ${invoice.id}: no MannaChef user could be resolved.`
+    )
+
+    return skipped('unknown-user')
+  }
+
+  const subscriptionId = await resolveLocalSubscriptionId(invoice.subscription)
+  const number = await resolveInvoiceNumber(invoice)
+
+  const discountCents = (invoice.total_discount_amounts ?? []).reduce(
+    (total, entry) => total + entry.amount,
+    0
+  )
+
+  const shared = {
+    status: invoiceStatusFor(invoice),
+    amountDueCents: invoice.amount_due,
+    amountPaidCents: invoice.amount_paid,
+    amountRemainingCents: invoice.amount_remaining,
+    subtotalCents: invoice.subtotal,
+    taxCents: invoice.tax ?? 0,
+    discountCents,
+    currency: invoice.currency.toUpperCase(),
+    hostedInvoiceUrl: invoice.hosted_invoice_url ?? null,
+    pdfUrl: invoice.invoice_pdf ?? null,
+    description: invoice.description,
+    number,
+    subscriptionId,
+    issuedAt: fromUnixSeconds(invoice.status_transitions.finalized_at),
+    dueAt: fromUnixSeconds(invoice.due_date),
+    paidAt: fromUnixSeconds(invoice.status_transitions.paid_at),
+    voidedAt: fromUnixSeconds(invoice.status_transitions.voided_at),
+  } satisfies Prisma.InvoiceUncheckedUpdateInput
+
+  await prisma.invoice.upsert({
+    where: { stripeInvoiceId: invoice.id },
+    create: {
+      ...shared,
+      userId,
+      stripeInvoiceId: invoice.id,
+      isManual: false,
+    },
+    update: shared,
+  })
+
+  return HANDLED
+}
+
+/** Our `UserSubscription` id for the Stripe subscription an invoice names. */
+async function resolveLocalSubscriptionId(
+  subscription: string | Stripe.Subscription | null
+): Promise<string | null> {
+  const stripeSubscriptionId = stripeIdOf(subscription)
+
+  if (stripeSubscriptionId === null) {
+    return null
+  }
+
+  const row = await prisma.userSubscription.findUnique({
+    where: { stripeSubscriptionId },
+    select: { id: true },
+  })
+
+  return row?.id ?? null
+}
+
+/**
+ * The invoice number to store, or `null` when the house sequence already owns
+ * it. See the note on collisions in {@link handleInvoiceChanged}.
+ */
+async function resolveInvoiceNumber(
+  invoice: Stripe.Invoice
+): Promise<string | null> {
+  if (invoice.number === null || invoice.number.length === 0) {
+    return null
+  }
+
+  const clash = await prisma.invoice.findUnique({
+    where: { number: invoice.number },
+    select: { stripeInvoiceId: true },
+  })
+
+  if (clash === null || clash.stripeInvoiceId === invoice.id) {
+    return invoice.number
+  }
+
+  console.error(
+    `[stripe-webhook] invoice ${invoice.id}: number ${invoice.number} is already held by another invoice; storing without it.`
+  )
+
+  return null
+}
+
+// =============================================================================
+// 10. Payments
+// =============================================================================
+
+/**
+ * Mirror a Stripe payment intent onto `PaymentHistory`.
+ *
+ * ## Refund state is never clobbered
+ *
+ * `refundedCents` is written only on insert. `charge.refunded` owns that column
+ * afterwards, and a `payment_intent.succeeded` arriving late must not reset a
+ * refund to zero or move a `REFUNDED` row back to `SUCCEEDED` — so a row that
+ * already carries a refund keeps the refund-derived status.
+ *
+ * ## Card details cost one extra call, and only on success
+ *
+ * `latest_charge` arrives as a bare id. The brand, the last four digits and the
+ * receipt URL live on the charge, and `@mannachef/api-contract` exposes all
+ * three — a client quoting a receipt is the fastest route through a support
+ * conversation. The charge is therefore retrieved, but only for a payment that
+ * actually succeeded, and a retrieval that fails degrades to `null` columns
+ * rather than failing the whole event. Nothing beyond the brand and the last
+ * four is ever stored (`CONTRACT.md` §5).
+ */
+async function handlePaymentIntentChanged(
+  intent: Stripe.PaymentIntent,
+  eventCreatedAt: Date
+): Promise<HandlerOutcome> {
+  const existing = await prisma.paymentHistory.findUnique({
+    where: { stripePaymentIntentId: intent.id },
+    select: {
+      id: true,
+      userId: true,
+      updatedAt: true,
+      refundedCents: true,
+    },
+  })
+
+  if (existing !== null && isStaleAgainst(eventCreatedAt, existing.updatedAt)) {
+    return skipped('stale-event')
+  }
+
+  const userId =
+    existing?.userId ??
+    (await resolveUserId({
+      metadata: intent.metadata,
+      customer: intent.customer,
+    }))
+
+  if (userId === null) {
+    console.error(
+      `[stripe-webhook] payment_intent ${intent.id}: no MannaChef user could be resolved.`
+    )
+
+    return skipped('unknown-user')
+  }
+
+  const charge =
+    intent.status === 'succeeded'
+      ? await loadCharge(intent.latest_charge)
+      : typeof intent.latest_charge === 'object'
+        ? intent.latest_charge
+        : null
+
+  const card = charge?.payment_method_details?.card ?? null
+
+  const invoiceId = await resolveLocalInvoiceId(intent.invoice)
+  const subscriptionId =
+    invoiceId === null ? null : await subscriptionIdForInvoice(invoiceId)
+
+  // A refunded row keeps its refund-derived status; otherwise Stripe's own.
+  const status: PaymentStatus =
+    existing !== null && existing.refundedCents > 0
+      ? paymentStatusAfterRefund(intent.amount, existing.refundedCents)
+      : paymentStatusFor(intent.status)
+
+  const processedAt =
+    intent.status === 'succeeded'
+      ? (fromUnixSeconds(charge?.created) ?? eventCreatedAt)
+      : null
+
+  const shared = {
+    invoiceId,
+    subscriptionId,
+    stripeChargeId: stripeIdOf(intent.latest_charge),
+    amountCents: intent.amount,
+    feeCents: null,
+    currency: intent.currency.toUpperCase(),
+    status,
+    method: paymentMethodFor(charge),
+    cardBrand: card?.brand ?? null,
+    cardLast4: card?.last4 ?? null,
+    failureCode: intent.last_payment_error?.code ?? null,
+    failureReason: intent.last_payment_error?.message ?? null,
+    receiptUrl: charge?.receipt_url ?? null,
+    processedAt,
+  } satisfies Prisma.PaymentHistoryUncheckedUpdateInput
+
+  await prisma.paymentHistory.upsert({
+    where: { stripePaymentIntentId: intent.id },
+    create: {
+      ...shared,
+      userId,
+      stripePaymentIntentId: intent.id,
+      refundedCents: 0,
+    },
+    // `refundedCents` is absent on purpose — see the docblock.
+    update: shared,
+  })
+
+  return HANDLED
+}
+
+/**
+ * The charge behind a payment intent, or `null`.
+ *
+ * A retrieval failure is swallowed: the receipt URL and the card brand are
+ * conveniences, and losing them must not cost us the record that the money
+ * moved. The reason is logged without the payload.
+ */
+async function loadCharge(
+  latestCharge: string | Stripe.Charge | null
+): Promise<Stripe.Charge | null> {
+  if (latestCharge === null) {
+    return null
+  }
+
+  if (typeof latestCharge !== 'string') {
+    return latestCharge
+  }
+
+  try {
+    return await getStripe().charges.retrieve(latestCharge)
+  } catch (error) {
+    console.error(
+      `[stripe-webhook] could not retrieve charge ${latestCharge}`,
+      { reason: summariseError(error) }
+    )
+
+    return null
+  }
+}
+
+async function resolveLocalInvoiceId(
+  invoice: string | Stripe.Invoice | null
+): Promise<string | null> {
+  const stripeInvoiceId = stripeIdOf(invoice)
+
+  if (stripeInvoiceId === null) {
+    return null
+  }
+
+  const row = await prisma.invoice.findUnique({
+    where: { stripeInvoiceId },
+    select: { id: true },
+  })
+
+  return row?.id ?? null
+}
+
+async function subscriptionIdForInvoice(
+  invoiceId: string
+): Promise<string | null> {
+  const row = await prisma.invoice.findUnique({
+    where: { id: invoiceId },
+    select: { subscriptionId: true },
+  })
+
+  return row?.subscriptionId ?? null
+}
+
+/**
+ * Money went back.
+ *
+ * ## Cumulative, and therefore monotonic
+ *
+ * `charge.amount_refunded` is the running total of everything refunded on that
+ * charge, not the increment. That makes it a perfect ordering guard in its own
+ * right: an event carrying a **smaller** total than the one already stored is
+ * describing an earlier refund and is dropped, whatever its timestamp says.
+ * Two partial refunds delivered out of order therefore settle on the larger
+ * figure rather than on whichever arrived last.
+ *
+ * `paymentStatusAfterRefund` decides between `PARTIALLY_REFUNDED` and
+ * `REFUNDED`; it lives in `@mannachef/validators` beside the enum rather than
+ * being restated here.
+ *
+ * A refund for a charge we have no row for is written as a new
+ * `PaymentHistory` when the payer can be resolved — a charge taken outside this
+ * platform and refunded through the dashboard still belongs in the ledger.
+ */
+async function handleChargeRefunded(
+  charge: Stripe.Charge,
+  eventCreatedAt: Date
+): Promise<HandlerOutcome> {
+  const paymentIntentId = stripeIdOf(charge.payment_intent)
+
+  const existing =
+    paymentIntentId === null
+      ? await prisma.paymentHistory.findFirst({
+          where: { stripeChargeId: charge.id },
+          orderBy: { createdAt: 'desc' },
+          select: {
+            id: true,
+            userId: true,
+            amountCents: true,
+            refundedCents: true,
+          },
+        })
+      : await prisma.paymentHistory.findUnique({
+          where: { stripePaymentIntentId: paymentIntentId },
+          select: {
+            id: true,
+            userId: true,
+            amountCents: true,
+            refundedCents: true,
+          },
+        })
+
+  const refundedCents = charge.amount_refunded
+
+  if (existing !== null) {
+    if (refundedCents <= existing.refundedCents) {
+      return skipped('refund-already-recorded')
+    }
+
+    await prisma.paymentHistory.update({
+      where: { id: existing.id },
+      data: {
+        refundedCents,
+        status: paymentStatusAfterRefund(existing.amountCents, refundedCents),
+        refundedAt: eventCreatedAt,
+        stripeChargeId: charge.id,
+        receiptUrl: charge.receipt_url ?? null,
+      },
+    })
+
+    return HANDLED
+  }
+
+  const userId = await resolveUserId({
+    metadata: charge.metadata,
+    customer: charge.customer,
+  })
+
+  if (userId === null) {
+    console.error(
+      `[stripe-webhook] charge ${charge.id}: refunded, but no MannaChef user could be resolved.`
+    )
+
+    return skipped('unknown-user')
+  }
+
+  const card = charge.payment_method_details?.card ?? null
+
+  await prisma.paymentHistory.create({
+    data: {
+      userId,
+      ...(paymentIntentId !== null
+        ? { stripePaymentIntentId: paymentIntentId }
+        : {}),
+      stripeChargeId: charge.id,
+      amountCents: charge.amount,
+      refundedCents,
+      currency: charge.currency.toUpperCase(),
+      status: paymentStatusAfterRefund(charge.amount, refundedCents),
+      method: paymentMethodFor(charge),
+      cardBrand: card?.brand ?? null,
+      cardLast4: card?.last4 ?? null,
+      receiptUrl: charge.receipt_url ?? null,
+      processedAt: new Date(charge.created * 1000),
+      refundedAt: eventCreatedAt,
+    },
+  })
+
+  return HANDLED
+}

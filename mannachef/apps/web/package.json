@@ -9,6 +9,8 @@
     "start": "next start",
     "lint": "eslint .",
     "typecheck": "tsc --noEmit",
+    "test": "node --experimental-strip-types --disable-warning=ExperimentalWarning --import ./scripts/register.mjs --test \"src/**/*.test.ts\"",
+    "verify": "pnpm run test",
     "db:generate": "turbo run db:generate --filter=@mannachef/db"
   },
   "dependencies": {
