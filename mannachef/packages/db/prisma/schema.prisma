@@ -1,0 +1,1542 @@
+// mannachef/packages/db/prisma/schema.prisma
+
+// =============================================================================
+// MannaChef — Platform & Business OS
+// Prisma 6 / PostgreSQL
+//
+// Conventions (see mannachef/CONTRACT.md §4):
+//   - Models are PascalCase singular, fields camelCase, enum values SCREAMING_SNAKE_CASE.
+//   - Every model (except the Auth.js `VerificationToken` / `Authenticator` adapter models,
+//     whose shape is dictated by @auth/prisma-adapter) carries:
+//         id String @id @default(cuid())
+//         createdAt DateTime @default(now())
+//         updatedAt DateTime @updatedAt
+//   - Money is ALWAYS an integer count of minor units, suffixed `…Cents`, paired with a
+//     `currency` VarChar(3) where the amount can stand on its own. Never Float, never Decimal.
+//   - Durations are Int minutes. All DateTime values are stored in UTC.
+//   - onDelete: Cascade for owned children, SetNull for optional audit/attribution
+//     references, Restrict where a delete must be blocked by referential integrity.
+// =============================================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// =============================================================================
+// 1. IDENTITY
+// =============================================================================
+
+enum Role {
+  SUPER_ADMIN
+  ADMIN
+  CHEF_STAFF
+  CLIENT
+}
+
+enum ClientStatus {
+  PROSPECT
+  LEAD_QUALIFIED
+  ACTIVE_SUBSCRIBER
+  PAUSED
+  CHURNED
+}
+
+enum ClientSource {
+  ORGANIC_SEARCH
+  PAID_SEARCH
+  SOCIAL
+  REFERRAL
+  PARTNER
+  EVENT
+  WORD_OF_MOUTH
+  DIRECT
+  OTHER
+}
+
+enum ContactMethod {
+  EMAIL
+  PHONE
+  SMS
+  IN_APP
+}
+
+/// Application user. Auth.js v5 (`@auth/prisma-adapter`) owns the
+/// `id / name / email / emailVerified / image / accounts / sessions` surface;
+/// everything else is MannaChef domain state.
+model User {
+  id            String    @id @default(cuid())
+  name          String?   @db.VarChar(200)
+  email         String?   @unique @db.VarChar(320)
+  emailVerified DateTime?
+  image         String?   @db.Text
+
+  role     Role    @default(CLIENT)
+  phone    String? @db.VarChar(32)
+  timeZone String  @default("America/Toronto") @db.VarChar(64)
+  locale   String  @default("en-CA") @db.VarChar(12)
+  isActive Boolean @default(true)
+
+  lastLoginAt   DateTime?
+  deactivatedAt DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // --- Auth.js adapter relations -------------------------------------------
+  accounts       Account[]
+  sessions       Session[]
+  authenticators Authenticator[]
+
+  // --- Profiles -------------------------------------------------------------
+  clientProfile ClientProfile?
+  staffProfile  StaffProfile?
+
+  // --- Media ----------------------------------------------------------------
+  uploadedMedia MediaAsset[] @relation("MediaUploader")
+
+  // --- Reviews --------------------------------------------------------------
+  reviewsAuthored  Review[] @relation("ReviewAuthor")
+  reviewsModerated Review[] @relation("ReviewModerator")
+
+  // --- Billing --------------------------------------------------------------
+  subscriptions  UserSubscription[] @relation("SubscriptionSubscriber")
+  invoices       Invoice[]          @relation("InvoiceRecipient")
+  invoicesIssued Invoice[]          @relation("InvoiceIssuer")
+  payments       PaymentHistory[]   @relation("PaymentPayer")
+
+  // --- Growth ---------------------------------------------------------------
+  referralCodesOwned  ReferralCode[]       @relation("ReferralCodeOwner")
+  referralsReceived   ReferralRedemption[] @relation("ReferralReferredUser")
+  rewardBalance       RewardBalance?
+  rewardLedgerEntries RewardLedgerEntry[]  @relation("RewardLedgerSubject")
+  rewardLedgerActions RewardLedgerEntry[]  @relation("RewardLedgerActor")
+
+  // --- Onboarding -----------------------------------------------------------
+  consultationsConducted ConsultationInterview[] @relation("ConsultationInterviewer")
+
+  // --- Calendar -------------------------------------------------------------
+  appointmentsCancelled ChefAppointment[] @relation("AppointmentCanceller")
+
+  // --- CRM ------------------------------------------------------------------
+  clientNotesAuthored ClientNote[]     @relation("ClientNoteAuthor")
+  interactionsLogged  InteractionLog[] @relation("InteractionLogger")
+
+  @@index([role, isActive])
+  @@index([createdAt])
+}
+
+/// Auth.js v5 Prisma adapter model — field names are dictated by the adapter
+/// (snake_case OAuth fields are intentional) and must not be renamed.
+model Account {
+  id                       String  @id @default(cuid())
+  userId                   String
+  type                     String
+  provider                 String
+  providerAccountId        String
+  refresh_token            String? @db.Text
+  access_token             String? @db.Text
+  expires_at               Int?
+  token_type               String?
+  scope                    String?
+  id_token                 String? @db.Text
+  session_state            String?
+  refresh_token_expires_in Int?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([provider, providerAccountId])
+  @@index([userId])
+}
+
+/// Auth.js v5 Prisma adapter model.
+model Session {
+  id           String   @id @default(cuid())
+  sessionToken String   @unique
+  userId       String
+  expires      DateTime
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([expires])
+}
+
+/// Auth.js v5 Prisma adapter model. Intentionally has NO `id` column — the
+/// adapter identifies rows by the [identifier, token] composite key.
+model VerificationToken {
+  identifier String
+  token      String
+  expires    DateTime
+
+  @@unique([identifier, token])
+  @@index([expires])
+}
+
+/// Auth.js v5 Prisma adapter model for WebAuthn / passkeys. Composite primary
+/// key and column names are dictated by the adapter.
+model Authenticator {
+  credentialID         String  @unique
+  userId               String
+  providerAccountId    String
+  credentialPublicKey  String
+  counter              Int
+  credentialDeviceType String
+  credentialBackedUp   Boolean
+  transports           String?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@id([userId, credentialID])
+  @@index([userId])
+}
+
+/// Everything MannaChef knows about a paying (or prospective) household.
+model ClientProfile {
+  id     String @id @default(cuid())
+  userId String @unique
+
+  displayName   String?      @db.VarChar(200)
+  status        ClientStatus @default(PROSPECT)
+  source        ClientSource @default(DIRECT)
+  sourceDetail  String?      @db.VarChar(200)
+  preferredName String?      @db.VarChar(120)
+  phone         String?      @db.VarChar(32)
+
+  preferredContactMethod ContactMethod @default(EMAIL)
+
+  lifetimeValueCents Int    @default(0)
+  currency           String @default("CAD") @db.VarChar(3)
+
+  lastContactedAt DateTime?
+  followUpAt      DateTime?
+  churnedAt       DateTime?
+  churnReason     String?   @db.Text
+  vipNotes        String?   @db.Text
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  onboardingFlow OnboardingFlow?
+  intakeForm     ClientIntakeForm?
+
+  consultations ConsultationInterview[] @relation("ConsultationClient")
+  appointments  ChefAppointment[]       @relation("AppointmentClient")
+  notes         ClientNote[]            @relation("ClientNoteSubject")
+  interactions  InteractionLog[]        @relation("InteractionSubject")
+
+  @@index([status, followUpAt])
+  @@index([status, lastContactedAt])
+  @@index([source])
+  @@index([createdAt])
+}
+
+/// A chef / culinary staff member who can be booked.
+model StaffProfile {
+  id     String @id @default(cuid())
+  userId String @unique
+
+  title            String?  @db.VarChar(160)
+  bio              String?  @db.Text
+  specialties      String[]
+  languages        String[]
+  hourlyRateCents  Int      @default(0)
+  currency         String   @default("CAD") @db.VarChar(3)
+  serviceRadiusKm  Int      @default(25)
+  yearsExperience  Int?
+  baseCity         String?  @db.VarChar(120)
+  baseRegion       String?  @db.VarChar(120)
+  baseCountry      String?  @db.VarChar(2)
+  calendarTimeZone String   @default("America/Toronto") @db.VarChar(64)
+
+  isAcceptingClients  Boolean @default(true)
+  maxConcurrentEvents Int     @default(1)
+  isPubliclyListed    Boolean @default(true)
+  sortOrder           Int     @default(0)
+
+  avatarMediaId String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user        User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  avatarMedia MediaAsset? @relation("StaffAvatarMedia", fields: [avatarMediaId], references: [id], onDelete: SetNull)
+
+  availability  ChefAvailability[]      @relation("AvailabilityStaff")
+  bookingSlots  BookingSlot[]           @relation("BookingSlotStaff")
+  appointments  ChefAppointment[]       @relation("AppointmentStaff")
+  consultations ConsultationInterview[] @relation("ConsultationStaff")
+  reviews       Review[]                @relation("ReviewStaffSubject")
+
+  @@index([isAcceptingClients, isPubliclyListed])
+  @@index([avatarMediaId])
+  @@index([sortOrder])
+}
+
+// =============================================================================
+// 2. MENU PRIMITIVES
+// =============================================================================
+
+enum TagKind {
+  DIETARY
+  ALLERGEN
+  CUISINE
+  TECHNIQUE
+  OCCASION
+}
+
+enum SpiceLevel {
+  NONE
+  MILD
+  MEDIUM
+  HOT
+  FIERY
+}
+
+enum MeasurementUnit {
+  GRAM
+  KILOGRAM
+  MILLILITER
+  LITER
+  OUNCE
+  POUND
+  TEASPOON
+  TABLESPOON
+  CUP
+  PIECE
+  CLOVE
+  BUNCH
+  SLICE
+  PINCH
+  TO_TASTE
+}
+
+model MenuCategory {
+  id          String  @id @default(cuid())
+  slug        String  @unique @db.VarChar(160)
+  name        String  @db.VarChar(200)
+  tagline     String? @db.VarChar(280)
+  description String? @db.Text
+  sortOrder   Int     @default(0)
+  isActive    Boolean @default(true)
+
+  heroMediaId String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  heroMedia MediaAsset? @relation("MenuCategoryHeroMedia", fields: [heroMediaId], references: [id], onDelete: SetNull)
+
+  subcategories MenuSubcategory[] @relation("SubcategoryParent")
+  items         MenuItem[]        @relation("MenuItemCategory")
+
+  @@index([isActive, sortOrder])
+  @@index([heroMediaId])
+}
+
+model MenuSubcategory {
+  id         String @id @default(cuid())
+  categoryId String
+
+  slug        String  @db.VarChar(160)
+  name        String  @db.VarChar(200)
+  description String? @db.Text
+  sortOrder   Int     @default(0)
+  isActive    Boolean @default(true)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  category MenuCategory @relation("SubcategoryParent", fields: [categoryId], references: [id], onDelete: Cascade)
+  items    MenuItem[]   @relation("MenuItemSubcategory")
+
+  @@unique([categoryId, slug])
+  @@index([categoryId, sortOrder])
+  @@index([isActive])
+}
+
+model MenuItem {
+  id            String  @id @default(cuid())
+  slug          String  @unique @db.VarChar(160)
+  categoryId    String
+  subcategoryId String?
+
+  name        String  @db.VarChar(200)
+  description String? @db.Text
+  /// Long-form narrative shown on the dish detail page.
+  story       String? @db.Text
+  /// Sommelier-style tasting note / pairing guidance.
+  tastingNote String? @db.Text
+  pairingNote String? @db.Text
+  chefNote    String? @db.Text
+
+  basePriceCents Int
+  currency       String @default("CAD") @db.VarChar(3)
+
+  servingSize     String? @db.VarChar(120)
+  servingsPerUnit Int?
+  prepTimeMinutes Int?
+  cookTimeMinutes Int?
+
+  calories    Int?
+  proteinGram Int?
+  carbGram    Int?
+  fatGram     Int?
+
+  spiceLevel SpiceLevel @default(NONE)
+
+  isSeasonal  Boolean @default(false)
+  /// 1–12, inclusive. Null when the item is not seasonal.
+  seasonStart Int?
+  seasonEnd   Int?
+
+  isActive    Boolean @default(true)
+  isSignature Boolean @default(false)
+  sortOrder   Int     @default(0)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  category    MenuCategory     @relation("MenuItemCategory", fields: [categoryId], references: [id], onDelete: Restrict)
+  subcategory MenuSubcategory? @relation("MenuItemSubcategory", fields: [subcategoryId], references: [id], onDelete: SetNull)
+
+  tags         MenuItemTag[]         @relation("MenuItemTagItem")
+  ingredients  MenuItemIngredient[]  @relation("MenuItemIngredientItem")
+  media        MenuItemMedia[]       @relation("MenuItemMediaItem")
+  reviews      Review[]              @relation("ReviewMenuItemSubject")
+  appointments AppointmentMenuItem[] @relation("AppointmentMenuItemItem")
+
+  @@index([categoryId, isActive, sortOrder])
+  @@index([subcategoryId])
+  @@index([isActive, isSignature])
+  @@index([isSeasonal, seasonStart, seasonEnd])
+  @@index([basePriceCents])
+}
+
+model Tag {
+  id          String  @id @default(cuid())
+  slug        String  @unique @db.VarChar(160)
+  name        String  @db.VarChar(160)
+  kind        TagKind
+  description String? @db.Text
+  colorToken  String? @db.VarChar(64)
+  sortOrder   Int     @default(0)
+  isActive    Boolean @default(true)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  menuItems         MenuItemTag[]         @relation("MenuItemTagTag")
+  media             MediaTag[]            @relation("MediaTagTag")
+  intakePreferences ClientIntakeFormTag[] @relation("IntakeTagTag")
+
+  @@unique([kind, name])
+  @@index([kind, sortOrder])
+  @@index([isActive])
+}
+
+model MenuItemTag {
+  id         String @id @default(cuid())
+  menuItemId String
+  tagId      String
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  menuItem MenuItem @relation("MenuItemTagItem", fields: [menuItemId], references: [id], onDelete: Cascade)
+  tag      Tag      @relation("MenuItemTagTag", fields: [tagId], references: [id], onDelete: Cascade)
+
+  @@unique([menuItemId, tagId])
+  @@index([tagId])
+}
+
+model Ingredient {
+  id   String @id @default(cuid())
+  slug String @unique @db.VarChar(160)
+  name String @unique @db.VarChar(200)
+
+  description   String?         @db.Text
+  sourcingNote  String?         @db.Text
+  isAllergen    Boolean         @default(false)
+  isActive      Boolean         @default(true)
+  defaultUnit   MeasurementUnit @default(GRAM)
+  unitCostCents Int?
+  currency      String          @default("CAD") @db.VarChar(3)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  menuItems MenuItemIngredient[] @relation("MenuItemIngredientIngredient")
+
+  @@index([isAllergen])
+  @@index([isActive])
+}
+
+model MenuItemIngredient {
+  id           String @id @default(cuid())
+  menuItemId   String
+  ingredientId String
+
+  quantity    Decimal         @db.Decimal(10, 3)
+  unit        MeasurementUnit @default(GRAM)
+  preparation String?         @db.VarChar(200)
+  isOptional  Boolean         @default(false)
+  isGarnish   Boolean         @default(false)
+  sortOrder   Int             @default(0)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  menuItem   MenuItem   @relation("MenuItemIngredientItem", fields: [menuItemId], references: [id], onDelete: Cascade)
+  ingredient Ingredient @relation("MenuItemIngredientIngredient", fields: [ingredientId], references: [id], onDelete: Restrict)
+
+  @@unique([menuItemId, ingredientId])
+  @@index([ingredientId])
+  @@index([menuItemId, sortOrder])
+}
+
+model MenuItemMedia {
+  id           String @id @default(cuid())
+  menuItemId   String
+  mediaAssetId String
+
+  sortOrder Int     @default(0)
+  isPrimary Boolean @default(false)
+  caption   String? @db.VarChar(280)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  menuItem   MenuItem   @relation("MenuItemMediaItem", fields: [menuItemId], references: [id], onDelete: Cascade)
+  mediaAsset MediaAsset @relation("MenuItemMediaAsset", fields: [mediaAssetId], references: [id], onDelete: Cascade)
+
+  @@unique([menuItemId, mediaAssetId])
+  @@index([mediaAssetId])
+  @@index([menuItemId, sortOrder])
+  @@index([menuItemId, isPrimary])
+}
+
+// =============================================================================
+// 3. MEDIA
+// =============================================================================
+
+enum MediaProvider {
+  UPLOADTHING
+  S3
+  CLOUDINARY
+  VERCEL_BLOB
+  EXTERNAL
+}
+
+enum MediaKind {
+  IMAGE
+  VIDEO
+  DOCUMENT
+  AUDIO
+}
+
+model MediaAsset {
+  id           String  @id @default(cuid())
+  url          String  @db.Text
+  thumbnailUrl String? @db.Text
+  /// REQUIRED for accessibility. Never optional — a decorative asset uses "".
+  alt          String  @db.VarChar(400)
+  caption      String? @db.Text
+  credit       String? @db.VarChar(200)
+
+  kind            MediaKind     @default(IMAGE)
+  provider        MediaProvider @default(UPLOADTHING)
+  /// Provider-scoped identifier (UploadThing file key, S3 object key, …).
+  providerFileKey String?       @db.VarChar(255)
+
+  width    Int?
+  height   Int?
+  bytes    Int?
+  mimeType String  @db.VarChar(160)
+  blurData String? @db.Text
+  checksum String? @db.VarChar(128)
+
+  uploadedById String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  uploadedBy User? @relation("MediaUploader", fields: [uploadedById], references: [id], onDelete: SetNull)
+
+  tags           MediaTag[]      @relation("MediaTagMedia")
+  menuItemMedia  MenuItemMedia[] @relation("MenuItemMediaAsset")
+  menuCategories MenuCategory[]  @relation("MenuCategoryHeroMedia")
+  staffAvatars   StaffProfile[]  @relation("StaffAvatarMedia")
+
+  @@unique([provider, providerFileKey])
+  @@index([uploadedById])
+  @@index([kind, createdAt])
+  @@index([createdAt])
+}
+
+model MediaTag {
+  id           String @id @default(cuid())
+  mediaAssetId String
+  tagId        String
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  mediaAsset MediaAsset @relation("MediaTagMedia", fields: [mediaAssetId], references: [id], onDelete: Cascade)
+  tag        Tag        @relation("MediaTagTag", fields: [tagId], references: [id], onDelete: Cascade)
+
+  @@unique([mediaAssetId, tagId])
+  @@index([tagId])
+}
+
+// =============================================================================
+// 4. REVIEWS
+// =============================================================================
+
+enum ReviewSubject {
+  MENU_ITEM
+  CHEF
+  PLATFORM
+  APPOINTMENT
+}
+
+enum ReviewStatus {
+  PENDING
+  APPROVED
+  REJECTED
+  FEATURED
+}
+
+model Review {
+  id      String        @id @default(cuid())
+  subject ReviewSubject @default(MENU_ITEM)
+
+  /// Nullable subject linkage — exactly one of these is expected to be set for
+  /// MENU_ITEM / CHEF / APPOINTMENT subjects; all three are null for PLATFORM.
+  menuItemId     String?
+  staffProfileId String?
+  /// Set when the review is tied to a fulfilled booking; drives `isVerified`.
+  appointmentId  String?
+
+  authorId String
+
+  /// 1–5 inclusive. Enforced by the Zod layer and a DB check constraint added in migration.
+  rating Int
+  title  String? @db.VarChar(200)
+  body   String  @db.Text
+
+  status        ReviewStatus @default(PENDING)
+  isVerified    Boolean      @default(false)
+  featuredOrder Int?
+
+  moderatedById  String?
+  moderatedAt    DateTime?
+  moderationNote String?   @db.Text
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  author       User             @relation("ReviewAuthor", fields: [authorId], references: [id], onDelete: Cascade)
+  moderatedBy  User?            @relation("ReviewModerator", fields: [moderatedById], references: [id], onDelete: SetNull)
+  menuItem     MenuItem?        @relation("ReviewMenuItemSubject", fields: [menuItemId], references: [id], onDelete: Cascade)
+  staffProfile StaffProfile?    @relation("ReviewStaffSubject", fields: [staffProfileId], references: [id], onDelete: Cascade)
+  appointment  ChefAppointment? @relation("ReviewAppointmentSubject", fields: [appointmentId], references: [id], onDelete: SetNull)
+
+  @@unique([authorId, menuItemId])
+  @@index([status, createdAt])
+  @@index([menuItemId, status])
+  @@index([staffProfileId, status])
+  @@index([subject, status])
+  @@index([authorId])
+  @@index([appointmentId])
+  @@index([moderatedById])
+  @@index([status, featuredOrder])
+}
+
+// =============================================================================
+// 5. BILLING
+// =============================================================================
+
+enum BillingInterval {
+  DAY
+  WEEK
+  MONTH
+  QUARTER
+  YEAR
+}
+
+/// Mirrors Stripe's `subscription.status` (Stripe's American single-L spelling
+/// is preserved deliberately so webhook mapping is a straight uppercase).
+enum SubscriptionStatus {
+  INCOMPLETE
+  INCOMPLETE_EXPIRED
+  TRIALING
+  ACTIVE
+  PAST_DUE
+  CANCELED
+  UNPAID
+  PAUSED
+}
+
+/// Mirrors Stripe's `invoice.status`.
+enum InvoiceStatus {
+  DRAFT
+  OPEN
+  PAID
+  UNCOLLECTIBLE
+  VOID
+}
+
+/// Mirrors Stripe's `payment_intent.status` plus terminal refund states.
+enum PaymentStatus {
+  REQUIRES_PAYMENT_METHOD
+  REQUIRES_CONFIRMATION
+  REQUIRES_ACTION
+  PROCESSING
+  SUCCEEDED
+  CANCELED
+  FAILED
+  REFUNDED
+  PARTIALLY_REFUNDED
+}
+
+enum PaymentMethodType {
+  CARD
+  ACH_DEBIT
+  BANK_TRANSFER
+  INTERAC
+  CASH
+  CHEQUE
+  CREDIT_BALANCE
+  OTHER
+}
+
+enum InvoiceLineKind {
+  SUBSCRIPTION
+  APPOINTMENT
+  MENU_ITEM
+  INGREDIENT_COST
+  TRAVEL
+  GRATUITY
+  DISCOUNT
+  TAX
+  OTHER
+}
+
+model SubscriptionPlan {
+  id   String @id @default(cuid())
+  slug String @unique @db.VarChar(160)
+
+  name        String  @db.VarChar(200)
+  tagline     String? @db.VarChar(280)
+  description String? @db.Text
+
+  stripePriceId   String @unique @db.VarChar(255)
+  stripeProductId String @db.VarChar(255)
+
+  interval      BillingInterval @default(MONTH)
+  intervalCount Int             @default(1)
+  priceCents    Int
+  currency      String          @default("CAD") @db.VarChar(3)
+  setupFeeCents Int?
+  trialDays     Int?
+
+  mealsPerWeek    Int
+  servingsPerMeal Int
+  features        String[]
+
+  isActive   Boolean @default(true)
+  isFeatured Boolean @default(false)
+  sortOrder  Int     @default(0)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  subscriptions UserSubscription[] @relation("SubscriptionPlanRef")
+
+  @@index([isActive, sortOrder])
+  @@index([stripeProductId])
+}
+
+model UserSubscription {
+  id     String @id @default(cuid())
+  userId String
+  planId String
+
+  stripeSubscriptionId String @unique @db.VarChar(255)
+  stripeCustomerId     String @db.VarChar(255)
+
+  status   SubscriptionStatus @default(INCOMPLETE)
+  quantity Int                @default(1)
+  currency String             @default("CAD") @db.VarChar(3)
+
+  currentPeriodStart DateTime
+  currentPeriodEnd   DateTime
+  cancelAtPeriodEnd  Boolean   @default(false)
+  cancelAt           DateTime?
+  canceledAt         DateTime?
+  cancellationReason String?   @db.Text
+  endedAt            DateTime?
+  trialEndsAt        DateTime?
+  pausedUntil        DateTime?
+  startedAt          DateTime  @default(now())
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user User             @relation("SubscriptionSubscriber", fields: [userId], references: [id], onDelete: Cascade)
+  plan SubscriptionPlan @relation("SubscriptionPlanRef", fields: [planId], references: [id], onDelete: Restrict)
+
+  invoices Invoice[]        @relation("InvoiceSubscription")
+  payments PaymentHistory[] @relation("PaymentSubscription")
+
+  @@index([userId, status])
+  @@index([planId])
+  @@index([status, currentPeriodEnd])
+  @@index([stripeCustomerId])
+}
+
+model Invoice {
+  id     String @id @default(cuid())
+  userId String
+
+  subscriptionId String?
+  appointmentId  String?
+  issuedById     String?
+
+  stripeInvoiceId String? @unique @db.VarChar(255)
+  number          String? @unique @db.VarChar(64)
+
+  amountDueCents       Int
+  amountPaidCents      Int    @default(0)
+  amountRemainingCents Int    @default(0)
+  subtotalCents        Int    @default(0)
+  taxCents             Int    @default(0)
+  discountCents        Int    @default(0)
+  currency             String @default("CAD") @db.VarChar(3)
+
+  status           InvoiceStatus @default(DRAFT)
+  hostedInvoiceUrl String?       @db.Text
+  pdfUrl           String?       @db.Text
+
+  description String?   @db.Text
+  memo        String?   @db.Text
+  issuedAt    DateTime?
+  dueAt       DateTime?
+  paidAt      DateTime?
+  voidedAt    DateTime?
+
+  /// True for bespoke culinary events invoiced outside the subscription engine.
+  isManual Boolean @default(false)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user         User              @relation("InvoiceRecipient", fields: [userId], references: [id], onDelete: Cascade)
+  issuedBy     User?             @relation("InvoiceIssuer", fields: [issuedById], references: [id], onDelete: SetNull)
+  subscription UserSubscription? @relation("InvoiceSubscription", fields: [subscriptionId], references: [id], onDelete: SetNull)
+  appointment  ChefAppointment?  @relation("InvoiceAppointment", fields: [appointmentId], references: [id], onDelete: SetNull)
+
+  lineItems     InvoiceLineItem[]   @relation("InvoiceLineItemInvoice")
+  payments      PaymentHistory[]    @relation("PaymentInvoice")
+  rewardEntries RewardLedgerEntry[] @relation("RewardLedgerInvoice")
+
+  @@index([userId, status])
+  @@index([status, dueAt])
+  @@index([status, createdAt])
+  @@index([subscriptionId])
+  @@index([appointmentId])
+  @@index([issuedById])
+  @@index([isManual, status])
+}
+
+model InvoiceLineItem {
+  id        String @id @default(cuid())
+  invoiceId String
+
+  kind            InvoiceLineKind @default(OTHER)
+  description     String          @db.VarChar(400)
+  quantity        Int             @default(1)
+  unitAmountCents Int
+  amountCents     Int
+  currency        String          @default("CAD") @db.VarChar(3)
+  taxCents        Int             @default(0)
+  sortOrder       Int             @default(0)
+
+  stripeInvoiceItemId String? @unique @db.VarChar(255)
+  /// Free-form pointer to the domain row this line was derived from
+  /// (menu item id, appointment id, plan id …). Intentionally not a FK so a
+  /// historical invoice never breaks when catalogue rows are removed.
+  sourceRefId         String? @db.VarChar(64)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  invoice Invoice @relation("InvoiceLineItemInvoice", fields: [invoiceId], references: [id], onDelete: Cascade)
+
+  @@index([invoiceId, sortOrder])
+  @@index([kind])
+}
+
+model PaymentHistory {
+  id     String @id @default(cuid())
+  userId String
+
+  invoiceId      String?
+  subscriptionId String?
+
+  stripePaymentIntentId String? @unique @db.VarChar(255)
+  stripeChargeId        String? @db.VarChar(255)
+
+  amountCents   Int
+  refundedCents Int    @default(0)
+  feeCents      Int?
+  currency      String @default("CAD") @db.VarChar(3)
+
+  status        PaymentStatus     @default(PROCESSING)
+  method        PaymentMethodType @default(CARD)
+  cardBrand     String?           @db.VarChar(40)
+  cardLast4     String?           @db.VarChar(4)
+  failureCode   String?           @db.VarChar(120)
+  failureReason String?           @db.Text
+  receiptUrl    String?           @db.Text
+
+  processedAt DateTime?
+  refundedAt  DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user         User              @relation("PaymentPayer", fields: [userId], references: [id], onDelete: Cascade)
+  invoice      Invoice?          @relation("PaymentInvoice", fields: [invoiceId], references: [id], onDelete: SetNull)
+  subscription UserSubscription? @relation("PaymentSubscription", fields: [subscriptionId], references: [id], onDelete: SetNull)
+
+  @@index([userId, status])
+  @@index([status, createdAt])
+  @@index([invoiceId])
+  @@index([subscriptionId])
+  @@index([stripeChargeId])
+}
+
+/// Webhook idempotency ledger. The Stripe route handler inserts here inside the
+/// same transaction as the effect, so a replayed event is a no-op.
+model StripeEvent {
+  id            String @id @default(cuid())
+  stripeEventId String @unique @db.VarChar(255)
+
+  type         String    @db.VarChar(160)
+  apiVersion   String?   @db.VarChar(40)
+  livemode     Boolean   @default(false)
+  /// SHA-256 of the raw payload. The raw payload itself is never persisted.
+  payloadHash  String    @db.VarChar(64)
+  receivedAt   DateTime  @default(now())
+  processedAt  DateTime?
+  attempts     Int       @default(0)
+  errorMessage String?   @db.Text
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([type, receivedAt])
+  @@index([processedAt])
+}
+
+// =============================================================================
+// 6. GROWTH
+// =============================================================================
+
+enum RewardType {
+  FIXED_CREDIT
+  PERCENT_DISCOUNT
+  FREE_MEAL
+  FREE_DELIVERY
+}
+
+enum ReferralRedemptionStatus {
+  PENDING
+  QUALIFIED
+  REWARDED
+  EXPIRED
+  REVOKED
+}
+
+enum RewardLedgerDirection {
+  CREDIT
+  DEBIT
+}
+
+enum RewardLedgerReason {
+  REFERRAL_REWARD
+  REFERRAL_SIGNUP_BONUS
+  PROMOTIONAL_GRANT
+  MANUAL_ADJUSTMENT
+  INVOICE_REDEMPTION
+  EXPIRATION
+  REVERSAL
+}
+
+model ReferralCode {
+  id      String @id @default(cuid())
+  code    String @unique @db.VarChar(40)
+  ownerId String
+
+  label              String?    @db.VarChar(160)
+  rewardType         RewardType @default(FIXED_CREDIT)
+  /// Set when rewardType is FIXED_CREDIT / FREE_MEAL / FREE_DELIVERY.
+  rewardValueCents   Int?
+  /// Set when rewardType is PERCENT_DISCOUNT. Whole percent, 1–100.
+  rewardValuePercent Int?
+  currency           String     @default("CAD") @db.VarChar(3)
+
+  /// Reward granted to the referred party, if different from the owner's reward.
+  refereeRewardCents Int?
+
+  maxRedemptions  Int?
+  redemptionCount Int       @default(0)
+  expiresAt       DateTime?
+  isActive        Boolean   @default(true)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  owner User @relation("ReferralCodeOwner", fields: [ownerId], references: [id], onDelete: Cascade)
+
+  redemptions ReferralRedemption[] @relation("ReferralRedemptionCode")
+
+  @@index([ownerId, isActive])
+  @@index([isActive, expiresAt])
+}
+
+model ReferralRedemption {
+  id             String @id @default(cuid())
+  referralCodeId String
+  referredUserId String
+
+  status        ReferralRedemptionStatus @default(PENDING)
+  qualifiedAt   DateTime?
+  rewardedAt    DateTime?
+  revokedAt     DateTime?
+  revokedReason String?                  @db.Text
+  /// Denormalised snapshot of the reward actually paid out, in minor units.
+  rewardCents   Int?
+  currency      String                   @default("CAD") @db.VarChar(3)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  referralCode ReferralCode @relation("ReferralRedemptionCode", fields: [referralCodeId], references: [id], onDelete: Cascade)
+  referredUser User         @relation("ReferralReferredUser", fields: [referredUserId], references: [id], onDelete: Cascade)
+
+  ledgerEntries RewardLedgerEntry[] @relation("RewardLedgerRedemption")
+
+  @@unique([referralCodeId, referredUserId])
+  @@index([referredUserId])
+  @@index([status, createdAt])
+}
+
+model RewardBalance {
+  id     String @id @default(cuid())
+  userId String @unique
+
+  balanceCents          Int    @default(0)
+  lifetimeEarnedCents   Int    @default(0)
+  lifetimeRedeemedCents Int    @default(0)
+  currency              String @default("CAD") @db.VarChar(3)
+
+  lastEarnedAt   DateTime?
+  lastRedeemedAt DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user    User                @relation(fields: [userId], references: [id], onDelete: Cascade)
+  entries RewardLedgerEntry[] @relation("RewardLedgerBalance")
+
+  @@index([balanceCents])
+}
+
+/// Append-only audit trail. Rows are never updated or deleted by application
+/// code; corrections are expressed as a compensating REVERSAL entry.
+model RewardLedgerEntry {
+  id        String  @id @default(cuid())
+  userId    String
+  balanceId String?
+
+  direction         RewardLedgerDirection
+  reason            RewardLedgerReason
+  amountCents       Int
+  balanceAfterCents Int
+  currency          String                @default("CAD") @db.VarChar(3)
+
+  referralRedemptionId String?
+  invoiceId            String?
+  createdById          String?
+  note                 String? @db.Text
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user               User                @relation("RewardLedgerSubject", fields: [userId], references: [id], onDelete: Cascade)
+  balance            RewardBalance?      @relation("RewardLedgerBalance", fields: [balanceId], references: [id], onDelete: SetNull)
+  referralRedemption ReferralRedemption? @relation("RewardLedgerRedemption", fields: [referralRedemptionId], references: [id], onDelete: SetNull)
+  invoice            Invoice?            @relation("RewardLedgerInvoice", fields: [invoiceId], references: [id], onDelete: SetNull)
+  createdBy          User?               @relation("RewardLedgerActor", fields: [createdById], references: [id], onDelete: SetNull)
+
+  @@index([userId, createdAt])
+  @@index([balanceId])
+  @@index([reason, createdAt])
+  @@index([referralRedemptionId])
+  @@index([invoiceId])
+  @@index([createdById])
+}
+
+// =============================================================================
+// 7. ONBOARDING
+// =============================================================================
+
+enum OnboardingStage {
+  INVITED
+  ACCOUNT_CREATED
+  INTAKE_SUBMITTED
+  CONSULTATION_SCHEDULED
+  CONSULTATION_COMPLETED
+  PLAN_SELECTED
+  PAYMENT_CONFIRMED
+  FIRST_APPOINTMENT_BOOKED
+  ACTIVATED
+  ABANDONED
+}
+
+enum DeliveryFrequency {
+  WEEKLY
+  BIWEEKLY
+  MONTHLY
+  ON_DEMAND
+}
+
+enum ConsultationOutcome {
+  PENDING
+  CONVERTED
+  DECLINED_BY_CLIENT
+  DECLINED_BY_CHEF
+  NO_SHOW
+  RESCHEDULED
+  FOLLOW_UP_REQUIRED
+}
+
+/// Per-client stage machine. `currentStage` is the authoritative position;
+/// `steps` records the completion timestamp of every stage passed through.
+model OnboardingFlow {
+  id              String @id @default(cuid())
+  clientProfileId String @unique
+
+  currentStage    OnboardingStage @default(INVITED)
+  startedAt       DateTime        @default(now())
+  completedAt     DateTime?
+  abandonedAt     DateTime?
+  abandonedReason String?         @db.Text
+  lastAdvancedAt  DateTime?
+  progressPercent Int             @default(0)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  clientProfile ClientProfile @relation(fields: [clientProfileId], references: [id], onDelete: Cascade)
+
+  steps OnboardingStepCompletion[] @relation("OnboardingStepFlow")
+
+  @@index([currentStage, lastAdvancedAt])
+  @@index([completedAt])
+}
+
+model OnboardingStepCompletion {
+  id               String @id @default(cuid())
+  onboardingFlowId String
+
+  stage       OnboardingStage
+  completedAt DateTime        @default(now())
+  note        String?         @db.Text
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  onboardingFlow OnboardingFlow @relation("OnboardingStepFlow", fields: [onboardingFlowId], references: [id], onDelete: Cascade)
+
+  @@unique([onboardingFlowId, stage])
+  @@index([stage, completedAt])
+}
+
+model ClientIntakeForm {
+  id              String @id @default(cuid())
+  clientProfileId String @unique
+
+  householdSize Int @default(1)
+  adults        Int @default(1)
+  children      Int @default(0)
+
+  allergies          String[]
+  dislikes           String[]
+  cuisinePreferences String[]
+  kitchenEquipment   String[]
+  favouriteDishes    String[]
+
+  hasPets  Boolean @default(false)
+  petsNote String? @db.VarChar(280)
+
+  deliveryFrequency  DeliveryFrequency @default(WEEKLY)
+  budgetPerMealCents Int?
+  currency           String            @default("CAD") @db.VarChar(3)
+
+  serviceAddressLine1 String? @db.VarChar(200)
+  serviceAddressLine2 String? @db.VarChar(200)
+  serviceCity         String? @db.VarChar(120)
+  serviceRegion       String? @db.VarChar(120)
+  servicePostalCode   String? @db.VarChar(20)
+  serviceCountry      String? @db.VarChar(2)
+  serviceAccessNotes  String? @db.Text
+
+  preferredContactMethod ContactMethod @default(EMAIL)
+  preferredCookDays      String[]
+  notes                  String?       @db.Text
+
+  submittedAt DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  clientProfile ClientProfile @relation(fields: [clientProfileId], references: [id], onDelete: Cascade)
+
+  dietaryPreferences ClientIntakeFormTag[] @relation("IntakeTagForm")
+
+  @@index([submittedAt])
+  @@index([deliveryFrequency])
+}
+
+/// Join between an intake form and DIETARY / ALLERGEN tags.
+model ClientIntakeFormTag {
+  id                 String @id @default(cuid())
+  clientIntakeFormId String
+  tagId              String
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  clientIntakeForm ClientIntakeForm @relation("IntakeTagForm", fields: [clientIntakeFormId], references: [id], onDelete: Cascade)
+  tag              Tag              @relation("IntakeTagTag", fields: [tagId], references: [id], onDelete: Cascade)
+
+  @@unique([clientIntakeFormId, tagId])
+  @@index([tagId])
+}
+
+model ConsultationInterview {
+  id              String  @id @default(cuid())
+  clientProfileId String
+  conductedById   String?
+  staffProfileId  String?
+
+  scheduledFor    DateTime
+  durationMinutes Int      @default(30)
+  location        String?  @db.VarChar(200)
+  meetingUrl      String?  @db.Text
+
+  startedAt   DateTime?
+  completedAt DateTime?
+
+  /// 0–100 fit score produced by the consultation rubric.
+  compatibilityScore  Int?
+  notes               String?             @db.Text
+  chefSummary         String?             @db.Text
+  outcome             ConsultationOutcome @default(PENDING)
+  followUpAt          DateTime?
+  convertedToClientAt DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  clientProfile ClientProfile @relation("ConsultationClient", fields: [clientProfileId], references: [id], onDelete: Cascade)
+  conductedBy   User?         @relation("ConsultationInterviewer", fields: [conductedById], references: [id], onDelete: SetNull)
+  staffProfile  StaffProfile? @relation("ConsultationStaff", fields: [staffProfileId], references: [id], onDelete: SetNull)
+
+  @@index([clientProfileId, scheduledFor])
+  @@index([outcome, scheduledFor])
+  @@index([conductedById, scheduledFor])
+  @@index([staffProfileId, scheduledFor])
+}
+
+// =============================================================================
+// 8. CALENDAR
+// =============================================================================
+
+enum AvailabilityRuleKind {
+  RECURRING_WEEKLY
+  DATE_OVERRIDE
+}
+
+enum BookingSlotStatus {
+  OPEN
+  HELD
+  BOOKED
+  FULL
+  CANCELLED
+  EXPIRED
+}
+
+enum ServiceType {
+  IN_HOME_DINNER
+  MEAL_PREP
+  PRIVATE_EVENT
+  COOKING_CLASS
+  TASTING
+  CATERING
+  CONSULTATION
+  DELIVERY_DROP_OFF
+}
+
+enum AppointmentStatus {
+  REQUESTED
+  CONFIRMED
+  IN_PROGRESS
+  COMPLETED
+  CANCELLED
+  NO_SHOW
+}
+
+/// A chef's availability rule. `kind = RECURRING_WEEKLY` uses `dayOfWeek`
+/// (0 = Sunday … 6 = Saturday) bounded by `effectiveFrom`/`effectiveUntil`.
+/// `kind = DATE_OVERRIDE` uses `specificDate` and wins over recurring rules.
+/// `isBlackout = true` subtracts the window instead of adding it.
+model ChefAvailability {
+  id             String @id @default(cuid())
+  staffProfileId String
+
+  kind AvailabilityRuleKind @default(RECURRING_WEEKLY)
+
+  /// 0–6, Sunday-indexed. Null for DATE_OVERRIDE rules.
+  dayOfWeek    Int?
+  /// Null for RECURRING_WEEKLY rules.
+  specificDate DateTime? @db.Date
+
+  /// Minutes from local midnight, 0–1440.
+  startMinute Int
+  endMinute   Int
+  timeZone    String @default("America/Toronto") @db.VarChar(64)
+
+  effectiveFrom  DateTime?
+  effectiveUntil DateTime?
+
+  isBlackout Boolean @default(false)
+  reason     String? @db.VarChar(280)
+  note       String? @db.Text
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  staffProfile StaffProfile @relation("AvailabilityStaff", fields: [staffProfileId], references: [id], onDelete: Cascade)
+
+  @@unique([staffProfileId, kind, dayOfWeek, specificDate, startMinute, endMinute])
+  @@index([staffProfileId, kind])
+  @@index([staffProfileId, dayOfWeek])
+  @@index([staffProfileId, specificDate])
+  @@index([effectiveFrom, effectiveUntil])
+  @@index([isBlackout])
+}
+
+/// A concrete, bookable window materialised from availability rules.
+model BookingSlot {
+  id             String @id @default(cuid())
+  staffProfileId String
+
+  startsAt DateTime
+  endsAt   DateTime
+
+  capacity    Int               @default(1)
+  bookedCount Int               @default(0)
+  status      BookingSlotStatus @default(OPEN)
+  serviceType ServiceType?
+
+  priceCents Int?
+  currency   String    @default("CAD") @db.VarChar(3)
+  holdsUntil DateTime?
+  note       String?   @db.Text
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  staffProfile StaffProfile @relation("BookingSlotStaff", fields: [staffProfileId], references: [id], onDelete: Cascade)
+
+  appointments ChefAppointment[] @relation("AppointmentSlot")
+
+  @@unique([staffProfileId, startsAt, endsAt])
+  @@index([staffProfileId, startsAt])
+  @@index([status, startsAt])
+  @@index([serviceType, startsAt])
+  @@index([startsAt, endsAt])
+}
+
+model ChefAppointment {
+  id              String  @id @default(cuid())
+  clientProfileId String
+  staffProfileId  String
+  bookingSlotId   String?
+
+  serviceType ServiceType       @default(IN_HOME_DINNER)
+  status      AppointmentStatus @default(REQUESTED)
+
+  startsAt                  DateTime
+  endsAt                    DateTime
+  prepStartsAt              DateTime?
+  travelBufferBeforeMinutes Int       @default(0)
+  travelBufferAfterMinutes  Int       @default(0)
+
+  guestCount Int @default(2)
+
+  addressLine1 String? @db.VarChar(200)
+  addressLine2 String? @db.VarChar(200)
+  city         String? @db.VarChar(120)
+  region       String? @db.VarChar(120)
+  postalCode   String? @db.VarChar(20)
+  country      String? @db.VarChar(2)
+  accessNotes  String? @db.Text
+
+  totalCents    Int    @default(0)
+  depositCents  Int    @default(0)
+  gratuityCents Int    @default(0)
+  currency      String @default("CAD") @db.VarChar(3)
+
+  clientNotes String? @db.Text
+  chefNotes   String? @db.Text
+
+  confirmedAt        DateTime?
+  completedAt        DateTime?
+  cancelledAt        DateTime?
+  cancellationReason String?   @db.Text
+  cancelledById      String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  clientProfile ClientProfile @relation("AppointmentClient", fields: [clientProfileId], references: [id], onDelete: Cascade)
+  staffProfile  StaffProfile  @relation("AppointmentStaff", fields: [staffProfileId], references: [id], onDelete: Restrict)
+  bookingSlot   BookingSlot?  @relation("AppointmentSlot", fields: [bookingSlotId], references: [id], onDelete: SetNull)
+  cancelledBy   User?         @relation("AppointmentCanceller", fields: [cancelledById], references: [id], onDelete: SetNull)
+
+  menuItems AppointmentMenuItem[] @relation("AppointmentMenuItemAppointment")
+  invoices  Invoice[]             @relation("InvoiceAppointment")
+  reviews   Review[]              @relation("ReviewAppointmentSubject")
+
+  @@index([clientProfileId, startsAt])
+  @@index([staffProfileId, startsAt])
+  @@index([status, startsAt])
+  @@index([serviceType, status])
+  @@index([bookingSlotId])
+  @@index([cancelledById])
+  @@index([startsAt, endsAt])
+}
+
+model AppointmentMenuItem {
+  id            String @id @default(cuid())
+  appointmentId String
+  menuItemId    String
+
+  quantity            Int     @default(1)
+  courseOrder         Int     @default(0)
+  notes               String? @db.Text
+  /// Price snapshot at booking time, so later catalogue changes never rewrite history.
+  priceCentsAtBooking Int?
+  currency            String  @default("CAD") @db.VarChar(3)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  appointment ChefAppointment @relation("AppointmentMenuItemAppointment", fields: [appointmentId], references: [id], onDelete: Cascade)
+  menuItem    MenuItem        @relation("AppointmentMenuItemItem", fields: [menuItemId], references: [id], onDelete: Restrict)
+
+  @@unique([appointmentId, menuItemId])
+  @@index([menuItemId])
+  @@index([appointmentId, courseOrder])
+}
+
+// =============================================================================
+// 9. CRM
+// =============================================================================
+
+enum NoteVisibility {
+  PRIVATE
+  STAFF
+  ADMIN_ONLY
+  CLIENT_VISIBLE
+}
+
+enum InteractionChannel {
+  EMAIL
+  PHONE
+  SMS
+  IN_APP
+  IN_PERSON
+}
+
+enum InteractionDirection {
+  INBOUND
+  OUTBOUND
+}
+
+model ClientNote {
+  id              String  @id @default(cuid())
+  clientProfileId String
+  authorId        String?
+
+  body       String         @db.Text
+  pinned     Boolean        @default(false)
+  visibility NoteVisibility @default(STAFF)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  clientProfile ClientProfile @relation("ClientNoteSubject", fields: [clientProfileId], references: [id], onDelete: Cascade)
+  author        User?         @relation("ClientNoteAuthor", fields: [authorId], references: [id], onDelete: SetNull)
+
+  @@index([clientProfileId, pinned, createdAt])
+  @@index([clientProfileId, createdAt])
+  @@index([authorId])
+  @@index([visibility])
+}
+
+model InteractionLog {
+  id              String  @id @default(cuid())
+  clientProfileId String
+  loggedById      String?
+
+  channel   InteractionChannel
+  direction InteractionDirection @default(OUTBOUND)
+
+  subject         String?  @db.VarChar(280)
+  body            String?  @db.Text
+  occurredAt      DateTime @default(now())
+  durationMinutes Int?
+  /// Provider message id (Resend, Twilio, …) for deduplication.
+  externalRef     String?  @db.VarChar(255)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  clientProfile ClientProfile @relation("InteractionSubject", fields: [clientProfileId], references: [id], onDelete: Cascade)
+  loggedBy      User?         @relation("InteractionLogger", fields: [loggedById], references: [id], onDelete: SetNull)
+
+  @@index([clientProfileId, occurredAt])
+  @@index([channel, occurredAt])
+  @@index([direction, occurredAt])
+  @@index([loggedById])
+  @@index([externalRef])
+}

@@ -1,0 +1,1202 @@
+// mannachef/packages/validators/src/booking.ts
+
+/**
+ * Calendar domain — a chef's availability, the bookable windows materialised
+ * from it, and the engagements booked into those windows.
+ *
+ * Mirrors `ChefAvailability`, `BookingSlot`, `ChefAppointment`, and
+ * `AppointmentMenuItem` in `mannachef/packages/db/prisma/schema.prisma`. Field
+ * names, optionality, and enum values are taken from that file verbatim.
+ *
+ * Every temporal rule in this file states itself in its own error message: a
+ * guest who is told "the end must fall after the start" can fix their booking
+ * without guessing what the calendar objected to.
+ *
+ * No runtime dependency on `@prisma/client` — enums come from `./enums`.
+ */
+
+import { z } from 'zod'
+
+import {
+  addressSchema,
+  cuidSchema,
+  currencySchema,
+  durationMinutesSchema,
+  endMinutesFromMidnightSchema,
+  isoDateTimeSchema,
+  MAX_DURATION_MINUTES,
+  minutesFromMidnightSchema,
+  moneyCentsSchema,
+  paginationSchema,
+} from './common'
+import {
+  appointmentStatusSchema,
+  bookingSlotStatusSchema,
+  serviceTypeSchema,
+} from './enums'
+import type {
+  AppointmentStatus,
+  AvailabilityRuleKind,
+  ServiceType,
+} from './enums'
+
+// =============================================================================
+// Limits
+// =============================================================================
+
+/** Milliseconds in one minute — every duration comparison below runs through it. */
+const MS_PER_MINUTE = 60_000
+
+/** Milliseconds in one day. */
+const MS_PER_DAY = 86_400_000
+
+/** Nothing on the calendar is shorter than a quarter of an hour. */
+export const MIN_APPOINTMENT_MINUTES = 15
+
+/** Travel either side of an engagement, in minutes. Eight hours is the ceiling. */
+export const MAX_TRAVEL_BUFFER_MINUTES = 480
+
+/** Preparation may begin at most a day before service. */
+export const MAX_PREP_LEAD_MINUTES = MAX_DURATION_MINUTES
+
+/** Guests at one engagement. Beyond this it is catering, quoted by hand. */
+export const MIN_GUEST_COUNT = 1
+export const MAX_GUEST_COUNT = 200
+
+/** Seats in a single bookable window. */
+export const MAX_SLOT_CAPACITY = 50
+
+/** How far ahead recurring generation may run in one pass. Half a year. */
+export const MAX_GENERATION_HORIZON_WEEKS = 26
+
+/** Hard ceiling on rows one generation pass may create. */
+export const MAX_GENERATED_SLOTS = 500
+
+/** Dates a single generation pass may be told to skip. */
+export const MAX_SKIP_DATES = 60
+
+/** Gap between consecutive generated slots, in minutes. */
+export const MAX_SLOT_GAP_MINUTES = 240
+
+/** Distinct dishes on one engagement's menu. */
+export const MAX_APPOINTMENT_MENU_ITEMS = 40
+
+/** Portions of a single dish. */
+export const MAX_MENU_ITEM_QUANTITY = 200
+
+/** Courses in a single service. */
+export const MAX_COURSE_ORDER = 20
+
+/** `ChefAvailability.reason` is `VarChar(280)`. */
+export const MAX_REASON_LENGTH = 280
+
+/** `@db.Text` note columns. Long, but not unbounded. */
+export const MAX_NOTE_LENGTH = 2000
+
+/** `ChefAvailability.timeZone` / `StaffProfile.calendarTimeZone` are `VarChar(64)`. */
+const MAX_TIME_ZONE_LENGTH = 64
+
+/** Where the whole platform lives until we open a second city. */
+export const DEFAULT_TIME_ZONE = 'America/Toronto'
+
+// =============================================================================
+// Calendar primitives
+// =============================================================================
+
+/**
+ * True when the runtime recognises the identifier as an IANA time zone.
+ *
+ * `Intl.DateTimeFormat` throws a `RangeError` for anything it cannot resolve,
+ * which is a far better authority than a regular expression.
+ */
+function isSupportedTimeZone(value: string): boolean {
+  try {
+    new Intl.DateTimeFormat('en-CA', { timeZone: value })
+    return true
+  } catch {
+    return false
+  }
+}
+
+/**
+ * An IANA time zone identifier. Availability is written in the chef's local
+ * wall-clock time, so the zone travels with the rule.
+ *
+ * Defined here rather than in `common.ts` because the calendar is its only
+ * consumer; if a second domain needs it, it moves rather than being copied.
+ */
+export const timeZoneSchema = z
+  .string({ error: 'Please choose a time zone.' })
+  .trim()
+  .min(1, { error: 'Please choose a time zone.' })
+  .max(MAX_TIME_ZONE_LENGTH, {
+    error: 'That time zone identifier is longer than our records allow.',
+  })
+  .refine(isSupportedTimeZone, {
+    error:
+      'We do not recognise that time zone — please choose one such as America/Toronto.',
+  })
+  .default(DEFAULT_TIME_ZONE)
+export type TimeZone = z.infer<typeof timeZoneSchema>
+
+/**
+ * Sunday-indexed day of the week, matching `ChefAvailability.dayOfWeek`
+ * and JavaScript's `Date.prototype.getDay()`.
+ */
+export const dayOfWeekSchema = z
+  .int({ error: 'Please choose a day of the week.' })
+  .min(0, { error: 'Days of the week run from 0 (Sunday) to 6 (Saturday).' })
+  .max(6, { error: 'Days of the week run from 0 (Sunday) to 6 (Saturday).' })
+export type DayOfWeek = z.infer<typeof dayOfWeekSchema>
+
+/** Minutes of travel either side of an engagement. Zero is perfectly valid. */
+const travelBufferSchema = z
+  .int({ error: 'Please give the travel time in whole minutes.' })
+  .min(0, { error: 'Travel time cannot be less than none.' })
+  .max(MAX_TRAVEL_BUFFER_MINUTES, {
+    error: 'Travel time either side of an engagement tops out at eight hours.',
+  })
+
+// =============================================================================
+// Shared temporal predicates
+// =============================================================================
+
+interface Window {
+  readonly startsAt?: Date | undefined
+  readonly endsAt?: Date | undefined
+}
+
+function windowEndsAfterItBegins(window: Window): boolean {
+  if (window.startsAt === undefined || window.endsAt === undefined) {
+    return true
+  }
+
+  return window.endsAt.getTime() > window.startsAt.getTime()
+}
+
+function windowIsLongEnough(window: Window): boolean {
+  if (window.startsAt === undefined || window.endsAt === undefined) {
+    return true
+  }
+
+  return (
+    window.endsAt.getTime() - window.startsAt.getTime() >=
+    MIN_APPOINTMENT_MINUTES * MS_PER_MINUTE
+  )
+}
+
+function windowFitsInOneDay(window: Window): boolean {
+  if (window.startsAt === undefined || window.endsAt === undefined) {
+    return true
+  }
+
+  return (
+    window.endsAt.getTime() - window.startsAt.getTime() <=
+    MAX_DURATION_MINUTES * MS_PER_MINUTE
+  )
+}
+
+const WINDOW_ORDER_ERROR =
+  'The end of the window must fall after its start — please choose a later finish.'
+const WINDOW_TOO_SHORT_ERROR = `Nothing on our calendar runs for less than ${MIN_APPOINTMENT_MINUTES} minutes — please lengthen the window.`
+const WINDOW_TOO_LONG_ERROR =
+  'A single engagement cannot run longer than twenty-four hours — please split it across two days.'
+
+interface MinuteWindow {
+  readonly startMinute?: number | undefined
+  readonly endMinute?: number | undefined
+}
+
+function minuteWindowClosesAfterItOpens(window: MinuteWindow): boolean {
+  if (window.startMinute === undefined || window.endMinute === undefined) {
+    return true
+  }
+
+  return window.endMinute > window.startMinute
+}
+
+const MINUTE_WINDOW_ORDER_ERROR =
+  'An availability window must close after it opens — set the closing time later than the opening time.'
+
+interface EffectiveRange {
+  readonly effectiveFrom?: Date | undefined
+  readonly effectiveUntil?: Date | undefined
+}
+
+function effectiveRangeIsOrdered(range: EffectiveRange): boolean {
+  if (range.effectiveFrom === undefined || range.effectiveUntil === undefined) {
+    return true
+  }
+
+  return range.effectiveUntil.getTime() > range.effectiveFrom.getTime()
+}
+
+const EFFECTIVE_RANGE_ERROR =
+  'The date this rule stops applying must fall after the date it starts applying.'
+
+// =============================================================================
+// 1. Chef availability
+// =============================================================================
+
+const availabilityBaseShape = {
+  staffProfileId: cuidSchema,
+  /** Minutes from local midnight. `540` is 09:00. */
+  startMinute: minutesFromMidnightSchema,
+  /** Minutes from local midnight; `1440` closes the window at midnight. */
+  endMinute: endMinutesFromMidnightSchema,
+  timeZone: timeZoneSchema,
+  effectiveFrom: isoDateTimeSchema.optional(),
+  effectiveUntil: isoDateTimeSchema.optional(),
+  /** `true` subtracts this window from the calendar instead of adding it. */
+  isBlackout: z
+    .boolean({
+      error: 'Please say whether this window opens or closes the diary.',
+    })
+    .default(false),
+  reason: z
+    .string({ error: 'Please give a reason.' })
+    .trim()
+    .max(MAX_REASON_LENGTH, {
+      error: `Please keep the reason to ${MAX_REASON_LENGTH} characters or fewer.`,
+    })
+    .optional(),
+  note: z
+    .string({ error: 'Please add a note.' })
+    .trim()
+    .max(MAX_NOTE_LENGTH, {
+      error: `Please keep the note to ${MAX_NOTE_LENGTH} characters or fewer.`,
+    })
+    .optional(),
+} as const
+
+function blackoutCarriesAReason(value: {
+  readonly isBlackout?: boolean | undefined
+  readonly reason?: string | undefined
+}): boolean {
+  if (value.isBlackout !== true) {
+    return true
+  }
+
+  return value.reason !== undefined && value.reason.length > 0
+}
+
+const BLACKOUT_REASON_ERROR =
+  'Please note why this window is closed, so the concierge can explain it.'
+
+/**
+ * A recurring weekly availability rule — `ChefAvailability` with
+ * `kind = RECURRING_WEEKLY`.
+ *
+ * The literal is checked against the enum at compile time so the two can never
+ * drift apart, without pulling the enum's runtime value into the branch.
+ */
+export const chefAvailabilityCreateSchema = z
+  .object({
+    kind: z
+      .literal('RECURRING_WEEKLY' satisfies AvailabilityRuleKind, {
+        error: 'This rule repeats every week.',
+      })
+      .default('RECURRING_WEEKLY'),
+    dayOfWeek: dayOfWeekSchema,
+    ...availabilityBaseShape,
+  })
+  .strict()
+  .refine(minuteWindowClosesAfterItOpens, {
+    error: MINUTE_WINDOW_ORDER_ERROR,
+    path: ['endMinute'],
+  })
+  .refine(effectiveRangeIsOrdered, {
+    error: EFFECTIVE_RANGE_ERROR,
+    path: ['effectiveUntil'],
+  })
+  .refine(blackoutCarriesAReason, {
+    error: BLACKOUT_REASON_ERROR,
+    path: ['reason'],
+  })
+export type ChefAvailabilityCreateInput = z.infer<
+  typeof chefAvailabilityCreateSchema
+>
+export type ChefAvailabilityCreateRawInput = z.input<
+  typeof chefAvailabilityCreateSchema
+>
+
+/**
+ * A single-date exception — `ChefAvailability` with `kind = DATE_OVERRIDE`.
+ * An override always wins over the recurring rules underneath it.
+ */
+export const availabilityOverrideSchema = z
+  .object({
+    kind: z
+      .literal('DATE_OVERRIDE' satisfies AvailabilityRuleKind, {
+        error: 'This rule covers a single date.',
+      })
+      .default('DATE_OVERRIDE'),
+    /** Stored as `@db.Date`; only the calendar date is retained. */
+    specificDate: isoDateTimeSchema,
+    ...availabilityBaseShape,
+  })
+  .strict()
+  .refine(minuteWindowClosesAfterItOpens, {
+    error: MINUTE_WINDOW_ORDER_ERROR,
+    path: ['endMinute'],
+  })
+  .refine(effectiveRangeIsOrdered, {
+    error: EFFECTIVE_RANGE_ERROR,
+    path: ['effectiveUntil'],
+  })
+  .refine(blackoutCarriesAReason, {
+    error: BLACKOUT_REASON_ERROR,
+    path: ['reason'],
+  })
+  .refine(
+    (value) =>
+      value.effectiveFrom === undefined ||
+      value.specificDate.getTime() >= value.effectiveFrom.getTime(),
+    {
+      error:
+        'The date this override covers must fall on or after the date the rule starts applying.',
+      path: ['specificDate'],
+    }
+  )
+  .refine(
+    (value) =>
+      value.effectiveUntil === undefined ||
+      value.specificDate.getTime() <= value.effectiveUntil.getTime(),
+    {
+      error:
+        'The date this override covers must fall on or before the date the rule stops applying.',
+      path: ['specificDate'],
+    }
+  )
+export type AvailabilityOverrideInput = z.infer<
+  typeof availabilityOverrideSchema
+>
+export type AvailabilityOverrideRawInput = z.input<
+  typeof availabilityOverrideSchema
+>
+
+/** Either kind of availability rule, for endpoints that accept both. */
+export const chefAvailabilityRuleSchema = z.union(
+  [chefAvailabilityCreateSchema, availabilityOverrideSchema],
+  {
+    error:
+      'An availability rule either repeats weekly on a chosen day or covers one specific date.',
+  }
+)
+export type ChefAvailabilityRuleInput = z.infer<
+  typeof chefAvailabilityRuleSchema
+>
+export type ChefAvailabilityRuleRawInput = z.input<
+  typeof chefAvailabilityRuleSchema
+>
+
+/**
+ * Editing an existing rule. The chef it belongs to is not editable — moving a
+ * window between chefs is a delete and a create, so nothing is silently
+ * reassigned.
+ */
+export const chefAvailabilityUpdateSchema = z
+  .object(availabilityBaseShape)
+  .omit({ staffProfileId: true })
+  .partial()
+  .extend({
+    availabilityId: cuidSchema,
+    dayOfWeek: dayOfWeekSchema.optional(),
+    specificDate: isoDateTimeSchema.optional(),
+  })
+  .strict()
+  .refine(minuteWindowClosesAfterItOpens, {
+    error: MINUTE_WINDOW_ORDER_ERROR,
+    path: ['endMinute'],
+  })
+  .refine(effectiveRangeIsOrdered, {
+    error: EFFECTIVE_RANGE_ERROR,
+    path: ['effectiveUntil'],
+  })
+  .refine(blackoutCarriesAReason, {
+    error: BLACKOUT_REASON_ERROR,
+    path: ['reason'],
+  })
+  .refine(
+    (value) =>
+      value.dayOfWeek === undefined || value.specificDate === undefined,
+    {
+      error:
+        'A rule either repeats on a weekday or covers one date — it cannot do both.',
+      path: ['specificDate'],
+    }
+  )
+export type ChefAvailabilityUpdateInput = z.infer<
+  typeof chefAvailabilityUpdateSchema
+>
+export type ChefAvailabilityUpdateRawInput = z.input<
+  typeof chefAvailabilityUpdateSchema
+>
+
+// =============================================================================
+// 2. Booking slots
+// =============================================================================
+
+const bookingSlotMutableShape = {
+  startsAt: isoDateTimeSchema,
+  endsAt: isoDateTimeSchema,
+  capacity: z
+    .int({ error: 'Please say how many bookings this window can take.' })
+    .min(1, { error: 'A bookable window needs room for at least one booking.' })
+    .max(MAX_SLOT_CAPACITY, {
+      error: `A single window holds up to ${MAX_SLOT_CAPACITY} bookings.`,
+    })
+    .default(1),
+  status: bookingSlotStatusSchema.default('OPEN'),
+  serviceType: serviceTypeSchema.optional(),
+  priceCents: moneyCentsSchema.optional(),
+  currency: currencySchema,
+  holdsUntil: isoDateTimeSchema.optional(),
+  note: z
+    .string({ error: 'Please add a note.' })
+    .trim()
+    .max(MAX_NOTE_LENGTH, {
+      error: `Please keep the note to ${MAX_NOTE_LENGTH} characters or fewer.`,
+    })
+    .optional(),
+} as const
+
+function holdExpiresBeforeService(value: {
+  readonly startsAt?: Date | undefined
+  readonly holdsUntil?: Date | undefined
+}): boolean {
+  if (value.holdsUntil === undefined || value.startsAt === undefined) {
+    return true
+  }
+
+  return value.holdsUntil.getTime() < value.startsAt.getTime()
+}
+
+function heldSlotCarriesAnExpiry(value: {
+  readonly status?: string | undefined
+  readonly holdsUntil?: Date | undefined
+}): boolean {
+  if (value.status !== 'HELD') {
+    return true
+  }
+
+  return value.holdsUntil !== undefined
+}
+
+const HOLD_ORDER_ERROR =
+  'A hold must lapse before the window it is holding begins.'
+const HELD_WITHOUT_EXPIRY_ERROR =
+  'A held window needs an expiry — choose the moment the hold lapses.'
+
+/**
+ * A concrete bookable window. `bookedCount` is absent by design: it is owned by
+ * the booking transaction, never by the client.
+ */
+export const bookingSlotCreateSchema = z
+  .object({
+    staffProfileId: cuidSchema,
+    ...bookingSlotMutableShape,
+  })
+  .strict()
+  .refine(windowEndsAfterItBegins, {
+    error: WINDOW_ORDER_ERROR,
+    path: ['endsAt'],
+  })
+  .refine(windowIsLongEnough, {
+    error: WINDOW_TOO_SHORT_ERROR,
+    path: ['endsAt'],
+  })
+  .refine(windowFitsInOneDay, {
+    error: WINDOW_TOO_LONG_ERROR,
+    path: ['endsAt'],
+  })
+  .refine(holdExpiresBeforeService, {
+    error: HOLD_ORDER_ERROR,
+    path: ['holdsUntil'],
+  })
+  .refine(heldSlotCarriesAnExpiry, {
+    error: HELD_WITHOUT_EXPIRY_ERROR,
+    path: ['holdsUntil'],
+  })
+export type BookingSlotCreateInput = z.infer<typeof bookingSlotCreateSchema>
+export type BookingSlotCreateRawInput = z.input<typeof bookingSlotCreateSchema>
+
+/** Editing a window that already exists. The chef it belongs to is fixed. */
+export const bookingSlotUpdateSchema = z
+  .object(bookingSlotMutableShape)
+  .partial()
+  .extend({ bookingSlotId: cuidSchema })
+  .strict()
+  .refine(windowEndsAfterItBegins, {
+    error: WINDOW_ORDER_ERROR,
+    path: ['endsAt'],
+  })
+  .refine(windowIsLongEnough, {
+    error: WINDOW_TOO_SHORT_ERROR,
+    path: ['endsAt'],
+  })
+  .refine(windowFitsInOneDay, {
+    error: WINDOW_TOO_LONG_ERROR,
+    path: ['endsAt'],
+  })
+  .refine(holdExpiresBeforeService, {
+    error: HOLD_ORDER_ERROR,
+    path: ['holdsUntil'],
+  })
+  .refine(heldSlotCarriesAnExpiry, {
+    error: HELD_WITHOUT_EXPIRY_ERROR,
+    path: ['holdsUntil'],
+  })
+export type BookingSlotUpdateInput = z.infer<typeof bookingSlotUpdateSchema>
+export type BookingSlotUpdateRawInput = z.input<typeof bookingSlotUpdateSchema>
+
+/** Filter for the availability board in the admin OS. */
+export const bookingSlotFilterSchema = paginationSchema
+  .extend({
+    staffProfileId: cuidSchema.optional(),
+    status: bookingSlotStatusSchema.optional(),
+    serviceType: serviceTypeSchema.optional(),
+    startsFrom: isoDateTimeSchema.optional(),
+    startsUntil: isoDateTimeSchema.optional(),
+    onlyBookable: z
+      .boolean({ error: 'Please choose whether to show only open windows.' })
+      .optional(),
+  })
+  .refine(
+    (value) =>
+      value.startsFrom === undefined ||
+      value.startsUntil === undefined ||
+      value.startsUntil.getTime() > value.startsFrom.getTime(),
+    {
+      error: 'The end of the range must fall after its start.',
+      path: ['startsUntil'],
+    }
+  )
+export type BookingSlotFilter = z.infer<typeof bookingSlotFilterSchema>
+export type BookingSlotFilterInput = z.input<typeof bookingSlotFilterSchema>
+
+// =============================================================================
+// 3. Recurring slot generation
+// =============================================================================
+
+/**
+ * The weekly pattern a generation pass repeats — the same shape as a
+ * `RECURRING_WEEKLY` availability rule, but able to name several days at once.
+ */
+export const weeklyRecurrenceRuleSchema = z
+  .object({
+    daysOfWeek: z
+      .array(dayOfWeekSchema, {
+        error: 'Please choose at least one day of the week to repeat on.',
+      })
+      .min(1, {
+        error: 'Please choose at least one day of the week to repeat on.',
+      })
+      .max(7, { error: 'There are only seven days in the week.' })
+      .refine((days) => new Set(days).size === days.length, {
+        error: 'Each day may only be chosen once.',
+      }),
+    startMinute: minutesFromMidnightSchema,
+    endMinute: endMinutesFromMidnightSchema,
+    timeZone: timeZoneSchema,
+  })
+  .strict()
+  .refine(minuteWindowClosesAfterItOpens, {
+    error: MINUTE_WINDOW_ORDER_ERROR,
+    path: ['endMinute'],
+  })
+export type WeeklyRecurrenceRule = z.infer<typeof weeklyRecurrenceRuleSchema>
+export type WeeklyRecurrenceRuleInput = z.input<
+  typeof weeklyRecurrenceRuleSchema
+>
+
+/**
+ * How many windows a pass would create. Exported so the admin OS can show the
+ * count before anything is written, and reused by the cap below.
+ */
+export function countGeneratedSlots(input: {
+  readonly rule: {
+    readonly daysOfWeek: readonly number[]
+    readonly startMinute: number
+    readonly endMinute: number
+  }
+  readonly slotDurationMinutes: number
+  readonly gapMinutes: number
+  readonly horizonWeeks: number
+}): number {
+  const windowMinutes = input.rule.endMinute - input.rule.startMinute
+  const stride = input.slotDurationMinutes + input.gapMinutes
+
+  if (windowMinutes < input.slotDurationMinutes || stride <= 0) {
+    return 0
+  }
+
+  const perDay =
+    Math.floor((windowMinutes - input.slotDurationMinutes) / stride) + 1
+
+  return perDay * input.rule.daysOfWeek.length * input.horizonWeeks
+}
+
+/**
+ * Materialises a weekly rule into `BookingSlot` rows across a bounded horizon.
+ *
+ * The horizon is capped so one careless pass cannot fill the calendar to the end
+ * of time, and the projected row count is capped on top of that.
+ */
+export const recurringSlotGenerationSchema = z
+  .object({
+    staffProfileId: cuidSchema,
+    rule: weeklyRecurrenceRuleSchema,
+    /** The first day the pattern may produce a window on. */
+    startsOn: isoDateTimeSchema,
+    horizonWeeks: z
+      .int({ error: 'Please say how many weeks ahead to open the diary.' })
+      .min(1, { error: 'Please open at least one week of the diary.' })
+      .max(MAX_GENERATION_HORIZON_WEEKS, {
+        error: `We open the diary up to ${MAX_GENERATION_HORIZON_WEEKS} weeks ahead in one pass.`,
+      }),
+    slotDurationMinutes: durationMinutesSchema
+      .min(MIN_APPOINTMENT_MINUTES, {
+        error: `Nothing on our calendar runs for less than ${MIN_APPOINTMENT_MINUTES} minutes.`,
+      })
+      .max(MAX_DURATION_MINUTES, {
+        error: 'A single window cannot run longer than twenty-four hours.',
+      }),
+    gapMinutes: z
+      .int({ error: 'Please give the gap between windows in whole minutes.' })
+      .min(0, { error: 'A gap cannot be less than none.' })
+      .max(MAX_SLOT_GAP_MINUTES, {
+        error: 'A gap between windows tops out at four hours.',
+      })
+      .default(0),
+    capacity: z
+      .int({ error: 'Please say how many bookings each window can take.' })
+      .min(1, { error: 'Each window needs room for at least one booking.' })
+      .max(MAX_SLOT_CAPACITY, {
+        error: `A single window holds up to ${MAX_SLOT_CAPACITY} bookings.`,
+      })
+      .default(1),
+    serviceType: serviceTypeSchema.optional(),
+    priceCents: moneyCentsSchema.optional(),
+    currency: currencySchema,
+    /** Holidays, travel, anything the pattern should step over. */
+    skipDates: z
+      .array(isoDateTimeSchema, {
+        error: 'Please list the dates to skip, or leave the list empty.',
+      })
+      .max(MAX_SKIP_DATES, {
+        error: `Please list up to ${MAX_SKIP_DATES} dates to skip in one pass.`,
+      })
+      .default([]),
+    /** Clears untouched OPEN windows in the horizon before writing the new ones. */
+    replaceExistingOpenSlots: z
+      .boolean({
+        error: 'Please choose whether to replace the windows already open.',
+      })
+      .default(false),
+  })
+  .strict()
+  .refine((value) => value.startsOn.getTime() >= Date.now() - MS_PER_DAY, {
+    error:
+      'The diary opens from today onward — please choose a start date that is not in the past.',
+    path: ['startsOn'],
+  })
+  .refine(
+    (value) =>
+      value.rule.endMinute - value.rule.startMinute >=
+      value.slotDurationMinutes,
+    {
+      error:
+        'The daily window is shorter than a single booking — lengthen the window or shorten the booking.',
+      path: ['slotDurationMinutes'],
+    }
+  )
+  .refine((value) => countGeneratedSlots(value) <= MAX_GENERATED_SLOTS, {
+    error: `That pattern would open more than ${MAX_GENERATED_SLOTS} windows — shorten the horizon or lengthen each booking.`,
+    path: ['horizonWeeks'],
+  })
+  .refine(
+    (value) =>
+      value.skipDates.every(
+        (date) => date.getTime() >= value.startsOn.getTime()
+      ),
+    {
+      error:
+        'Every date you skip must fall on or after the day generation begins.',
+      path: ['skipDates'],
+    }
+  )
+export type RecurringSlotGenerationInput = z.infer<
+  typeof recurringSlotGenerationSchema
+>
+export type RecurringSlotGenerationRawInput = z.input<
+  typeof recurringSlotGenerationSchema
+>
+
+// =============================================================================
+// 4. Appointments
+// =============================================================================
+
+/**
+ * Every service that puts a chef in somebody's home or venue, and therefore
+ * needs an address. `CONSULTATION` is the one conversation we can have anywhere.
+ */
+export const ON_SITE_SERVICE_TYPES: readonly ServiceType[] = [
+  'IN_HOME_DINNER',
+  'MEAL_PREP',
+  'PRIVATE_EVENT',
+  'COOKING_CLASS',
+  'TASTING',
+  'CATERING',
+  'DELIVERY_DROP_OFF',
+]
+
+/** One dish on an engagement's menu — an `AppointmentMenuItem` row. */
+export const appointmentMenuItemSelectionSchema = z
+  .object({
+    menuItemId: cuidSchema,
+    quantity: z
+      .int({ error: 'Please say how many portions of this dish.' })
+      .min(1, { error: 'A dish on the menu needs at least one portion.' })
+      .max(MAX_MENU_ITEM_QUANTITY, {
+        error: `We prepare up to ${MAX_MENU_ITEM_QUANTITY} portions of a single dish.`,
+      })
+      .default(1),
+    courseOrder: z
+      .int({ error: 'Please say where this dish falls in the service.' })
+      .min(0, { error: 'The first course is numbered zero.' })
+      .max(MAX_COURSE_ORDER, {
+        error: `A menu runs to ${MAX_COURSE_ORDER} courses at most.`,
+      })
+      .default(0),
+    notes: z
+      .string({ error: 'Please add a note for the chef.' })
+      .trim()
+      .max(MAX_NOTE_LENGTH, {
+        error: `Please keep the note to ${MAX_NOTE_LENGTH} characters or fewer.`,
+      })
+      .optional(),
+    /** Price snapshot taken at booking time so history never rewrites itself. */
+    priceCentsAtBooking: moneyCentsSchema.optional(),
+    currency: currencySchema,
+  })
+  .strict()
+export type AppointmentMenuItemSelection = z.infer<
+  typeof appointmentMenuItemSelectionSchema
+>
+export type AppointmentMenuItemSelectionInput = z.input<
+  typeof appointmentMenuItemSelectionSchema
+>
+
+const appointmentMutableShape = {
+  serviceType: serviceTypeSchema.default('IN_HOME_DINNER'),
+  /** The window this engagement was booked into, when it came from the diary. */
+  bookingSlotId: cuidSchema.optional(),
+  startsAt: isoDateTimeSchema,
+  endsAt: isoDateTimeSchema,
+  prepStartsAt: isoDateTimeSchema.optional(),
+  travelBufferBeforeMinutes: travelBufferSchema.default(0),
+  travelBufferAfterMinutes: travelBufferSchema.default(0),
+  guestCount: z
+    .int({ error: 'Please tell us how many will be dining.' })
+    .min(MIN_GUEST_COUNT, { error: 'We cook for at least one guest.' })
+    .max(MAX_GUEST_COUNT, {
+      error: `For more than ${MAX_GUEST_COUNT} guests, speak with us about catering.`,
+    })
+    .default(2),
+  /** Flattened onto `addressLine1 … country` on `ChefAppointment` by the action. */
+  address: addressSchema.optional(),
+  accessNotes: z
+    .string({ error: 'Please tell us how to reach your door.' })
+    .trim()
+    .max(MAX_NOTE_LENGTH, {
+      error: `Please keep the access notes to ${MAX_NOTE_LENGTH} characters or fewer.`,
+    })
+    .optional(),
+  totalCents: moneyCentsSchema.default(0),
+  depositCents: moneyCentsSchema.default(0),
+  gratuityCents: moneyCentsSchema.default(0),
+  currency: currencySchema,
+  clientNotes: z
+    .string({ error: 'Please add anything the chef should know.' })
+    .trim()
+    .max(MAX_NOTE_LENGTH, {
+      error: `Please keep your notes to ${MAX_NOTE_LENGTH} characters or fewer.`,
+    })
+    .optional(),
+  chefNotes: z
+    .string({ error: 'Please add a note for the kitchen.' })
+    .trim()
+    .max(MAX_NOTE_LENGTH, {
+      error: `Please keep the note to ${MAX_NOTE_LENGTH} characters or fewer.`,
+    })
+    .optional(),
+  menuItems: z
+    .array(appointmentMenuItemSelectionSchema, {
+      error: 'Please choose the dishes for this engagement.',
+    })
+    .max(MAX_APPOINTMENT_MENU_ITEMS, {
+      error: `A single menu runs to ${MAX_APPOINTMENT_MENU_ITEMS} dishes — the chef will help you choose.`,
+    })
+    .default([])
+    .refine(
+      (items) =>
+        new Set(items.map((item) => item.menuItemId)).size === items.length,
+      {
+        error:
+          'Each dish may appear on the menu only once — raise the number of portions instead.',
+      }
+    ),
+} as const
+
+function preparationPrecedesService(value: {
+  readonly startsAt?: Date | undefined
+  readonly prepStartsAt?: Date | undefined
+}): boolean {
+  if (value.prepStartsAt === undefined || value.startsAt === undefined) {
+    return true
+  }
+
+  return value.prepStartsAt.getTime() <= value.startsAt.getTime()
+}
+
+function preparationIsNotTooEarly(value: {
+  readonly startsAt?: Date | undefined
+  readonly prepStartsAt?: Date | undefined
+}): boolean {
+  if (value.prepStartsAt === undefined || value.startsAt === undefined) {
+    return true
+  }
+
+  return (
+    value.startsAt.getTime() - value.prepStartsAt.getTime() <=
+    MAX_PREP_LEAD_MINUTES * MS_PER_MINUTE
+  )
+}
+
+function depositFitsWithinTotal(value: {
+  readonly totalCents?: number | undefined
+  readonly depositCents?: number | undefined
+}): boolean {
+  if (value.totalCents === undefined || value.depositCents === undefined) {
+    return true
+  }
+
+  return value.depositCents <= value.totalCents
+}
+
+const PREP_ORDER_ERROR =
+  'Preparation must begin at or before the service itself begins.'
+const PREP_LEAD_ERROR =
+  'Preparation cannot begin more than twenty-four hours before the service.'
+const DEPOSIT_ERROR =
+  'A deposit cannot be larger than the total for the engagement.'
+
+/**
+ * Booking an engagement. `status` is absent on purpose: a new booking is always
+ * `REQUESTED`, and every move after that goes through
+ * `appointmentStatusTransitionSchema`.
+ */
+export const appointmentCreateSchema = z
+  .object({
+    clientProfileId: cuidSchema,
+    staffProfileId: cuidSchema,
+    ...appointmentMutableShape,
+  })
+  .strict()
+  .refine(windowEndsAfterItBegins, {
+    error: WINDOW_ORDER_ERROR,
+    path: ['endsAt'],
+  })
+  .refine(windowIsLongEnough, {
+    error: WINDOW_TOO_SHORT_ERROR,
+    path: ['endsAt'],
+  })
+  .refine(windowFitsInOneDay, {
+    error: WINDOW_TOO_LONG_ERROR,
+    path: ['endsAt'],
+  })
+  .refine((value) => value.startsAt.getTime() > Date.now(), {
+    error: 'An engagement must be booked for a moment still ahead of us.',
+    path: ['startsAt'],
+  })
+  .refine(preparationPrecedesService, {
+    error: PREP_ORDER_ERROR,
+    path: ['prepStartsAt'],
+  })
+  .refine(preparationIsNotTooEarly, {
+    error: PREP_LEAD_ERROR,
+    path: ['prepStartsAt'],
+  })
+  .refine(depositFitsWithinTotal, {
+    error: DEPOSIT_ERROR,
+    path: ['depositCents'],
+  })
+  .refine(
+    (value) =>
+      !ON_SITE_SERVICE_TYPES.includes(value.serviceType) ||
+      value.address !== undefined,
+    {
+      error: 'Please tell us where we are cooking for this kind of service.',
+      path: ['address'],
+    }
+  )
+export type AppointmentCreateInput = z.infer<typeof appointmentCreateSchema>
+export type AppointmentCreateRawInput = z.input<typeof appointmentCreateSchema>
+
+/**
+ * Amending an engagement already on the calendar.
+ *
+ * Neither the household nor the chef can be swapped here, and `status` stays out
+ * of reach — those are separate, audited moves. The address rule cannot be
+ * checked on a partial payload, so the action re-applies it after merging the
+ * change onto the stored row.
+ */
+export const appointmentUpdateSchema = z
+  .object(appointmentMutableShape)
+  .partial()
+  .extend({ appointmentId: cuidSchema })
+  .strict()
+  .refine(windowEndsAfterItBegins, {
+    error: WINDOW_ORDER_ERROR,
+    path: ['endsAt'],
+  })
+  .refine(windowIsLongEnough, {
+    error: WINDOW_TOO_SHORT_ERROR,
+    path: ['endsAt'],
+  })
+  .refine(windowFitsInOneDay, {
+    error: WINDOW_TOO_LONG_ERROR,
+    path: ['endsAt'],
+  })
+  .refine(preparationPrecedesService, {
+    error: PREP_ORDER_ERROR,
+    path: ['prepStartsAt'],
+  })
+  .refine(preparationIsNotTooEarly, {
+    error: PREP_LEAD_ERROR,
+    path: ['prepStartsAt'],
+  })
+  .refine(depositFitsWithinTotal, {
+    error: DEPOSIT_ERROR,
+    path: ['depositCents'],
+  })
+export type AppointmentUpdateInput = z.infer<typeof appointmentUpdateSchema>
+export type AppointmentUpdateRawInput = z.input<typeof appointmentUpdateSchema>
+
+// =============================================================================
+// 5. The appointment state machine
+// =============================================================================
+
+/**
+ * The only moves an engagement may make, as data.
+ *
+ * ```
+ *   REQUESTED ──▶ CONFIRMED ──▶ IN_PROGRESS ──▶ COMPLETED
+ *       │             │              │
+ *       │             ├──▶ NO_SHOW   │
+ *       └──▶ CANCELLED ◀─────────────┘
+ * ```
+ *
+ * `CONFIRMED → COMPLETED` is permitted so a chef who cooked a whole dinner
+ * without touching their phone can still close it out. `COMPLETED`, `CANCELLED`,
+ * and `NO_SHOW` are terminal: a correction is a new engagement, never a rewrite.
+ */
+export const APPOINTMENT_TRANSITIONS: Readonly<
+  Record<AppointmentStatus, readonly AppointmentStatus[]>
+> = {
+  REQUESTED: ['CONFIRMED', 'CANCELLED'],
+  CONFIRMED: ['IN_PROGRESS', 'COMPLETED', 'CANCELLED', 'NO_SHOW'],
+  IN_PROGRESS: ['COMPLETED', 'CANCELLED'],
+  COMPLETED: [],
+  CANCELLED: [],
+  NO_SHOW: [],
+}
+
+/** Statuses an engagement can never leave. */
+export const TERMINAL_APPOINTMENT_STATUSES: readonly AppointmentStatus[] = [
+  'COMPLETED',
+  'CANCELLED',
+  'NO_SHOW',
+]
+
+/** Every status this engagement could legally move to next. */
+export function allowedAppointmentTransitions(
+  from: AppointmentStatus
+): readonly AppointmentStatus[] {
+  return APPOINTMENT_TRANSITIONS[from]
+}
+
+/**
+ * Whether an engagement may move from one status to another.
+ *
+ * This is the authority for the state machine — the server action calls it
+ * before writing, and the UI calls it to decide which buttons to render. The UI
+ * copy is a convenience; the action's call is the enforcement.
+ */
+export function canTransition(
+  from: AppointmentStatus,
+  to: AppointmentStatus
+): boolean {
+  return APPOINTMENT_TRANSITIONS[from].includes(to)
+}
+
+/** Whether an engagement has reached a status it can never leave. */
+export function isTerminalAppointmentStatus(
+  status: AppointmentStatus
+): boolean {
+  return APPOINTMENT_TRANSITIONS[status].length === 0
+}
+
+/**
+ * Moving an engagement through the state machine.
+ *
+ * `from` is sent by the caller and compared against the stored row by the
+ * action, so two people pressing the same button at once cannot both win.
+ */
+export const appointmentStatusTransitionSchema = z
+  .object({
+    appointmentId: cuidSchema,
+    /** The status the caller believes the engagement is currently in. */
+    from: appointmentStatusSchema,
+    to: appointmentStatusSchema,
+    /** Defaults to now in the action when the caller does not back-date it. */
+    occurredAt: isoDateTimeSchema.optional(),
+    reason: z
+      .string({ error: 'Please record why.' })
+      .trim()
+      .min(1, { error: 'Please record why.' })
+      .max(MAX_NOTE_LENGTH, {
+        error: `Please keep the reason to ${MAX_NOTE_LENGTH} characters or fewer.`,
+      })
+      .optional(),
+    /** The `User` who cancelled. Only meaningful on a cancellation. */
+    cancelledById: cuidSchema.optional(),
+  })
+  .strict()
+  .refine((value) => value.from !== value.to, {
+    error: 'This engagement is already in that state.',
+    path: ['to'],
+  })
+  .refine((value) => canTransition(value.from, value.to), {
+    error:
+      'An engagement cannot make that move — a completed, cancelled, or missed engagement is final, and one is confirmed before it begins.',
+    path: ['to'],
+  })
+  .refine(
+    (value) =>
+      value.to !== 'CANCELLED' ||
+      (value.reason !== undefined && value.reason.length > 0),
+    {
+      error: 'Please record why the engagement was cancelled.',
+      path: ['reason'],
+    }
+  )
+  .refine(
+    (value) => value.to === 'CANCELLED' || value.cancelledById === undefined,
+    {
+      error: 'Only a cancellation records who cancelled it.',
+      path: ['cancelledById'],
+    }
+  )
+  .refine(
+    (value) =>
+      value.occurredAt === undefined ||
+      value.occurredAt.getTime() <= Date.now(),
+    {
+      error:
+        'A change of status cannot be recorded for a moment still to come.',
+      path: ['occurredAt'],
+    }
+  )
+export type AppointmentStatusTransitionInput = z.infer<
+  typeof appointmentStatusTransitionSchema
+>
+export type AppointmentStatusTransitionRawInput = z.input<
+  typeof appointmentStatusTransitionSchema
+>
+
+// =============================================================================
+// 6. Conflict checking
+// =============================================================================
+
+/**
+ * The statuses that occupy a chef's calendar. A cancelled or missed engagement
+ * frees its window; a completed one is in the past and cannot be double-booked.
+ */
+export const DEFAULT_BLOCKING_APPOINTMENT_STATUSES: readonly AppointmentStatus[] =
+  ['REQUESTED', 'CONFIRMED', 'IN_PROGRESS']
+
+/**
+ * Asks whether a chef is free for a window, travel included.
+ *
+ * The buffers widen the window on both sides before the overlap test, so an
+ * engagement across town cannot be booked against the end of another.
+ */
+export const appointmentConflictCheckSchema = z
+  .object({
+    staffProfileId: cuidSchema,
+    startsAt: isoDateTimeSchema,
+    endsAt: isoDateTimeSchema,
+    travelBufferBeforeMinutes: travelBufferSchema.default(0),
+    travelBufferAfterMinutes: travelBufferSchema.default(0),
+    /** Ignore this engagement — set when re-checking one that already exists. */
+    excludeAppointmentId: cuidSchema.optional(),
+    /** Ignore this window — set when re-checking a slot being rewritten. */
+    excludeBookingSlotId: cuidSchema.optional(),
+    blockingStatuses: z
+      .array(appointmentStatusSchema, {
+        error: 'Please choose which statuses count as occupied.',
+      })
+      .min(1, {
+        error: 'Please choose at least one status that counts as occupied.',
+      })
+      .max(6, { error: 'There are only six statuses to choose from.' })
+      .default([...DEFAULT_BLOCKING_APPOINTMENT_STATUSES])
+      .refine((statuses) => new Set(statuses).size === statuses.length, {
+        error: 'Each status may only be chosen once.',
+      }),
+    /** Whether blackout availability rules also count as a conflict. */
+    includeBlackouts: z
+      .boolean({ error: 'Please choose whether blackouts count as conflicts.' })
+      .default(true),
+  })
+  .strict()
+  .refine(windowEndsAfterItBegins, {
+    error: WINDOW_ORDER_ERROR,
+    path: ['endsAt'],
+  })
+  .refine(windowFitsInOneDay, {
+    error: WINDOW_TOO_LONG_ERROR,
+    path: ['endsAt'],
+  })
+export type AppointmentConflictCheckInput = z.infer<
+  typeof appointmentConflictCheckSchema
+>
+export type AppointmentConflictCheckRawInput = z.input<
+  typeof appointmentConflictCheckSchema
+>
+
+/** Filter for the engagements table and the chef's day view. */
+export const appointmentFilterSchema = paginationSchema
+  .extend({
+    clientProfileId: cuidSchema.optional(),
+    staffProfileId: cuidSchema.optional(),
+    bookingSlotId: cuidSchema.optional(),
+    status: appointmentStatusSchema.optional(),
+    serviceType: serviceTypeSchema.optional(),
+    startsFrom: isoDateTimeSchema.optional(),
+    startsUntil: isoDateTimeSchema.optional(),
+  })
+  .refine(
+    (value) =>
+      value.startsFrom === undefined ||
+      value.startsUntil === undefined ||
+      value.startsUntil.getTime() > value.startsFrom.getTime(),
+    {
+      error: 'The end of the range must fall after its start.',
+      path: ['startsUntil'],
+    }
+  )
+export type AppointmentFilter = z.infer<typeof appointmentFilterSchema>
+export type AppointmentFilterInput = z.input<typeof appointmentFilterSchema>

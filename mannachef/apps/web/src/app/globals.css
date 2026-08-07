@@ -1,0 +1,132 @@
+/* mannachef/apps/web/src/app/globals.css */
+@import 'tailwindcss';
+
+/*
+ * "Luxury Culinary" design system.
+ * Single source of truth for every color, radius, font, and motion token
+ * used across the marketing site, client portal, and admin OS.
+ * Never hardcode hex values in components — always reference these tokens.
+ */
+@theme {
+  /* ---- Palette (dark-first) ------------------------------------------ */
+  --color-obsidian: #0b0a09;
+  --color-charcoal: #121110;
+  --color-slate-warm: #1a1817;
+  --color-ash: #26231f;
+  --color-linen: #f4f0e9;
+  --color-parchment: #cfc7b8;
+  --color-stone: #8b8377;
+  --color-champagne: #d8c39a;
+  --color-gold: #b08d4f;
+  --color-terracotta: #9c5b3c;
+  --color-sage: #6e7f63;
+  --color-claret: #7c2f35;
+
+  /* ---- Semantic aliases (shadcn/ui primitives read these) ------------- */
+  --color-background: var(--color-obsidian);
+  --color-foreground: var(--color-linen);
+
+  --color-card: var(--color-slate-warm);
+  --color-card-foreground: var(--color-linen);
+
+  --color-popover: var(--color-slate-warm);
+  --color-popover-foreground: var(--color-linen);
+
+  --color-border: var(--color-ash);
+  --color-input: var(--color-ash);
+  --color-ring: var(--color-champagne);
+
+  --color-primary: var(--color-champagne);
+  --color-primary-foreground: var(--color-obsidian);
+
+  --color-secondary: var(--color-charcoal);
+  --color-secondary-foreground: var(--color-linen);
+
+  --color-accent: var(--color-terracotta);
+  --color-accent-foreground: var(--color-linen);
+
+  --color-muted: var(--color-charcoal);
+  --color-muted-foreground: var(--color-stone);
+
+  --color-destructive: var(--color-claret);
+  --color-destructive-foreground: var(--color-linen);
+
+  --color-success: var(--color-sage);
+  --color-success-foreground: var(--color-linen);
+
+  /* ---- Radii ----------------------------------------------------------- */
+  --radius-sm: 0.25rem;
+  --radius-md: 0.5rem;
+  --radius-lg: 0.75rem;
+  --radius-xl: 1rem;
+
+  /* ---- Typography -------------------------------------------------------
+   * The CSS variables --font-cormorant / --font-inter are produced by
+   * next/font/google in the root layout (app/layout.tsx) via the
+   * `variable` option, and applied as classNames on <html>/<body>.
+   */
+  --font-display: var(--font-cormorant), ui-serif, Georgia, serif;
+  --font-sans: var(--font-inter), ui-sans-serif, system-ui, sans-serif;
+
+  /* ---- Motion ------------------------------------------------------------ */
+  --ease-luxe: cubic-bezier(0.16, 1, 0.3, 1);
+  --duration-fast: 150ms;
+  --duration-base: 200ms;
+  --duration-slow: 250ms;
+}
+
+@layer base {
+  * {
+    border-color: var(--color-border);
+  }
+
+  html {
+    color-scheme: dark;
+  }
+
+  body {
+    background-color: var(--color-background);
+    color: var(--color-foreground);
+    font-family: var(--font-sans);
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    text-rendering: optimizeLegibility;
+  }
+
+  /* Numeric / data-table text should use tabular figures. */
+  .tabular-nums {
+    font-variant-numeric: tabular-nums;
+  }
+
+  /* Visible focus ring in champagne at 40% opacity, per contract §3. */
+  :focus-visible {
+    outline: none;
+    box-shadow: 0 0 0 2px color-mix(in oklab, var(--color-champagne) 40%, transparent);
+    border-radius: var(--radius-sm);
+  }
+
+  /* 1px gold-gradient hairline rule — use instead of heavy borders/shadows
+   * for elevation and section dividers. */
+  .hairline {
+    height: 1px;
+    width: 100%;
+    background-image: linear-gradient(
+      90deg,
+      transparent,
+      color-mix(in oklab, var(--color-gold) 70%, transparent),
+      transparent
+    );
+    border: none;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+    scroll-behavior: auto !important;
+  }
+}
