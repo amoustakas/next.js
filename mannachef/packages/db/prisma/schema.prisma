@@ -115,6 +115,7 @@ model User {
   rewardBalance       RewardBalance?
   rewardLedgerEntries RewardLedgerEntry[]  @relation("RewardLedgerSubject")
   rewardLedgerActions RewardLedgerEntry[]  @relation("RewardLedgerActor")
+  referralProgramsSet ReferralProgram[]    @relation("ReferralProgramEditor")
 
   // --- Onboarding -----------------------------------------------------------
   consultationsConducted ConsultationInterview[] @relation("ConsultationInterviewer")
@@ -985,6 +986,67 @@ enum RewardLedgerReason {
   INVOICE_REDEMPTION
   EXPIRATION
   REVERSAL
+}
+
+/// The house's standing referral offer — a singleton configuration row.
+///
+/// `key` is the singleton discriminator and the application only ever reads and
+/// writes `key = "default"`; the `@unique` on it is what makes "there is one
+/// programme" a fact of the database rather than a convention of the code.
+///
+/// This row exists because the figures on a `ReferralCode` are a liability the
+/// business takes on, and below ADMIN they must therefore come from the
+/// business rather than from the person who will be paid (MCV-030). A CLIENT
+/// minting an invitation carries this offer verbatim; the reward fields on
+/// their payload are discarded. ADMIN and above still set a code's figures per
+/// code, which is what makes a bespoke arrangement possible at all.
+///
+/// The reward pairing mirrors `ReferralCode`: `rewardValuePercent` is set when
+/// `rewardType` is PERCENT_DISCOUNT and `rewardValueCents` otherwise, never
+/// both. Unlike `ReferralCode` — whose historical rows predate the rule — the
+/// pairing is a CHECK constraint here, added in the `0001_referral_program`
+/// migration alongside the numeric ranges documented on each field below.
+model ReferralProgram {
+  id  String @id @default(cuid())
+  key String @unique @default("default") @db.VarChar(40)
+
+  rewardType         RewardType @default(FIXED_CREDIT)
+  /// Set when rewardType is FIXED_CREDIT / FREE_MEAL / FREE_DELIVERY. 1–1,000,000.
+  rewardValueCents   Int?
+  /// Set when rewardType is PERCENT_DISCOUNT. Whole percent, 1–100.
+  rewardValuePercent Int?
+  currency           String     @default("CAD") @db.VarChar(3)
+
+  /// Reward granted to the referred party, if different from the owner's reward.
+  /// 1–1,000,000 when set; null when the offer rewards only the inviter.
+  refereeRewardCents Int?
+
+  /// The redemption cap a code minted from this offer carries. 1–10,000, or
+  /// null to leave programme codes open-ended.
+  defaultMaxRedemptions Int?
+  /// How many days after minting a programme code expires. 1–3,650, or null to
+  /// leave programme codes open until they are withdrawn.
+  defaultExpiryDays     Int?
+
+  /// A referral is not earned until the referred household has paid an invoice
+  /// of at least this much. 0 means any paid invoice qualifies. Enforced in
+  /// `findQualifyingInvoice`, which is the only definition of "qualified".
+  minimumQualifyingInvoiceCents Int @default(0)
+
+  /// Off by default: an unconfigured platform makes no standing offer, and a
+  /// CLIENT asking for a code while it is off is refused rather than given
+  /// something generous.
+  isActive Boolean @default(false)
+
+  updatedById String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  updatedBy User? @relation("ReferralProgramEditor", fields: [updatedById], references: [id], onDelete: SetNull)
+
+  @@index([isActive])
+  @@index([updatedById])
 }
 
 model ReferralCode {

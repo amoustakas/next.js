@@ -4,8 +4,9 @@
  * Growth domain validation — invitation codes, their redemptions, and the
  * append-only reward ledger that sits behind a subscriber's credit balance.
  *
- * Mirrors `ReferralCode`, `ReferralRedemption`, `RewardBalance` and
- * `RewardLedgerEntry` in `mannachef/packages/db/prisma/schema.prisma`.
+ * Mirrors `ReferralProgram`, `ReferralCode`, `ReferralRedemption`,
+ * `RewardBalance` and `RewardLedgerEntry` in
+ * `mannachef/packages/db/prisma/schema.prisma`.
  *
  * Rules that govern this file (see `mannachef/CONTRACT.md`):
  *
@@ -18,10 +19,17 @@
  *     five sibling modules — until MCV-004 gave each of them a single home.
  *  3. The reward a code grants is a discriminated union, not a bag of nullable
  *     columns: a percentage code cannot carry a cash value and a credit code
- *     cannot carry a percentage. The database allows both to be null; this layer
- *     is where the pairing is actually enforced.
+ *     cannot carry a percentage. The database allows both to be null on
+ *     `ReferralCode`; this layer is where that pairing is actually enforced.
+ *     `ReferralProgram` is the exception — it is new enough to carry a
+ *     `CHECK` for it as well, in the `0001_referral_program` migration.
  *  4. `redemptionCount`, `balanceAfterCents` and `balanceId` are computed inside
  *     the transaction that writes them and are never accepted from a caller.
+ *     `ReferralProgram` extends that list to the *reward figures themselves*
+ *     for anybody below `ADMIN`: what a client-minted code is worth is read
+ *     from the standing programme rather than from the payload (MCV-030), so
+ *     the schemas here describe what an administrator may state, not what a
+ *     subscriber may choose.
  *  5. `referral.codes` is a `GET` route in `@mannachef/api-contract`, and the
  *     redemption and ledger lists are read the same way, so every numeric and
  *     temporal bound in an `xFilterSchema` goes through the coercion helpers in
@@ -41,6 +49,7 @@ import {
   cuidSchema,
   currencySchema,
   hasUniqueValues,
+  intSchema,
   isInTheFuture,
   isNotInTheFuture,
   isoDateTimeSchema,
@@ -568,7 +577,182 @@ export type ReferralCodeFilterRawInput = z.input<
 >
 
 // =============================================================================
-// 2. Redemption
+// 2. The standing programme
+// =============================================================================
+
+/**
+ * The singleton discriminator on `ReferralProgram.key`.
+ *
+ * There is one standing offer, and this is the row that holds it. The column
+ * exists rather than the table simply being constrained to a single row because
+ * `@unique` on a named key is an invariant Postgres enforces, whereas "only
+ * ever insert one row" is a habit — and this is the row every client-minted
+ * invitation copies its money from.
+ */
+export const REFERRAL_PROGRAM_KEY = 'default'
+
+/** Matches `ReferralProgram.key` — `@db.VarChar(40)`. */
+const MAX_PROGRAM_KEY_LENGTH = 40
+
+/**
+ * Ten years, in days — the ceiling on `ReferralProgram.defaultExpiryDays`.
+ *
+ * Not a business rule so much as a guard against a fat-fingered figure that is
+ * indistinguishable from "never expires"; leaving the field `null` is how an
+ * open-ended offer is actually expressed.
+ */
+export const MAX_PROGRAM_EXPIRY_DAYS = 3_650
+
+/**
+ * Which programme is being addressed.
+ *
+ * Lower-cased on the way in so `Default` and `default` are the same row rather
+ * than two, and defaulted to {@link REFERRAL_PROGRAM_KEY} so every present-day
+ * caller — all of which want the singleton — can omit it entirely.
+ */
+export const referralProgramKeySchema = z
+  .string({ error: 'Please say which referral programme you mean.' })
+  .trim()
+  .toLowerCase()
+  .min(1, { error: 'Please say which referral programme you mean.' })
+  .max(MAX_PROGRAM_KEY_LENGTH, {
+    error: 'Please keep the programme key to 40 characters or fewer.',
+  })
+  .default(REFERRAL_PROGRAM_KEY)
+export type ReferralProgramKey = z.infer<typeof referralProgramKeySchema>
+
+/** Reading the standing offer. */
+export const referralProgramReadSchema = z
+  .object({ key: referralProgramKeySchema })
+  .strict()
+export type ReferralProgramReadInput = z.infer<typeof referralProgramReadSchema>
+export type ReferralProgramReadRawInput = z.input<
+  typeof referralProgramReadSchema
+>
+
+/**
+ * The terms every standing offer carries, whatever it rewards.
+ *
+ * `defaultMaxRedemptions` reuses `referralCodeCommonShape.maxRedemptions`
+ * rather than restating its bounds, because a programme code's cap and a
+ * hand-issued code's cap are the same quantity with the same ceiling: one
+ * definition, one wording, no drift.
+ */
+const referralProgramCommonShape = {
+  key: referralProgramKeySchema,
+  currency: currencySchema,
+  /** What the invited guest receives, when the offer rewards them too. */
+  refereeRewardCents: rewardCentsSchema.nullable().optional(),
+  /** The cap a programme code carries. `null` leaves them open-ended. */
+  defaultMaxRedemptions: referralCodeCommonShape.maxRedemptions,
+  /**
+   * How long a programme code stays redeemable, in days from the moment it is
+   * minted. `null` leaves it open until the code is withdrawn.
+   */
+  defaultExpiryDays: intSchema(1, MAX_PROGRAM_EXPIRY_DAYS, {
+    notAnInteger: 'Please give the expiry as a whole number of days.',
+    tooSmall: 'A code that expires the moment it is minted is no code at all.',
+    tooLarge: 'Beyond ten years, please leave the offer open-ended instead.',
+  })
+    .nullable()
+    .optional(),
+  /**
+   * The floor a referred household's first paid invoice has to clear before the
+   * referral is earned. `0` means any paid invoice qualifies.
+   *
+   * ## Required, not defaulted
+   *
+   * Same reasoning as `reverseLedgerEntry` on the revocation branch below: `0`
+   * is the *permissive* reading, and a default that silently picks the
+   * permissive branch is a default that is doing the deciding. Without a floor,
+   * a one-dollar invoice earns a full referral reward, which is the second half
+   * of the abuse MCV-030 closed. Whoever sets the offer says what the floor is.
+   */
+  minimumQualifyingInvoiceCents: moneyCentsSchema.max(MAX_REWARD_CENTS, {
+    error:
+      'A qualifying invoice tops out at $10,000. Please arrange larger thresholds by hand.',
+  }),
+  /**
+   * Whether the offer is being made at all.
+   *
+   * Required for the same reason, and it is the more consequential of the two:
+   * `true` is what lets an ordinary subscriber mint a code that will eventually
+   * cost the business money. `referralCodeCommonShape.isActive` defaults to
+   * `true` because withdrawing one code is cheap; switching the whole programme
+   * on is not the sort of thing a missing key should decide.
+   */
+  isActive: z.boolean({
+    error: 'Please say whether this offer is being made.',
+  }),
+} as const
+
+/**
+ * Setting the standing offer.
+ *
+ * A discriminated union over `rewardType`, exactly as
+ * {@link referralCodeCreateSchema} is and for the same reason: the reward and
+ * its measure travel together, so a percentage programme cannot carry a cash
+ * value and a credit programme cannot carry a percentage. The database says the
+ * same thing — `ReferralProgram_reward_pairing_check`, added in the
+ * `0001_referral_program` migration — because this is the row a code minted by
+ * somebody who is not an administrator copies its figures from.
+ *
+ * ## Why "upsert" rather than `buildUpdateSchema`
+ *
+ * This is not a patch. The programme is a singleton whose every field is stated
+ * together on one admin form, and a partial update of a discriminated reward
+ * triple is precisely the shape `referralCodeUpdateSchema` needs a `superRefine`
+ * to police. Writing the whole offer at once means the coherence rule is the
+ * union's, enforced at the boundary, and the action can write the row without
+ * merging anything against what is already there.
+ */
+export const referralProgramUpsertSchema = z.discriminatedUnion(
+  'rewardType',
+  [
+    z
+      .object({
+        rewardType: z.literal('FIXED_CREDIT'),
+        /** Credit added to the inviter's balance once the referral qualifies. */
+        rewardValueCents: rewardCentsSchema,
+        ...referralProgramCommonShape,
+      })
+      .strict(),
+    z
+      .object({
+        rewardType: z.literal('PERCENT_DISCOUNT'),
+        /** Whole percent of the qualifying invoice, 1–100. */
+        rewardValuePercent: rewardPercentSchema,
+        ...referralProgramCommonShape,
+      })
+      .strict(),
+    z
+      .object({
+        rewardType: z.literal('FREE_MEAL'),
+        /** What the complimentary meal is worth, so the ledger balances. */
+        rewardValueCents: rewardCentsSchema,
+        ...referralProgramCommonShape,
+      })
+      .strict(),
+    z
+      .object({
+        rewardType: z.literal('FREE_DELIVERY'),
+        /** What the waived delivery is worth, so the ledger balances. */
+        rewardValueCents: rewardCentsSchema,
+        ...referralProgramCommonShape,
+      })
+      .strict(),
+  ],
+  { error: 'Please choose the reward this programme should grant.' }
+)
+export type ReferralProgramUpsertInput = z.infer<
+  typeof referralProgramUpsertSchema
+>
+export type ReferralProgramUpsertRawInput = z.input<
+  typeof referralProgramUpsertSchema
+>
+
+// =============================================================================
+// 3. Redemption
 // =============================================================================
 
 /**
@@ -777,7 +961,7 @@ export type ReferralRedemptionFilterRawInput = z.input<
 >
 
 // =============================================================================
-// 3. The reward ledger
+// 4. The reward ledger
 // =============================================================================
 
 /**
