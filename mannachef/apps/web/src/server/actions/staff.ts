@@ -572,6 +572,31 @@ export const updateStaffProfile = withAction(
         ...(input.languages === undefined
           ? {}
           : { languages: input.languages }),
+        // A chef sets their own rate, and that is deliberate (MCV-043, finding
+        // H). It looks at first like the money hole `isPubliclyListed` and
+        // `sortOrder` are gated against, and it is not one, because
+        // `hourlyRateCents` never reaches an amount anybody is charged or paid.
+        // Every read of the column in the repository was enumerated: the roster
+        // projection at `STAFF_ROSTER_SELECT`/`toStaffRosterView`, the two sort
+        // keys in `directoryOrderBy` and `rosterOrderBy`, and the two directory
+        // filter bounds. That is all of them. No invoice line, no appointment
+        // total, no ledger entry is computed from it — a chef's actual pay runs
+        // through payroll, which this platform does not model, and an
+        // engagement's price is `ChefAppointment.totalCents`, which
+        // `booking.ts` writes only for a staff caller.
+        //
+        // So the column is a **listing figure**: the rate a chef advertises,
+        // like their biography and their specialities, and the same thing they
+        // would say on the telephone. Gating it would mean an administrator had
+        // to retype a number that costs the business nothing.
+        //
+        // The distinction that decides it is *who bears the consequence*.
+        // `isPubliclyListed` and `sortOrder` allocate a shared, finite resource
+        // — the directory's attention — between chefs who are competing for it,
+        // which is why they are the curator's. A rate is a claim about oneself.
+        // If a future change ever multiplies this column by anything, it stops
+        // being a claim and becomes a price, and it must be gated in the same
+        // breath as that change.
         ...(input.hourlyRateCents === undefined
           ? {}
           : { hourlyRateCents: input.hourlyRateCents }),

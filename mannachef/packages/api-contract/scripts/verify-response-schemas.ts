@@ -202,6 +202,8 @@ const SUBJECTS: readonly Subject[] = [
       depositCents: 50_000,
       gratuityCents: 0,
       currency: 'USD',
+      quotedGuestCount: 6,
+      requiresRequote: false,
       clientNotes: null,
       chefNotes: null,
       confirmedAt: NOW,

@@ -25,6 +25,7 @@
 
 import { AsyncLocalStorage } from 'node:async_hooks'
 
+import { clearRateLimits } from './database'
 import type { FakeDatabase } from './fake-db'
 
 /** The shape `sessionUserSchema` in `@/server/auth` parses to. */
@@ -96,7 +97,17 @@ export function harnessDatabase(): FakeDatabase {
   return state.database
 }
 
-/** Empty every table and forget every recorded query, in place. */
+/**
+ * Empty every table and forget every recorded query, in place.
+ *
+ * The token buckets go with them, as they do in `intake-harness.ts` and
+ * `billing-harness.ts`. They are process-global state an action's outcome
+ * depends on, so a scenario inheriting the previous scenario's spent quota is
+ * the same class of bug as one inheriting its rows. `referral.code.create` is
+ * limited to five an hour per identity since MCV-043 and this harness mints
+ * more than that as one attacker; without this line the later scenarios would
+ * report `RATE_LIMITED` and prove nothing about privilege.
+ */
 export function resetDatabase(): void {
   const { store, calls } = harnessDatabase()
 
@@ -106,4 +117,6 @@ export function resetDatabase(): void {
   store.referralRedemptions.length = 0
   store.invoices.length = 0
   calls.length = 0
+
+  clearRateLimits()
 }

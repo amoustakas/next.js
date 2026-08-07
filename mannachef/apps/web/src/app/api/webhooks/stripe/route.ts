@@ -106,6 +106,10 @@ import {
 import type Stripe from 'stripe'
 
 import { Prisma, prisma } from '@/server/db'
+import {
+  createReferralRedemption,
+  resolveRedemptionEligibility,
+} from '@/server/referral-eligibility'
 import { getStripe, STRIPE_CUSTOMER_USER_ID_KEY } from '@/server/stripe'
 
 /**
@@ -1037,81 +1041,88 @@ async function handleCheckoutCompleted(
 /**
  * Turn a validated invitation code into a `ReferralRedemption`.
  *
- * Idempotent twice over: the read inside the transaction returns early when the
- * redemption already exists, and `@@unique([referralCodeId, referredUserId])`
- * catches the concurrent case, which is swallowed because a duplicate here
- * means the work is already done.
+ * Idempotent twice over: {@link resolveRedemptionEligibility} refuses with
+ * `ALREADY_USED` when the redemption already exists, and
+ * `@@unique([referralCodeId, referredUserId])` catches the concurrent case,
+ * which is swallowed because a duplicate here means the work is already done.
  *
  * Only the redemption and the code's counter are written. Crediting the reward
  * — `RewardBalance`, `RewardLedgerEntry` — belongs to the referral domain,
  * which owns the append-only ledger and the compensating-entry rules; writing
  * a balance from here would fork that authority.
+ *
+ * ## One definition of a valid redemption (MCV-041, finding F)
+ *
+ * This handler used to carry its own. It checked four things — the code exists
+ * and is live, it has not expired, it is not full, and it is not the redeemer's
+ * own — and then wrote the row. It did **not** check `sharesEmailIdentity` or
+ * the one-live-redemption rule, both of which `redeemReferralCode` refuses on,
+ * so an inviter who signed a second account up under a plus-addressed alias of
+ * their own inbox was turned away by the portal form and let through here. A
+ * predicate with two implementations has two meanings, and the weaker one is
+ * the one that decides. There is now one, in `@/server/referral-eligibility`,
+ * and this function contributes nothing to it.
+ *
+ * The heuristic is applied with no escape hatch, unlike `redeemReferralCode`'s
+ * `ADMIN` bypass: there is no operator on this path to exercise judgement, only
+ * Stripe. A household wrongly caught by it asks the concierge, who has the
+ * bypass.
+ *
+ * ## Why `PENDING` and not `QUALIFIED`
+ *
+ * Because a paid Checkout session is not a qualification. The row written here
+ * used to be `QUALIFIED`, stamped `qualifiedAt: new Date()` and carrying the
+ * code's `rewardValueCents` as `rewardCents`, without consulting
+ * `findQualifyingInvoice` or the programme's `minimumQualifyingInvoiceCents`
+ * floor — the two things that decide whether a referral has been earned, and
+ * the whole of what MCV-030 put in place. It escaped being a payout only
+ * because the settlement sweep walks `PENDING` and never looked at these rows.
+ * That is a filter in one query standing between a webhook and the ledger, and
+ * it is not where this platform's rules are supposed to live.
+ *
+ * So the webhook writes what every other path writes: `PENDING`, no
+ * `qualifiedAt`, no `rewardCents`. The sweep applies the floor and moves it on.
  */
 async function recordReferralRedemption(
   referralCodeId: string,
   referredUserId: string
 ): Promise<void> {
   try {
-    await prisma.$transaction(async (tx) => {
-      const code = await tx.referralCode.findUnique({
-        where: { id: referralCodeId },
-        select: {
-          id: true,
-          ownerId: true,
-          isActive: true,
-          expiresAt: true,
-          maxRedemptions: true,
-          redemptionCount: true,
-          rewardValueCents: true,
-          currency: true,
-        },
-      })
+    const outcome = await prisma.$transaction(async (tx) => {
+      const eligibility = await resolveRedemptionEligibility(
+        tx,
+        { kind: 'id', referralCodeId },
+        referredUserId,
+        { applyHouseholdHeuristic: true }
+      )
 
-      if (code === null || !code.isActive || code.ownerId === referredUserId) {
-        return
+      if (eligibility.kind === 'refused') {
+        return { kind: 'refused' as const, reason: eligibility.reason }
       }
 
-      if (code.expiresAt !== null && code.expiresAt.getTime() <= Date.now()) {
-        return
-      }
-
-      if (
-        code.maxRedemptions !== null &&
-        code.redemptionCount >= code.maxRedemptions
-      ) {
-        return
-      }
-
-      const existing = await tx.referralRedemption.findUnique({
-        where: {
-          referralCodeId_referredUserId: {
-            referralCodeId: code.id,
-            referredUserId,
-          },
-        },
-        select: { id: true },
-      })
-
-      if (existing !== null) {
-        return
-      }
-
-      await tx.referralRedemption.create({
-        data: {
-          referralCodeId: code.id,
-          referredUserId,
-          status: 'QUALIFIED',
-          qualifiedAt: new Date(),
-          rewardCents: code.rewardValueCents,
-          currency: code.currency,
-        },
-      })
-
-      await tx.referralCode.update({
-        where: { id: code.id },
-        data: { redemptionCount: { increment: 1 } },
-      })
+      return createReferralRedemption(tx, eligibility.code, referredUserId)
     })
+
+    if (outcome.kind === 'refused') {
+      // Not an error, and not a retry: the code was checked when the session
+      // was opened and something about it has changed since, or it was never
+      // eligible for this household. The reason is a rule name, not a payload.
+      console.info(
+        `[stripe-webhook] referral code ${referralCodeId} not redeemable for user ${referredUserId} (${outcome.reason}); no redemption written.`
+      )
+
+      return
+    }
+
+    if (outcome.kind === 'raced') {
+      // The counter moved under us, so somebody else took the seat. The
+      // transaction rolled the row back; throwing leaves `processedAt` null so
+      // Stripe's redelivery runs the whole check again against fresh rows,
+      // which is the only way this resolves correctly.
+      throw new Error(
+        `[stripe-webhook] referral code ${referralCodeId} was taken concurrently; redemption for user ${referredUserId} will be retried.`
+      )
+    }
   } catch (error) {
     if (
       error instanceof Prisma.PrismaClientKnownRequestError &&

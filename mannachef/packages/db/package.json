@@ -11,7 +11,10 @@
     "db:migrate": "prisma migrate dev",
     "db:push": "prisma db push",
     "db:studio": "prisma studio",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "verify:drift": "node --experimental-strip-types --disable-warning=ExperimentalWarning ./scripts/verify-migration-drift.ts",
+    "verify:conflict-targets": "node --experimental-strip-types --disable-warning=ExperimentalWarning ./scripts/verify-conflict-targets.ts",
+    "verify": "pnpm run verify:drift && pnpm run verify:conflict-targets"
   },
   "dependencies": {
     "@prisma/client": "^6.2.0"

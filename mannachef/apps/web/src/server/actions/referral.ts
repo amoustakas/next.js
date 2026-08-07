@@ -55,12 +55,19 @@
  * | Rule                         | Why                                          |
  * | ---------------------------- | -------------------------------------------- |
  * | self-referral                | `ReferralCode.ownerId === referredUserId`     |
- * | same mailbox as the owner    | {@link sharesEmailIdentity}, below `ADMIN`    |
+ * | same mailbox as the owner    | `sharesEmailIdentity`, below `ADMIN`          |
  * | one redemption per user      | any live redemption already names them        |
  * | one redemption per code/user | `@@unique([referralCodeId, referredUserId])`  |
  * | `maxRedemptions`             | `redemptionCount` may not pass it             |
  * | `expiresAt`                  | an expired invitation is not an invitation    |
  * | `isActive`                   | a withdrawn code is not redeemable            |
+ *
+ * That table is not implemented here. It is
+ * `resolveRedemptionEligibility` in `@/server/referral-eligibility`, which the
+ * Checkout pre-flight in `actions/billing.ts` and the Stripe webhook call as
+ * well — before MCV-041 each of the three carried its own subset of the rows
+ * above, and the webhook's was missing the two that make it a household
+ * heuristic at all.
  *
  * The second of those is a **deterrent, not a proof**: it catches the inviter
  * who signs a second account up to a plus-addressed alias of their own inbox,
@@ -115,7 +122,6 @@ import {
   rewardAdjustmentSchema,
   rewardLedgerFilterSchema,
   rewardPayoutSchema,
-  sharesEmailIdentity,
   signedLedgerAmountCents,
   MAX_REWARD_CENTS,
   type ReferralCodeCreateInput,
@@ -147,6 +153,11 @@ import {
   withAction,
   type AuthenticatedUser,
 } from '@/server/guards'
+import {
+  createReferralRedemption,
+  resolveRedemptionEligibility,
+  REDEMPTION_REFUSALS,
+} from '@/server/referral-eligibility'
 import {
   readQualifyingFloorCents,
   resolveProgramCodeTerms,
@@ -186,18 +197,32 @@ const MAX_CODE_MINT_ATTEMPTS = 8
  */
 const REDEMPTION_RATE_LIMIT = { tokens: 10, windowMs: 60 * 60 * 1_000 } as const
 
+/**
+ * Minting invitation codes (MCV-043).
+ *
+ * Not a defence against enumeration — a code's owner already knows their own
+ * codes. It bounds the *aggregate* liability a single account can create in an
+ * afternoon, which is the one dimension of this programme nothing else measures:
+ * every ceiling that exists is per redemption, and a script that mints codes in
+ * a loop turns a per-redemption ceiling into no ceiling at all.
+ *
+ * Five an hour is generous for the real behaviour — a household issues one code
+ * and gives it out, and a concierge issuing a run of bespoke codes for an event
+ * is `ADMIN`, who is bounded by the same bucket but is also the person being
+ * protected — and hostile for the other. `scope` is left at its `'identity'`
+ * default so the bucket is the signed-in user's; the action is `auth: 'SESSION'`
+ * and unreachable without one, so it never falls back to IP.
+ *
+ * Read the production note on {@link rateLimit} before treating this as a
+ * control rather than a speed bump: the buckets live in the process.
+ */
+const CODE_MINT_RATE_LIMIT = { tokens: 5, windowMs: 60 * 60 * 1_000 } as const
+
 /** The reasons that represent an inbound referral payment. */
 const REFERRAL_CREDIT_REASONS = [
   'REFERRAL_REWARD',
   'REFERRAL_SIGNUP_BONUS',
 ] as const
-
-/** Redemptions that still occupy the "you have already been referred" slot. */
-const LIVE_REDEMPTION_STATUSES = [
-  'PENDING',
-  'QUALIFIED',
-  'REWARDED',
-] as const satisfies readonly ReferralRedemptionStatus[]
 
 // =============================================================================
 // 1. Local input schemas
@@ -720,6 +745,29 @@ interface QualifyingInvoice {
  * dinner has converted; dating the referral to the dinner is both the truthful
  * reading and the one that cannot be gamed by asking a referred guest to buy
  * something trivial first.
+ *
+ * ## An invoice paid for nothing is not a paid invoice (MCV-043)
+ *
+ * `amountPaidCents > 0` is a *separate* condition from the floor, deliberately
+ * not folded into it as `Math.max(floor, 1)`, because it is not a matter of
+ * degree: whatever the programme is willing to accept as a qualifying purchase,
+ * "no money changed hands" is not one, and an operator who sets the floor to
+ * zero is saying "any purchase" rather than "no purchase at all".
+ *
+ * The gap this closes is not hypothetical and it does not need a hostile
+ * `Invoice` row to open it. `handleInvoiceChanged` in the Stripe webhook writes
+ * `amountPaidCents: invoice.amount_paid` and `paidAt` from
+ * `status_transitions.paid_at`, both verbatim and both correct — and Stripe
+ * issues a genuine, `paid`, `amount_paid: 0` invoice in two ordinary cases:
+ * the invoice that opens a subscription trial, and one a 100%-off promotion
+ * code has zeroed. `createCheckoutSession` enables both (`trial_period_days`
+ * and `allow_promotion_codes`). So without this condition, and with a
+ * programme whose floor is the column's default of zero, the entire cost of
+ * manufacturing a referred household was a free trial signup, and the reward
+ * for it was real money.
+ *
+ * Prisma renders the two conditions as one `AND`ed predicate on the column, so
+ * this costs nothing: `"amountPaidCents" >= $floor AND "amountPaidCents" > 0`.
  */
 async function findQualifyingInvoice(
   tx: Prisma.TransactionClient,
@@ -731,7 +779,7 @@ async function findQualifyingInvoice(
       userId: referredUserId,
       status: 'PAID',
       paidAt: { not: null },
-      amountPaidCents: { gte: minimumQualifyingInvoiceCents },
+      amountPaidCents: { gte: minimumQualifyingInvoiceCents, gt: 0 },
     },
     orderBy: [{ paidAt: 'asc' }, { id: 'asc' }],
     select: {
@@ -965,12 +1013,34 @@ async function resolveCodeTerms(
  * With no active programme, a subscriber is refused. There is no built-in
  * fallback figure, and adding one would put a number nobody chose behind a
  * payout.
+ *
+ * ## Why this is rate-limited (MCV-043)
+ *
+ * MCV-030 bounded what *one* code is worth. It did not bound how many a caller
+ * may mint, and the two ceilings this platform has are both per redemption:
+ * `ownerRewardCents` clamps at `MAX_REWARD_CENTS`, and the one-live-redemption
+ * rule caps a referred household at one accepted invitation. Neither says
+ * anything about a thousand codes.
+ *
+ * That is not, by itself, the abuse — the cost of *using* a code is a referred
+ * household that pays a qualifying invoice, and MCV-043's other two changes are
+ * what make that cost real (a zero-amount invoice no longer qualifies, and a
+ * programme may no longer pay out more than the invoice that earns it without
+ * saying so). What the limit adds is that the cheap half of the loop is no
+ * longer free either: minting is the one step in the scheme that costs an
+ * attacker nothing at all, and leaving it unmetered means the whole scheme runs
+ * at whatever rate their script does.
+ *
+ * See {@link CODE_MINT_RATE_LIMIT} for the figures, and the production note on
+ * `rateLimit` in `@/server/guards` for why this is a speed bump until the
+ * buckets move to a shared store.
  */
 export const createReferralCode = withAction(
   {
     name: 'referral.code.create',
     auth: 'SESSION',
     input: referralCodeCreateSchema,
+    rateLimit: CODE_MINT_RATE_LIMIT,
     revalidatePaths: REFERRAL_PATHS,
     revalidateTags: REFERRAL_TAGS,
   },
@@ -1478,20 +1548,24 @@ export interface ReferralRedemptionReceipt {
  * {@link findQualifyingInvoice}. Crediting at signup is how a referral
  * programme becomes a faucet.
  *
- * ## The six refusals
+ * ## The refusals are not decided here
  *
- * Each has its own sentence on the `code` field, and every one of them is
- * decided inside the transaction against freshly-read rows — the code the guest
- * typed is a string, not a permission. They are, in order: unknown or
- * withdrawn, expired, fully redeemed, the guest's own code, already used by
- * this guest, and already referred by somebody else.
+ * They are {@link resolveRedemptionEligibility}'s, and this action's only
+ * contributions are the caller check above it and the sentence each refusal is
+ * rendered as. That is deliberate (MCV-041, finding F): the same predicate
+ * decides the checkout pre-flight in `actions/billing.ts` and the webhook write
+ * in `api/webhooks/stripe/route.ts`, and when it lived here in longhand the
+ * other two had drifted into weaker copies of it — the checkout path in
+ * particular skipped the household heuristic and the one-live-redemption rule
+ * altogether.
  *
  * ## The counter
  *
  * `redemptionCount` is bumped with `updateMany` guarded on its *prior* value, a
- * compare-and-swap. Two guests taking the last seat of a capped code therefore
- * produce one redemption and one `CONFLICT`; the loser's `create` is rolled
- * back with the rest of the transaction.
+ * compare-and-swap, inside {@link createReferralRedemption}. Two guests taking
+ * the last seat of a capped code therefore produce one redemption and one
+ * `CONFLICT`; the loser's `create` is rolled back with the rest of the
+ * transaction.
  */
 export const redeemReferralCode = withAction(
   {
@@ -1513,121 +1587,33 @@ export const redeemReferralCode = withAction(
       )
     }
 
-    /**
-     * The six refusals all read the same to a guest: a sentence under the code
-     * field. Built rather than thrown, so each `throw` site stays a `throw` and
-     * TypeScript keeps narrowing the row afterwards.
-     */
-    const codeIssue = (message: string): ActionError =>
-      new ActionError('VALIDATION', message, { code: [message] })
-
     const receipt = await ctx.db.$transaction(async (tx) => {
-      const account = await tx.user.findUnique({
-        where: { id: referredUserId },
-        select: { id: true, isActive: true, email: true },
-      })
+      const eligibility = await resolveRedemptionEligibility(
+        tx,
+        { kind: 'code', code: input.code },
+        referredUserId,
+        // `ADMIN` and above are the escape hatch when the household heuristic
+        // is simply wrong about two members of one family.
+        { applyHouseholdHeuristic: !privileged }
+      )
 
-      if (account === null || !account.isActive) {
-        throw new ActionError('NOT_FOUND', 'We could not find that account.')
+      if (eligibility.kind === 'refused') {
+        const terms = REDEMPTION_REFUSALS[eligibility.reason]
+
+        // Every refusal about the code itself reads the same to a guest: a
+        // sentence under the `code` field. `NO_ACCOUNT` is not about the code,
+        // so it does not get one.
+        throw terms.code === 'NOT_FOUND'
+          ? new ActionError('NOT_FOUND', terms.message)
+          : new ActionError('VALIDATION', terms.message, {
+              code: [terms.message],
+            })
       }
 
-      const code = await tx.referralCode.findUnique({
-        where: { code: input.code },
-        select: REFERRAL_CODE_SELECT,
-      })
+      const { code } = eligibility
+      const written = await createReferralRedemption(tx, code, referredUserId)
 
-      if (code === null || !code.isActive) {
-        throw codeIssue('That invitation code is not one we recognise.')
-      }
-
-      if (code.expiresAt !== null && code.expiresAt.getTime() <= Date.now()) {
-        throw codeIssue('That invitation code has expired.')
-      }
-
-      if (
-        code.maxRedemptions !== null &&
-        code.redemptionCount >= code.maxRedemptions
-      ) {
-        throw codeIssue('That invitation code has already been fully redeemed.')
-      }
-
-      if (code.ownerId === account.id) {
-        throw codeIssue(
-          'An invitation code cannot be redeemed by its own owner.'
-        )
-      }
-
-      // The identity check above catches one account redeeming its own code.
-      // It does not catch the five-second version of the same thing: mint a
-      // code, sign a second account up with a plus-addressed alias of the same
-      // inbox, redeem it there. `sharesEmailIdentity` refuses that, and it is a
-      // DETERRENT RATHER THAN A PROOF — it reduces both addresses to a likely
-      // mailbox (see its docblock), which has false positives by construction
-      // and is defeated outright by a second real address. Nothing downstream
-      // may read its silence as evidence a referral was earned; the control
-      // point remains an administrator, who chooses whether to run the
-      // settlement sweep and can `REVOKE` with `reverseLedgerEntry` afterwards.
-      //
-      // Skipped for `ADMIN` and above, who are the escape hatch when the
-      // heuristic is simply wrong about two members of one household.
-      if (!privileged) {
-        const owner = await tx.user.findUnique({
-          where: { id: code.ownerId },
-          select: { email: true },
-        })
-
-        if (sharesEmailIdentity(owner?.email, account.email)) {
-          throw codeIssue(
-            'That invitation appears to have been issued to this same household.'
-          )
-        }
-      }
-
-      const sameCode = await tx.referralRedemption.findUnique({
-        where: {
-          referralCodeId_referredUserId: {
-            referralCodeId: code.id,
-            referredUserId: account.id,
-          },
-        },
-        select: { id: true },
-      })
-
-      if (sameCode !== null) {
-        throw codeIssue('You have already used that invitation code.')
-      }
-
-      const anyLive = await tx.referralRedemption.findFirst({
-        where: {
-          referredUserId: account.id,
-          status: { in: [...LIVE_REDEMPTION_STATUSES] },
-        },
-        select: { id: true },
-      })
-
-      if (anyLive !== null) {
-        throw codeIssue(
-          'An invitation has already been accepted on this account.'
-        )
-      }
-
-      const created = await tx.referralRedemption.create({
-        data: {
-          referralCodeId: code.id,
-          referredUserId: account.id,
-          status: 'PENDING',
-          currency: code.currency,
-        },
-        select: { id: true, status: true, currency: true },
-      })
-
-      // Compare-and-swap on the counter's prior value.
-      const bumped = await tx.referralCode.updateMany({
-        where: { id: code.id, redemptionCount: code.redemptionCount },
-        data: { redemptionCount: { increment: 1 } },
-      })
-
-      if (bumped.count !== 1) {
+      if (written.kind === 'raced') {
         throw new ActionError(
           'CONFLICT',
           'That invitation was taken a moment ago. Please try again.'
@@ -1635,11 +1621,11 @@ export const redeemReferralCode = withAction(
       }
 
       return {
-        redemptionId: created.id,
+        redemptionId: written.redemption.id,
         code: code.code,
-        status: created.status,
+        status: written.redemption.status,
         refereeRewardCents: code.refereeRewardCents,
-        currency: created.currency,
+        currency: written.redemption.currency,
       }
     })
 

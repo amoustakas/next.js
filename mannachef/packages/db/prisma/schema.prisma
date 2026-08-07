@@ -1006,6 +1006,44 @@ enum RewardLedgerReason {
 /// both. Unlike `ReferralCode` — whose historical rows predate the rule — the
 /// pairing is a CHECK constraint here, added in the `0001_referral_program`
 /// migration alongside the numeric ranges documented on each field below.
+///
+/// ## The economics of the offer (MCV-043)
+///
+/// Every per-redemption ceiling this platform has is a ceiling on *one*
+/// redemption. `ownerRewardCents` clamps to MAX_REWARD_CENTS ($10,000) and the
+/// one-live-redemption rule in `apps/web/src/server/referral-eligibility.ts`
+/// caps a referred household at one accepted invitation, so a single fabricated
+/// household is worth at most $10,000 to the inviter plus the referee reward.
+///
+/// In aggregate there is no ceiling at all, and there is not meant to be one:
+/// a programme that works is a programme people use repeatedly. What has to
+/// hold instead is that **each** fabricated household costs more to manufacture
+/// than it pays out. The whole cost of manufacturing one is a single PAID
+/// invoice on a new account, so the only thing standing between the programme
+/// and a money pump is the relationship between two figures on this row:
+///
+///   ownerReward(invoice) + refereeReward  ≤  invoice, for every qualifying invoice
+///
+/// The reward side of that inequality is fixed by this row. The invoice side is
+/// bounded below by `minimumQualifyingInvoiceCents` and by the rule that a
+/// qualifying invoice must have been paid for a non-zero amount (see
+/// `findQualifyingInvoice`). Since `ownerRewardCents` grows no faster than the
+/// invoice does — a flat credit is constant, and a percentage is at most 100% —
+/// checking the inequality at the floor checks it everywhere. So the invariant
+/// this table enforces is:
+///
+///   ownerRewardAtTheFloor + COALESCE(refereeRewardCents, 0)
+///     ≤ minimumQualifyingInvoiceCents        unless allowLossLeader
+///
+/// where ownerRewardAtTheFloor is `rewardValueCents`, or
+/// `round(minimumQualifyingInvoiceCents × rewardValuePercent / 100)` for a
+/// PERCENT_DISCOUNT offer — the same arithmetic `ownerRewardCents` performs.
+///
+/// Note what this makes impossible by construction: a floor of 0 with any
+/// reward at all. That combination was reachable before MCV-043 and was the
+/// cheapest form of the abuse, because the column *defaults* to 0 — an offer
+/// switched on before anybody thought about the floor paid out real money for
+/// an invoice of nothing. It is now either refused, or acknowledged.
 model ReferralProgram {
   id  String @id @default(cuid())
   key String @unique @default("default") @db.VarChar(40)
@@ -1029,9 +1067,20 @@ model ReferralProgram {
   defaultExpiryDays     Int?
 
   /// A referral is not earned until the referred household has paid an invoice
-  /// of at least this much. 0 means any paid invoice qualifies. Enforced in
-  /// `findQualifyingInvoice`, which is the only definition of "qualified".
+  /// of at least this much. 0 means any paid invoice **of a non-zero amount**
+  /// qualifies — a Stripe trial-start or a fully discounted invoice arrives as
+  /// PAID with `amount_paid` of 0 and is refused whatever this is set to.
+  /// Enforced in `findQualifyingInvoice`, which is the only definition of
+  /// "qualified".
   minimumQualifyingInvoiceCents Int @default(0)
+
+  /// The owner's acknowledgement that this offer pays out more than the invoice
+  /// that earns it — see the economics note on this model. False refuses such an
+  /// offer outright, at the validator and at the
+  /// `ReferralProgram_reward_economics_check` constraint. True permits it, and
+  /// records that somebody chose it: a loss leader is a legitimate way to buy
+  /// growth, and the point of this column is that it can never be an accident.
+  allowLossLeader Boolean @default(false)
 
   /// Off by default: an unconfigured platform makes no standing offer, and a
   /// CLIENT asking for a code while it is off is refused rather than given
@@ -1411,7 +1460,29 @@ model ChefAvailability {
 
   staffProfile StaffProfile @relation("AvailabilityStaff", fields: [staffProfileId], references: [id], onDelete: Cascade)
 
-  @@unique([staffProfileId, kind, dayOfWeek, specificDate, startMinute, endMinute])
+  // NO `@@unique([staffProfileId, kind, dayOfWeek, specificDate, startMinute,
+  // endMinute])`. Uniqueness for this model IS enforced, but by two partial
+  // unique indexes that the Prisma DSL cannot express — one per `kind`
+  // discriminator branch, each keyed only on the columns that branch actually
+  // populates:
+  //
+  //   ChefAvailability_recurring_weekly_unique
+  //     (staffProfileId, dayOfWeek, startMinute, endMinute)
+  //     WHERE kind = 'RECURRING_WEEKLY'
+  //   ChefAvailability_date_override_unique
+  //     (staffProfileId, specificDate, startMinute, endMinute)
+  //     WHERE kind = 'DATE_OVERRIDE'
+  //
+  // Both live in `0000_init/migration.sql`. The six-column tuple above was
+  // written here first and was decorative: exactly one of `dayOfWeek` /
+  // `specificDate` is NULL on every row, and Postgres never treats two NULLs
+  // as equal, so it could not reject a single real duplicate (MCV-007).
+  // Declaring it anyway put an index in the datamodel that no migration
+  // creates — permanent `prisma migrate diff` drift (MCV-042) — in exchange
+  // for a `ChefAvailabilityWhereUniqueInput` member that would have been an
+  // unusable `ON CONFLICT` target had anything reached for it. Nothing does:
+  // every access is by `id`. Do not add it back; add a partial index to a new
+  // migration instead. See `packages/db/README.md`.
   @@index([staffProfileId, kind])
   @@index([staffProfileId, dayOfWeek])
   @@index([staffProfileId, specificDate])
@@ -1480,6 +1551,25 @@ model ChefAppointment {
   depositCents  Int    @default(0)
   gratuityCents Int    @default(0)
   currency      String @default("CAD") @db.VarChar(3)
+
+  /// The party size the three money columns above were priced for — 1–200 when
+  /// set, and null while nobody has priced this engagement at all.
+  ///
+  /// Money on an engagement is staff-owned: a CLIENT booking writes zeroes and
+  /// a concierge quotes the figures afterwards. `guestCount`, by contrast, is a
+  /// household's to change, and a party of four that becomes a party of forty
+  /// is the ordinary reason someone reschedules. Recording *what the quote was
+  /// for* is what keeps those two facts from contradicting each other silently:
+  /// whenever this differs from `guestCount`, the figures were priced for a
+  /// different dinner and the engagement needs re-quoting. See `requiresRequote`
+  /// on `AppointmentView` and `repriceAppointment` in
+  /// `apps/web/src/server/actions/booking.ts` (MCV-043, finding G).
+  ///
+  /// Deliberately *not* a boolean flag anybody has to remember to set. Staleness
+  /// is derived from two columns that are each written for their own reasons, so
+  /// there is no code path that can change the party size and forget to raise
+  /// the flag — which is precisely the path the finding walked in through.
+  quotedGuestCount Int?
 
   clientNotes String? @db.Text
   chefNotes   String? @db.Text

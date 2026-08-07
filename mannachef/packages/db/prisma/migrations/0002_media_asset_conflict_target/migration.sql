@@ -1,0 +1,57 @@
+-- =============================================================================
+-- MCV-042 — make MediaAsset(provider, providerFileKey) a real ON CONFLICT target
+-- =============================================================================
+--
+-- `0000_init` replaced the Prisma-generated
+--   CREATE UNIQUE INDEX "MediaAsset_provider_providerFileKey_key"
+-- with a partial index scoped to `WHERE "providerFileKey" IS NOT NULL`, on the
+-- grounds that rows with a NULL file key can never collide anyway under
+-- Postgres's NULL-distinctness rules. That reasoning is correct about *what the
+-- index enforces* and wrong about *what the index can be used for*.
+--
+-- Prisma Client is generated from `schema.prisma`, not from this migration
+-- history. `@@unique([provider, providerFileKey])` on `MediaAsset` makes
+-- `mediaAsset.upsert({ where: { provider_providerFileKey: … } })` compile to
+--
+--   INSERT INTO "MediaAsset" (…) VALUES (…)
+--   ON CONFLICT ("provider", "providerFileKey") DO UPDATE SET …
+--
+-- and PostgreSQL will only match an `ON CONFLICT` inference clause to a
+-- *non-partial* unique index (or to a partial one whose predicate the planner
+-- can prove is implied by the statement, which a bare column list never is).
+-- Against a database built from the migration history, that upsert therefore
+-- failed unconditionally with
+--
+--   42P10: there is no unique or exclusion constraint matching the ON CONFLICT
+--          specification
+--
+-- which made `completeMediaUpload` (apps/web/src/server/actions/media.ts) dead
+-- on arrival for every media upload — the one code path the whole media library
+-- is reached through.
+--
+-- The two indexes are otherwise indistinguishable. A full unique index on
+-- (provider, providerFileKey) still admits any number of rows whose
+-- `providerFileKey` is NULL, because Postgres's default NULLS DISTINCT means no
+-- two such tuples are ever equal; and for rows that *do* carry a file key it
+-- rejects exactly the duplicates the partial index rejected. Nothing about the
+-- MCV-007 NULL-distinctness finding is being reverted here: the partial index
+-- was never buying additional enforcement on this table, only losing the
+-- ability to back an `ON CONFLICT`.
+--
+-- The index is recreated under the name Prisma derives for
+-- `@@unique([provider, providerFileKey])` — `MediaAsset_provider_providerFileKey_key`
+-- — so that `prisma migrate diff --from-migrations … --to-schema-datamodel …`
+-- sees no drift. `scripts/verify-migration-drift.ts` now fails the package's
+-- `verify` task if it ever does again.
+--
+-- ChefAvailability is deliberately NOT touched. Its two partial indexes encode
+-- two genuinely different constraints (one per `kind` discriminator branch)
+-- that a single `@@unique` tuple cannot express, no client code addresses that
+-- compound key, and so the reconciliation there went the other way: the
+-- unenforceable `@@unique` was removed from `schema.prisma` and the partial
+-- indexes stay. See `packages/db/README.md`.
+
+DROP INDEX "MediaAsset_provider_providerFileKey_unique";
+
+CREATE UNIQUE INDEX "MediaAsset_provider_providerFileKey_key"
+  ON "MediaAsset"("provider", "providerFileKey");

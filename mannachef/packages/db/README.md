@@ -40,7 +40,7 @@ apps/web's Zod validators.
 
 In the normal case — the schema changes going forward — do **not** touch
 `0000_init` at all. Create a new migration for the change and add any new
-hand-written constraints it needs to *that* migration's `.sql` file instead,
+hand-written constraints it needs to _that_ migration's `.sql` file instead,
 following the same pattern.
 
 ### What's in the hand-written block, and why
@@ -73,24 +73,24 @@ following the same pattern.
      current balance) is still constrained to `>= 0` — it's spendable store
      credit, not a line of credit a client can go into debt on.
 
-3. **NULL-distinctness fixes.** Two `@@unique` constraints in the Prisma
-   schema are decorative under Postgres's NULL-distinctness rules, because
-   they span two nullable columns that are supposed to be mutually exclusive:
-   - `ChefAvailability` distinguishes `RECURRING_WEEKLY` rows (`dayOfWeek` set,
-     `specificDate` null) from `DATE_OVERRIDE` rows (`specificDate` set,
-     `dayOfWeek` null). The original
-     `@@unique([staffProfileId, kind, dayOfWeek, specificDate, startMinute, endMinute])`
-     always has a `NULL` in one of `dayOfWeek`/`specificDate`, and Postgres
-     never treats two `NULL`s as equal — so two identical `RECURRING_WEEKLY`
-     rows for the same staff member, day, and time window could be inserted
-     without ever tripping the constraint. This is replaced with two partial
-     unique indexes, one per `kind`, each keyed only on the columns that are
-     actually populated for that branch.
-   - `MediaAsset.@@unique([provider, providerFileKey])` is decorative for
-     every row where `providerFileKey` is `NULL` (e.g. `provider = EXTERNAL`
-     assets, which have no provider file key at all) for the same reason.
-     Replaced with a unique index scoped to `WHERE "providerFileKey" IS NOT
-     NULL`.
+3. **NULL-distinctness fix (`ChefAvailability`).** `ChefAvailability`
+   distinguishes `RECURRING_WEEKLY` rows (`dayOfWeek` set, `specificDate`
+   null) from `DATE_OVERRIDE` rows (`specificDate` set, `dayOfWeek` null). The
+   original
+   `@@unique([staffProfileId, kind, dayOfWeek, specificDate, startMinute, endMinute])`
+   always has a `NULL` in one of `dayOfWeek`/`specificDate`, and Postgres never
+   treats two `NULL`s as equal — so two identical `RECURRING_WEEKLY` rows for
+   the same staff member, day, and time window could be inserted without ever
+   tripping the constraint. It is replaced with two partial unique indexes, one
+   per `kind`, each keyed only on the columns that are actually populated for
+   that branch.
+
+   `0000_init` applied the same reasoning to
+   `MediaAsset.@@unique([provider, providerFileKey])` and replaced it with an
+   index scoped to `WHERE "providerFileKey" IS NOT NULL`. **That one was
+   wrong**, and `0002_media_asset_conflict_target` puts it back. The reasoning
+   is in "Reconciling a hand-written index with the datamodel" below; read that
+   section before reaching for a partial index again.
 
 4. **`ChefAvailability` discriminator invariant.** A `CHECK` constraint
    enforces that `RECURRING_WEEKLY` rows always have `dayOfWeek NOT NULL` and
@@ -106,10 +106,52 @@ following the same pattern.
      can never be oversold at the database layer, independent of whatever
      application-level locking is used when incrementing `bookedCount`).
 
+### The later hand-written blocks
+
+`0000_init` is not the only migration with one, and each block belongs to the
+migration that introduced the column it constrains:
+
+- **`0001_referral_program`** — the numeric ranges on `ReferralProgram`, and the
+  reward-pairing `CHECK` that keeps a `FIXED_CREDIT` offer from carrying a
+  percentage (MCV-030).
+- **`0003_mcv043_referral_economics_and_requote`** — the range on
+  `ChefAppointment.quotedGuestCount`, a one-off backfill, and
+  `ReferralProgram_reward_economics_check` (MCV-043).
+
+The last of those is the only `CHECK` in the history that is _arithmetic across
+several columns_ rather than a range on one, so it is worth saying what it
+encodes. Nothing bounds the aggregate cost of the referral programme — every
+other ceiling is per redemption — so the only thing that can keep it from being
+farmable is that each referred household costs more to manufacture than it pays
+out. The constraint is that inequality, evaluated at the cheapest invoice that
+can qualify:
+
+```
+ownerRewardAtTheFloor + COALESCE(refereeRewardCents, 0)
+  <= minimumQualifyingInvoiceCents      unless allowLossLeader
+```
+
+Checking at the floor checks everywhere, because the owner's reward is either a
+constant or a share of the invoice bounded at 100%, so the slack only grows as
+the invoice does. The full argument is on the `ReferralProgram` model in
+`schema.prisma`; `referralProgramUpsertSchema` enforces the same rule at the
+boundary, and `apps/web`'s `verify:mcv043` asserts both layers, the second by
+writing around the first with the raw client.
+
+The backfill in that migration deserves its own note, because a migration that
+changes data is rare here. `ALTER TABLE … ADD CONSTRAINT … CHECK` validates
+existing rows, and a programme configured before MCV-043 may well violate the
+new one — `minimumQualifyingInvoiceCents` defaults to `0`, so an offer switched
+on before anybody thought about the floor pays a real reward for an invoice of
+nothing. Such rows are marked `allowLossLeader = true` rather than repaired: the
+alternatives were to raise the floor or lower the reward, and both silently
+change what an offer already in circulation pays out. Setting the flag changes
+no behaviour and states something true of the row.
+
 ### Regenerating or extending
 
 - Changing an existing model? Add a new migration (`prisma migrate dev
-  --create-only` or hand-authored) for the schema change, and add any new
+--create-only` or hand-authored) for the schema change, and add any new
   hand-written constraints to that migration, not to `0000_init`.
 - Touching one of the columns/models above? Update both the `schema.prisma`
   doc comment (the source of truth for the documented range/invariant) and
@@ -118,3 +160,126 @@ following the same pattern.
   validated: load it into a disposable Postgres instance (or at minimum run
   it through `psql --set ON_ERROR_STOP=1 -f migration.sql` against a scratch
   database) before committing.
+- **Run `pnpm --filter @mannachef/db verify` before committing.** A
+  hand-written index that diverges from `schema.prisma` is not a style
+  problem; MCV-042 below is what it costs.
+
+---
+
+## Reconciling a hand-written index with the datamodel (MCV-042)
+
+Prisma has two schemas, and the hand-written block above is what makes them
+come apart.
+
+- **Prisma Client is generated from `schema.prisma`.** An `@@unique` there is
+  what puts a compound key in `WhereUniqueInput`, and what makes `upsert` emit
+  `INSERT … ON CONFLICT (<those columns>) DO UPDATE`.
+- **The database is built from `prisma/migrations`.** An `@@unique` that no
+  migration creates as a plain unique index exists nowhere a query can reach.
+
+Every hand-written index therefore has to be reconciled with the datamodel
+deliberately, in one of two directions. Getting the direction wrong is silent:
+the types still check, the unit tests still pass, and PostgreSQL rejects the
+query at runtime.
+
+### What went wrong
+
+`0000_init` swapped a plain unique index for a partial one on
+`MediaAsset(provider, providerFileKey)` while leaving
+`@@unique([provider, providerFileKey])` in `schema.prisma`. PostgreSQL will
+only infer an `ON CONFLICT` target from a bare column list to a **non-partial**
+unique index, so `completeMediaUpload`
+(`apps/web/src/server/actions/media.ts`) — the only path an asset enters the
+library by — failed on every call, on every database built from the migration
+history:
+
+```text
+42P10: there is no unique or exclusion constraint matching the ON CONFLICT
+       specification
+```
+
+Media upload was dead platform-wide behind a fully green test suite, because
+nothing in that suite touched `mediaAsset.upsert` against a real PostgreSQL.
+
+### The two directions, and how to choose
+
+**Direction A — reconcile toward the datamodel** (`MediaAsset`,
+`0002_media_asset_conflict_target`). Drop the partial index, create the plain
+one Prisma expects, under the name Prisma derives
+(`MediaAsset_provider_providerFileKey_key`).
+
+Choose this when the partial index and the plain one enforce **the same thing**.
+That was the case here, and the MCV-007 reasoning that produced the partial
+index — "rows with a `NULL` file key can never collide anyway" — is exactly why:
+a plain unique index on `(provider, providerFileKey)` still admits any number of
+keyless `EXTERNAL` assets, because Postgres's default `NULLS DISTINCT` means two
+such tuples are never equal. The predicate was buying no additional enforcement,
+only losing the ability to back an `ON CONFLICT`. Nothing about the
+NULL-distinctness finding is reverted; it simply had no work to do on this table.
+
+**Direction B — reconcile toward the SQL** (`ChefAvailability`). Delete the
+`@@unique` from `schema.prisma`, keep the partial indexes, and say in a comment
+on the model what enforces uniqueness instead.
+
+Choose this when the partial indexes encode something the DSL genuinely cannot
+say. `ChefAvailability` has two constraints, not one — a `RECURRING_WEEKLY` rule
+is unique on `(staffProfileId, dayOfWeek, startMinute, endMinute)` and a
+`DATE_OVERRIDE` rule on `(staffProfileId, specificDate, startMinute, endMinute)`
+— and no single tuple expresses both. The six-column `@@unique` that was there
+could not reject a single real duplicate, and declaring it bought nothing but
+permanent drift plus an unusable `ON CONFLICT` target in the generated client.
+
+**Before choosing direction B, grep for the compound key.** Removing an
+`@@unique` removes its member from `WhereUniqueInput`, so any `findUnique`,
+`update`, `delete` or `upsert` addressing it stops compiling — and an `upsert`
+that _was_ compiling was relying on an `ON CONFLICT` that could never have
+worked. For `ChefAvailability` the search was
+`grep -rn 'staffProfileId_kind' apps packages`, which found nothing: every
+access is by `id`.
+
+### The guardrail
+
+Both of the checks below need a reachable PostgreSQL. They are wired into
+`pnpm --filter @mannachef/db verify`, which the root `pnpm verify` runs.
+
+```bash
+DATABASE_URL=postgresql://…/mannachef_harness pnpm --filter @mannachef/db verify
+```
+
+- **`scripts/verify-migration-drift.ts`** (`verify:drift`) runs
+
+  ```bash
+  prisma migrate diff \
+    --from-migrations prisma/migrations \
+    --to-schema-datamodel prisma/schema.prisma \
+    --shadow-database-url … \
+    --exit-code
+  ```
+
+  and fails the build on any difference. Exit code 2 from that command means
+  drift, not error, and the script separates the two — a guardrail that reads a
+  CLI failure as "no drift" is decorative. The shadow database is derived from
+  `DATABASE_URL` by suffixing the database name with `_migrate_shadow`, created
+  on first use, and never the database `DATABASE_URL` itself names.
+
+  Note what this does **not** cover: `CHECK` constraints and partial unique
+  indexes have no DSL syntax, so `migrate diff` cannot see them in either
+  direction. A partial index in SQL is not reported as an extra, and it cannot
+  stand in for a plain `@@unique` in the datamodel — which is the asymmetry that
+  makes it report MCV-042 in the first place.
+
+- **`scripts/verify-conflict-targets.ts`** (`verify:conflict-targets`) drops and
+  recreates a scratch database (`<DATABASE_URL's database>_conflict_harness`),
+  applies the **full migration history** to it with `prisma migrate deploy`,
+  regenerates the client from `schema.prisma`, and then issues the real queries.
+  It asserts the upsert resolves its conflict target in both directions; that a
+  genuine duplicate is still rejected; that keyless `EXTERNAL` assets are still
+  admitted; and — for `ChefAvailability`, where the constraint was removed from
+  the datamodel and therefore from the drift check's view — that both partial
+  indexes and the discriminator `CHECK` still enforce what they claim to.
+
+- **`apps/web`'s `verify:media`** (`scripts/verify-media-upload.ts`) drives the
+  real `completeMediaUpload` Server Action — guard, zod transform, transaction
+  and all — against a database built from the migration history. The two db
+  checks prove the schema is coherent; this one proves the action an
+  administrator actually reaches still files a photograph.

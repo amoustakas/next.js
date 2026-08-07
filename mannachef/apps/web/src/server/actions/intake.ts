@@ -24,31 +24,50 @@
  *
  * ## The rule the first two exist to obey
  *
- * **A public submission never overwrites an existing household's record.**
+ * **A public submission never writes to an existing household's record.**
  *
  * The prospect entry points are reachable by anyone with a browser, and the one
  * piece of identity they carry is an email address the sender has not proved
  * they own. Everything downstream follows from treating that address as a
- * *claim*:
+ * *claim*, and from {@link resolveIdentity} reporting, as a typed discriminant,
+ * whether it `created` the `User` it returned or merely `matched` one that was
+ * already ours.
+ *
+ * The enumeration below is deliberately phrased over **columns and rows both**.
+ * An earlier version of this note promised only that "not one of their columns
+ * is written", and {@link attachReferral} walked straight through that promise
+ * by inserting a *new row* — a `ReferralRedemption` naming the matched
+ * household as somebody's referee — which is money, and which an unauthenticated
+ * caller could aim at any address they could guess (MCV-040 finding A). A
+ * protection stated over the wrong noun is not a protection.
  *
  *  - When the caller is signed in, the payload's email is ignored entirely for
  *    identity and the session's own `User` is used. A signed-in caller can
  *    therefore never open or touch a record belonging to a different address.
- *  - When the caller is anonymous and the address is already ours, the existing
- *    `User` and `ClientProfile` are read and **not one of their columns is
- *    written**. No name, no phone, no source, no status. The enquiry is
- *    recorded *alongside* them as a `ConsultationInterview` and an
- *    `InteractionLog`, which is what the concierge needs and what a stranger
- *    cannot use to vandalise a real client's file.
- *  - When the address is already ours *and already has a submitted
- *    questionnaire*, an anonymous submission writes no answers at all. It is
- *    logged as a duplicate for the concierge and the caller receives the same
- *    receipt they would have received anyway.
+ *  - When the caller is anonymous and the address is already ours — an identity
+ *    of kind `matched` — the existing `User` and `ClientProfile` are read and
+ *    **not one of their columns is written**. No name, no phone, no source, no
+ *    status. The enquiry is recorded *alongside* them as a
+ *    `ConsultationInterview` and an `InteractionLog`, which is what the
+ *    concierge needs and what a stranger cannot use to vandalise a real
+ *    client's file.
+ *  - When the caller is anonymous and the identity is `matched`, **no
+ *    `ClientIntakeForm` is written either** — not amended, and not created. It
+ *    makes no difference whether the household has already returned its
+ *    questionnaire: a household that has not (one the concierge opened, or one
+ *    {@link convertProspect} promoted) is the *more* fragile case, because a
+ *    stranger's answers would arrive stamped `submittedAt` and would then be
+ *    the allergen list a chef cooks against (MCV-040 finding D).
+ *  - When the caller is anonymous and the identity is `matched`, **no row that
+ *    carries money may name them**. {@link attachReferral} refuses any identity
+ *    it did not just create, and takes the whole {@link ResolvedIdentity} rather
+ *    than a bare id so that the refusal cannot be bypassed by a call site that
+ *    forgot to ask.
  *  - Row identifiers are withheld from anonymous callers — {@link
  *    ConsultationReceipt} and {@link ProspectIntakeReceipt} both carry `null`
- *    ids for them — and the response shape does not vary with whether the
- *    address was already known. The form is therefore not an oracle for who our
- *    clients are.
+ *    ids for them — and neither the response shape *nor its values* vary with
+ *    whether the address was already known. The form is therefore not an oracle
+ *    for who our clients are.
  *
  * ## What a household may read
  *
@@ -498,22 +517,58 @@ interface ProspectContact {
   readonly sourceDetail?: string | undefined
 }
 
-interface ResolvedIdentity {
-  readonly userId: string
-  readonly clientProfileId: string
-}
+/**
+ * Where the `User` behind an enquiry came from.
+ *
+ * Two answers rather than one field, and modelled as a discriminated union for
+ * the reason the Stripe webhook's `Attribution` is: the difference between "we
+ * opened this account a moment ago" and "this account was already ours" decides
+ * whether a caller who has proved nothing may cause a row to be written naming
+ * it, and a shape that could only report an id made that question invisible at
+ * every call site. It stayed invisible long enough for {@link attachReferral} to
+ * hand an unauthenticated stranger a paying household's referral (MCV-040
+ * finding A).
+ *
+ * `clientProfileId` accompanies both, because every caller needs it; the `kind`
+ * is what they must branch on before writing anything that is not theirs.
+ */
+type ResolvedIdentity =
+  /**
+   * This call inserted the `User` row. Nobody else has ever held this account,
+   * so there is nothing of anybody's to damage and no consent to forge.
+   */
+  | {
+      readonly kind: 'created'
+      readonly userId: string
+      readonly clientProfileId: string
+    }
+  /**
+   * The `User` row was already ours. Either the caller's own session named it —
+   * in which case ownership is proved but the account is still not new — or an
+   * **unproved email address** in a public payload matched it, in which case the
+   * caller has demonstrated nothing beyond knowing how to spell it.
+   */
+  | {
+      readonly kind: 'matched'
+      readonly userId: string
+      readonly clientProfileId: string
+    }
 
 /**
  * Find, or carefully open, the household this enquiry belongs to.
  *
  * A signed-in caller is themselves — the payload's email is not consulted at
  * all, so nobody can drive this function at a record they do not own by typing
- * somebody else's address into a public form.
+ * somebody else's address into a public form. That identity is reported as
+ * `matched`: a session proves *ownership*, not *novelty*, and the two callers of
+ * this function want to know about novelty.
  *
  * An anonymous caller whose address we already hold gets the *existing* rows
- * back, untouched. The `create` branches run only when there is genuinely
- * nothing there, and the `P2002` retry covers two submissions racing for the
- * same brand-new address.
+ * back, untouched, also as `matched`. The `create` branch runs only when there
+ * is genuinely nothing there, and the `P2002` retry inside
+ * {@link createProspectUser} covers two submissions racing for the same
+ * brand-new address — reporting `matched`, because the loser of that race read
+ * a row it did not write.
  */
 async function resolveIdentity(
   tx: Prisma.TransactionClient,
@@ -532,18 +587,23 @@ async function resolveIdentity(
         })
 
   let userId: string
+  let kind: ResolvedIdentity['kind']
 
   if (existingUser !== null) {
     // Deliberately no update. The name, phone, role and locale on an account
     // that already exists belong to that account; a public form does not edit
     // them, and a stranger who guessed the address must not be able to.
     userId = existingUser.id
+    kind = 'matched'
 
     if (existingUser.clientProfile !== null) {
-      return { userId, clientProfileId: existingUser.clientProfile.id }
+      return { kind, userId, clientProfileId: existingUser.clientProfile.id }
     }
   } else {
-    userId = await createProspectUser(tx, contact)
+    const opened = await createProspectUser(tx, contact)
+
+    userId = opened.userId
+    kind = opened.kind
   }
 
   const profile = await tx.clientProfile.upsert({
@@ -566,13 +626,19 @@ async function resolveIdentity(
     select: { id: true },
   })
 
-  return { userId, clientProfileId: profile.id }
+  return { kind, userId, clientProfileId: profile.id }
+}
+
+/** A `User` opened for a prospect, and whether this call is what opened it. */
+interface OpenedProspectUser {
+  readonly kind: ResolvedIdentity['kind']
+  readonly userId: string
 }
 
 async function createProspectUser(
   tx: Prisma.TransactionClient,
   contact: ProspectContact
-): Promise<string> {
+): Promise<OpenedProspectUser> {
   try {
     const created = await tx.user.create({
       data: {
@@ -585,7 +651,7 @@ async function createProspectUser(
       select: { id: true },
     })
 
-    return created.id
+    return { kind: 'created', userId: created.id }
   } catch (error) {
     // Two submissions for the same unknown address arriving together: the loser
     // reads the winner's row rather than failing the enquiry.
@@ -599,7 +665,11 @@ async function createProspectUser(
       })
 
       if (raced !== null) {
-        return raced.id
+        // `matched`, emphatically. This branch *read* a row another transaction
+        // wrote; the winner may have been the household itself signing up in
+        // the next tab, and the loser has proved no more about that address
+        // than the exploit in finding A did.
+        return { kind: 'matched', userId: raced.id }
       }
     }
 
@@ -940,22 +1010,86 @@ async function logEnquiry(
 }
 
 /**
- * Attach the code the prospect typed, when it is one that is genuinely open.
+ * Attach the code the prospect typed, when it is one that is genuinely open
+ * **and the household it would name is one this very call opened**.
  *
- * Nothing about the outcome reaches the caller: a code that is expired, spent,
- * or the prospect's own simply does not produce a redemption. Telling a
- * stranger which codes are live would turn the enquiry form into a way to
- * harvest them, and `ReferralCode.code` carries money.
+ * ## Why the identity, and not an id (MCV-040 finding A)
  *
- * `redemptionCount` is untouched — a redemption is *pending* until the
- * household qualifies, and the growth ledger owns that transition.
+ * This function inserts a `ReferralRedemption`, and a `ReferralRedemption` is
+ * money: `settleReferralRedemptions` credits the code's owner as soon as the
+ * named household has a paid invoice clearing the programme's floor. Both
+ * callers are `auth: 'PUBLIC'`, and both reach here with whatever
+ * {@link resolveIdentity} made of an *unproved* email address.
+ *
+ * So a `CLIENT` could mint one code, and then — with no session, no password
+ * and no access to the mailbox — post the public consultation form carrying a
+ * paying household's address and their own code. The victim was `matched`, the
+ * redemption was written naming the victim as referee, the victim's own genuine
+ * invoice qualified it, and the next settlement sweep paid the attacker. The
+ * enumeration at the head of this file promised that nothing of a matched
+ * household's is written; it said *columns*, and this wrote a *row*.
+ *
+ * The refusal therefore lives here rather than at the two call sites, and the
+ * parameter is the whole {@link ResolvedIdentity} rather than a `userId`: there
+ * is no way to spell a call to this function that does not carry the provenance
+ * with it, so a third caller added later cannot forget to check.
+ *
+ * A signed-in caller is refused too, and that is deliberate rather than
+ * incidental. Their identity is `matched` — a session proves they own the
+ * account, not that it is new — and the *audited* way for an account that
+ * already exists to accept an invitation is `redeemReferralCode`, which applies
+ * six rules this path has none of: expiry with a reason, the owner-identity
+ * check, `sharesEmailIdentity` against plus-addressed aliases, one live
+ * redemption per account, and an honest error when any of them refuses. A
+ * silent second door into the same table is worth less than that door.
+ *
+ * ## Nothing about the outcome reaches the caller
+ *
+ * A code that is expired, spent, refused or simply not ours produces no
+ * redemption and no message. Telling a stranger which codes are live would turn
+ * the enquiry form into a way to harvest them.
+ *
+ * ## The cap binds (MCV-040 finding B)
+ *
+ * `redemptionCount` is incremented here, by the same compare-and-swap
+ * `redeemReferralCode` uses and inside the same transaction as the insert.
+ * Before that it was only ever *read*: `maxRedemptions` was compared against a
+ * counter this path never moved, so a code capped at five accepted an unbounded
+ * number of redemptions through the public form while its counter sat at zero.
+ * A comparison against a number nobody updates is not a cap.
+ *
+ * The bump is taken **before** the insert, so a lost compare-and-swap costs a
+ * refused referral rather than a counter that disagrees with the rows. It is
+ * conditioned on the exact value that was read, so two enquiries racing for a
+ * code's last place cannot both take it.
+ *
+ * `status` stays `PENDING`: qualification is the growth ledger's transition to
+ * make, and it makes it against a paid invoice.
+ *
+ * ## Two checks that are now belt-and-braces, and are labelled as such
+ *
+ * `ownerId: { not: referredUserId }` and the `existing` lookup were both live
+ * controls when this function could be pointed at any account. Once the
+ * identity must be one this transaction opened, neither can fire: an account
+ * created seconds ago owns no codes and has redeemed nothing. They are kept
+ * because they cost one indexed read and would matter again the moment somebody
+ * widens the guard above — but they are *not* what makes this function safe,
+ * and nobody reading it should think they are. The cap is different: fresh
+ * email addresses are free, so it is still load-bearing, which is why it was
+ * repaired rather than deleted.
  */
 async function attachReferral(
   tx: Prisma.TransactionClient,
-  referredUserId: string,
+  identity: ResolvedIdentity,
   code: string,
   now: Date
 ): Promise<void> {
+  if (identity.kind !== 'created') {
+    return
+  }
+
+  const referredUserId = identity.userId
+
   const referral = await tx.referralCode.findFirst({
     where: {
       code,
@@ -963,7 +1097,12 @@ async function attachReferral(
       ownerId: { not: referredUserId },
       OR: [{ expiresAt: null }, { expiresAt: { gt: now } }],
     },
-    select: { id: true, maxRedemptions: true, redemptionCount: true },
+    select: {
+      id: true,
+      currency: true,
+      maxRedemptions: true,
+      redemptionCount: true,
+    },
   })
 
   if (referral === null) {
@@ -991,8 +1130,26 @@ async function attachReferral(
     return
   }
 
+  // Compare-and-swap on the counter's prior value, exactly as
+  // `redeemReferralCode` does. A concurrent enquiry that took the same place
+  // leaves `count` at zero here, and this enquiry attaches nothing — silently,
+  // because silence is this function's whole contract with the caller.
+  const bumped = await tx.referralCode.updateMany({
+    where: { id: referral.id, redemptionCount: referral.redemptionCount },
+    data: { redemptionCount: { increment: 1 } },
+  })
+
+  if (bumped.count !== 1) {
+    return
+  }
+
   await tx.referralRedemption.create({
-    data: { referralCodeId: referral.id, referredUserId, status: 'PENDING' },
+    data: {
+      referralCodeId: referral.id,
+      referredUserId,
+      status: 'PENDING',
+      currency: referral.currency,
+    },
     select: { id: true },
   })
 }
@@ -1060,8 +1217,9 @@ async function requireHouseholdAccess(
  * not already exist**, an `OnboardingFlow` moved to `CONSULTATION_SCHEDULED`
  * when the ladder permits it, a `ConsultationInterview` for the earliest time
  * offered, an `InteractionLog` recording the enquiry and the consent that came
- * with it, and — silently, when the code is live — a pending
- * `ReferralRedemption`.
+ * with it, and — silently, when the code is live **and this call is what opened
+ * the account** — a pending `ReferralRedemption`. {@link attachReferral} says
+ * why that last condition is not negotiable.
  *
  * See the note at the head of this file for why an anonymous caller receives no
  * row identifiers and why the reply does not vary with whether we already knew
@@ -1126,7 +1284,9 @@ export const requestConsultation = withAction(
       )
 
       if (input.referralCode !== undefined) {
-        await attachReferral(tx, identity.userId, input.referralCode, now)
+        // The identity, not the id: {@link attachReferral} refuses anything it
+        // did not just create, and it is handed the evidence to decide with.
+        await attachReferral(tx, identity, input.referralCode, now)
       }
 
       return consultation
@@ -1147,16 +1307,49 @@ export const requestConsultation = withAction(
  * Identical identity handling to {@link requestConsultation}, plus the one rule
  * that is the reason this action is separate from {@link submitIntake}:
  *
- * **An anonymous submission never overwrites answers that are already on file.**
- * If the address we resolved already has a `ClientIntakeForm` carrying a
- * `submittedAt`, not one column of it is touched. The enquiry is still logged,
- * so the concierge sees that somebody sent the form again and can telephone —
- * which is the right response whether it was the household repeating itself or
- * a stranger typing their address.
+ * **An anonymous submission never writes a `ClientIntakeForm` for a household
+ * that was already ours.**
  *
- * A *signed-in* caller reaching this action is told plainly to amend their
- * questionnaire in the portal, because for them there is no ambiguity about who
- * they are and a silent no-op would look like a bug.
+ * ## The rule used to have a condition on it, and the condition was the bug
+ *
+ * It read: *never overwrites answers that are already on file* — implemented as
+ * "if the resolved household has a form carrying a `submittedAt`, touch
+ * nothing". Every word of that is about a household that has **already
+ * answered**. A household that exists and has *not* answered — one the
+ * concierge opened over the telephone, one {@link convertProspect} promoted —
+ * has no `ClientIntakeForm` at all, fell straight past the condition, and had a
+ * stranger's questionnaire written into it (MCV-040 finding D).
+ *
+ * That is the worse of the two cases, not the lesser one:
+ *
+ *  - `allergies` is a `string[]`, and a submission that names none writes an
+ *    **empty allergen list** for a real household. The kitchen reads it before
+ *    cooking, and an empty list is indistinguishable from a safe one.
+ *  - `writeIntakeForm` stamps `submittedAt`. So from that moment the household
+ *    *does* have a submitted form, the old condition finally engages, and every
+ *    genuine submission the household later makes is swallowed by the duplicate
+ *    branch. The stranger's answers become permanent by making the real ones
+ *    unwriteable.
+ *
+ * So the test is now the caller's provenance rather than the row's state: an
+ * anonymous caller whose identity {@link resolveIdentity} `matched` writes no
+ * questionnaire, whether or not one exists. The enquiry is still logged, so the
+ * concierge sees that somebody sent the form and can telephone — which is the
+ * right response whether it was the household repeating itself or a stranger
+ * typing their address.
+ *
+ * A *signed-in* caller is unaffected by that rule: their session proves the
+ * household is theirs, so their questionnaire is written exactly as before, and
+ * if they already have a submitted one they are told plainly to amend it in the
+ * portal rather than being silently no-op'd.
+ *
+ * ## The anonymous receipt is a constant
+ *
+ * Every anonymous caller gets `{ received: true, …null ids…, submittedAt: now }`
+ * regardless of which of the three branches ran. The ids were already withheld;
+ * `submittedAt` is now withheld too, because returning the household's *real*
+ * submission date to a stranger — or `null` where a new prospect would have seen
+ * a timestamp — is the same oracle the null ids exist to close.
  */
 export const submitProspectIntake = withAction(
   {
@@ -1202,6 +1395,27 @@ export const submitProspectIntake = withAction(
         details,
         scheduledFor
       )
+
+      // Finding D, in one expression. Not `onFile === null`, not
+      // `onFile.submittedAt === null` — the question is who is asking, and
+      // whether this call is what brought the household into being.
+      if (sessionUserId === null && identity.kind === 'matched') {
+        await logEnquiry(
+          tx,
+          identity.clientProfileId,
+          sessionUserId,
+          'Questionnaire sent from the public site for a household we already hold',
+          'A questionnaire arrived from the public form quoting the address of a household already on our books. Nothing on their file was written — the sender has not proved the address is theirs, and a public form may not answer for a household we already know. Please telephone to confirm who sent it.',
+          `withheld-intake:${consultation.id}`,
+          now
+        )
+
+        // Nothing of the matched household's leaves the transaction — not the
+        // profile id, not the form id, not the date they really submitted.
+        // The receipt below is a constant anyway, and a value that is never
+        // read is a value that cannot later be returned by accident.
+        return { kind: 'withheld' as const }
+      }
 
       if (onFile !== null && onFile.submittedAt !== null) {
         await logEnquiry(
@@ -1257,12 +1471,12 @@ export const submitProspectIntake = withAction(
       )
 
       if (input.contact.referralCode !== undefined) {
-        await attachReferral(
-          tx,
-          identity.userId,
-          input.contact.referralCode,
-          now
-        )
+        // The identity, not the id — see {@link attachReferral}. Reaching this
+        // statement does not by itself mean the identity is new: a signed-in
+        // caller writes their own questionnaire here and is `matched`, and the
+        // refusal that keeps their referral on the audited path lives inside
+        // the callee rather than in a condition somebody has to remember.
+        await attachReferral(tx, identity, input.contact.referralCode, now)
       }
 
       return {
@@ -1274,23 +1488,48 @@ export const submitProspectIntake = withAction(
       }
     })
 
-    // Honest to somebody we can identify; silent to somebody we cannot. The
-    // anonymous branch returns one shape for both outcomes.
-    if (outcome.kind === 'duplicate' && sessionUserId !== null) {
+    // One receipt for every anonymous caller, whichever branch ran, and it is
+    // the same one a brand-new prospect gets. `submittedAt` is `now` rather
+    // than the row's own value: a matched household's real submission date is
+    // theirs, and a `null` where a new prospect would see a timestamp would
+    // say "we know this address" just as loudly as an id would.
+    if (sessionUserId === null) {
+      return ok({
+        received: true,
+        intakeFormId: null,
+        clientProfileId: null,
+        consultationInterviewId: null,
+        submittedAt: now,
+      })
+    }
+
+    // Honest to somebody we can identify. `withheld` is unreachable here — it
+    // is returned only when `sessionUserId` is `null`, which the branch above
+    // has already answered — and the exhaustiveness check below is what says so
+    // in a way the compiler will keep checking.
+    if (outcome.kind === 'duplicate') {
       return fail(
         'CONFLICT',
         'We already have your questionnaire. Please sign in to amend it rather than sending a new one.'
       )
     }
 
-    return ok({
-      received: true,
-      intakeFormId: sessionUserId === null ? null : outcome.intakeFormId,
-      clientProfileId: sessionUserId === null ? null : outcome.clientProfileId,
-      consultationInterviewId:
-        sessionUserId === null ? null : outcome.consultationInterviewId,
-      submittedAt: outcome.submittedAt,
-    })
+    if (outcome.kind === 'written') {
+      return ok({
+        received: true,
+        intakeFormId: outcome.intakeFormId,
+        clientProfileId: outcome.clientProfileId,
+        consultationInterviewId: outcome.consultationInterviewId,
+        submittedAt: outcome.submittedAt,
+      })
+    }
+
+    const exhaustive: 'withheld' = outcome.kind
+
+    throw new ActionError(
+      'INTERNAL',
+      `A signed-in questionnaire produced an anonymous outcome (${exhaustive}).`
+    )
   }
 )
 

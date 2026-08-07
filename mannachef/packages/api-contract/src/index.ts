@@ -461,6 +461,12 @@ export type AppointmentMenuItemView = z.infer<typeof appointmentMenuItemSchema>
  * `chefNotes` is present but nullable: the handler nulls it for a `CLIENT` and
  * fills it only for `CHEF_STAFF` and above. The address columns are returned
  * grouped, mirroring `addressSchema` on the way in.
+ *
+ * `quotedGuestCount` and `requiresRequote` describe the *money* rather than the
+ * party: the first is the party size the three cash figures were priced for,
+ * and the second says those figures no longer describe the dinner they are
+ * attached to. `requiresRequote` is derived by the handler from the two counts
+ * rather than stored, so it can never disagree with them (MCV-043).
  */
 export const appointmentSchema = z
   .object({
@@ -493,6 +499,10 @@ export const appointmentSchema = z
     depositCents: moneyCentsSchema,
     gratuityCents: moneyCentsSchema,
     currency: responseCurrencySchema,
+    /** The party size the three figures above were priced for. */
+    quotedGuestCount: z.int().min(1).nullable(),
+    /** `quotedGuestCount` is set and no longer matches `guestCount`. */
+    requiresRequote: z.boolean(),
     clientNotes: z.string().nullable(),
     /** Staff-only. `null` for a `CLIENT` caller. */
     chefNotes: z.string().nullable(),

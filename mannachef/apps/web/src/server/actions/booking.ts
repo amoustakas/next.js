@@ -59,6 +59,7 @@
 import {
   appointmentCreateSchema,
   appointmentFilterSchema,
+  appointmentRepriceSchema,
   appointmentStatusTransitionSchema,
   appointmentUpdateSchema,
   cuidSchema,
@@ -252,6 +253,7 @@ const APPOINTMENT_SELECT = {
   depositCents: true,
   gratuityCents: true,
   currency: true,
+  quotedGuestCount: true,
   clientNotes: true,
   chefNotes: true,
   confirmedAt: true,
@@ -376,6 +378,11 @@ function toAppointmentView(
     depositCents: row.depositCents,
     gratuityCents: row.gratuityCents,
     currency: row.currency,
+    quotedGuestCount: row.quotedGuestCount,
+    // Derived here rather than stored, so it cannot fall out of step with the
+    // two columns it is about. See {@link repriceAppointment}.
+    requiresRequote:
+      row.quotedGuestCount !== null && row.quotedGuestCount !== row.guestCount,
     clientNotes: row.clientNotes,
     chefNotes: canSeeChefNotes ? row.chefNotes : null,
     confirmedAt: row.confirmedAt,
@@ -1064,6 +1071,11 @@ export const requestAppointment = withAction(
           depositCents: staffCaller ? input.depositCents : 0,
           gratuityCents: staffCaller ? input.gratuityCents : 0,
           currency: input.currency,
+          // And the party size those three figures were quoted for, on the
+          // same branch, because it is only meaningful when they are. A guest's
+          // booking is priced by nobody yet, so it records no quote — and
+          // `requiresRequote` stays false until a concierge makes one.
+          quotedGuestCount: staffCaller ? input.guestCount : null,
           clientNotes: input.clientNotes ?? null,
           // Likewise the kitchen's private column: a guest may not write into
           // the field a guest may not read.
@@ -1234,10 +1246,37 @@ async function priceMenuSelections(
 }
 
 // =============================================================================
-// 9. Moving an engagement in time
+// 9. Amending an engagement — in time, and in money
 // =============================================================================
 
-/** Fields on `appointmentUpdateSchema` that a reschedule refuses to apply. */
+/**
+ * Fields on `appointmentUpdateSchema` that a reschedule refuses to apply.
+ *
+ * ## Why `guestCount` is not on this list (MCV-043, finding G)
+ *
+ * It is the one field here that a household legitimately needs to change and
+ * has no other way to change: there is no general appointment update action,
+ * so refusing it would mean a party that grew from four to six had to cancel a
+ * confirmed engagement and book a new one — losing the deposit's link to it,
+ * the menu already chosen, and its place in the diary. That is a worse outcome
+ * than the one the finding describes, and it is worse for the honest majority.
+ *
+ * The finding is nonetheless real, and it is about *money* rather than about
+ * the party size. Every figure on this list is staff-owned, and a reschedule
+ * refuses all of them, so a household that books for four, is quoted for four,
+ * and then reschedules for forty keeps the four-person price. The answer is not
+ * to freeze the party size but to record what the price was quoted *for*:
+ * `quotedGuestCount` is written beside the figures and never by this action, so
+ * the moment the counts diverge the engagement reports `requiresRequote` and
+ * the quote on it is visibly stale rather than silently wrong. The concierge
+ * clears it with {@link repriceAppointment}, which is the separately-audited
+ * re-pricing this docblock has always said was a separate change.
+ *
+ * Nothing is cleared. Zeroing `totalCents` on a guest count change would let a
+ * household erase a four-thousand-dollar quote — and a paid deposit's record of
+ * itself — by nudging the party from six to seven, which is the same defect
+ * wearing the other sign.
+ */
 const RESCHEDULE_FORBIDDEN_FIELDS = [
   'serviceType',
   'menuItems',
@@ -1280,6 +1319,12 @@ const RESCHEDULE_FORBIDDEN_FIELDS = [
  * *refused*, not silently dropped: re-pricing, re-plating and rewriting the
  * kitchen's notes are separate, separately-audited changes, and an action that
  * quietly ignored half of what it was sent would be the worse failure.
+ *
+ * `guestCount`, `accessNotes`, `clientNotes` and `address` are the exceptions,
+ * and they are exceptions because they are the details of *this* engagement at
+ * *this* new time — where to come, how to get in, and how many will be there.
+ * See {@link RESCHEDULE_FORBIDDEN_FIELDS} for why the party size is on that
+ * side of the line despite being the one of the four that costs money.
  */
 export const rescheduleAppointment = withAction(
   {
@@ -1531,6 +1576,10 @@ export const rescheduleAppointment = withAction(
           travelBufferBeforeMinutes: timing.travelBufferBeforeMinutes,
           travelBufferAfterMinutes: timing.travelBufferAfterMinutes,
           bookingSlotId: nextSlotId,
+          // `quotedGuestCount` is deliberately absent from this object. The
+          // party size may move; the record of what the quote was made for may
+          // not, because that record is the only thing that can tell anybody
+          // the quote has gone stale.
           ...(input.guestCount === undefined
             ? {}
             : { guestCount: input.guestCount }),
@@ -1624,6 +1673,150 @@ export const rescheduleAppointment = withAction(
           staffCaller,
           outcome.timeZone,
           ctx.user.locale
+        )
+
+      default: {
+        const exhaustive: never = outcome
+        return exhaustive
+      }
+    }
+  }
+)
+
+/**
+ * Put a price on an engagement, or a new one (MCV-043, finding G).
+ *
+ * ## Why this exists
+ *
+ * {@link rescheduleAppointment} has always said that re-pricing is a separate,
+ * separately-audited change. Until this action it was a separate change with
+ * nowhere to happen: money reached a `ChefAppointment` only at creation, and
+ * only from a staff caller, so a household booking for itself was quoted
+ * outside the system and a quote that went stale could not be replaced inside
+ * it. That is the other half of the finding — a re-quote marker nobody can
+ * clear is a warning light with no switch behind it.
+ *
+ * ## `auth: 'CHEF_STAFF'`
+ *
+ * The same line every other money field in this file draws. `requestAppointment`
+ * writes `totalCents: staffCaller ? input.totalCents : 0` precisely so that a
+ * household cannot quote its own dinner; an action that let one do it in a
+ * second call would make that expression decoration. The guard is the wrapper's
+ * rather than a `staffCaller` branch inside the body, because unlike a booking
+ * there is no legitimate client-shaped version of this request to fall through
+ * to.
+ *
+ * Ownership is still checked on top of the role: `requireAppointmentOwnership`
+ * bounds a `CHEF_STAFF` caller to the engagements assigned to them and lets
+ * `ADMIN` through, so one chef cannot re-price another's dinner.
+ *
+ * ## The compare-and-swap
+ *
+ * `input.guestCount` is the party size the caller priced *for*, and the update
+ * is guarded on it — the same shape as `from` on the status transitions, and
+ * for the same reason. A household that rescheduled from four guests to forty
+ * while the concierge was typing does not get the four-person figure stamped as
+ * the price of the forty-person dinner; the write matches no rows and the
+ * concierge is told to look again. Without this guard the action would be a
+ * *second* way to attach a price to the wrong party size, which is the defect
+ * it was written to close.
+ *
+ * A terminal engagement is refused. A completed dinner's price is history, and
+ * a cancelled one has no price to set.
+ */
+export const repriceAppointment = withAction(
+  {
+    name: 'appointment.reprice',
+    auth: 'CHEF_STAFF',
+    input: appointmentRepriceSchema,
+    revalidatePaths: APPOINTMENT_PATHS,
+    revalidateTags: APPOINTMENT_TAGS,
+  },
+  async (ctx, input): Promise<ActionResult<AppointmentView>> => {
+    const owned = await requireAppointmentOwnership(
+      ctx.user,
+      input.appointmentId
+    )
+
+    if (!owned.ok) {
+      return owned
+    }
+
+    if (isTerminalAppointmentStatus(owned.data.status)) {
+      return fail(
+        'CONFLICT',
+        `A ${owned.data.status.toLowerCase().replace(/_/g, ' ')} engagement cannot be re-priced.`
+      )
+    }
+
+    const outcome = await runSerializable(ctx.db, RACE_MESSAGE, async (tx) => {
+      const current = await tx.chefAppointment.findUnique({
+        where: { id: owned.data.id },
+        select: { id: true, status: true, guestCount: true },
+      })
+
+      if (current === null) {
+        return { kind: 'gone' } as const
+      }
+
+      // Re-read rather than trust the ownership guard's snapshot, exactly as
+      // the reschedule path does: the engagement may have been cancelled
+      // between that read and this transaction.
+      if (isTerminalAppointmentStatus(current.status)) {
+        return { kind: 'terminal', status: current.status } as const
+      }
+
+      const priced = await tx.chefAppointment.updateMany({
+        where: { id: current.id, guestCount: input.guestCount },
+        data: {
+          totalCents: input.totalCents,
+          depositCents: input.depositCents,
+          gratuityCents: input.gratuityCents,
+          currency: input.currency,
+          // The whole point of the action: the figures and the party size they
+          // were priced for are written together, in one statement, so they
+          // cannot be written apart.
+          quotedGuestCount: input.guestCount,
+        },
+      })
+
+      if (priced.count !== 1) {
+        return { kind: 'countMoved', stored: current.guestCount } as const
+      }
+
+      const refreshed = await tx.chefAppointment.findUniqueOrThrow({
+        where: { id: current.id },
+        select: APPOINTMENT_SELECT,
+      })
+
+      return { kind: 'priced', appointment: refreshed } as const
+    })
+
+    switch (outcome.kind) {
+      case 'priced':
+        // `true` rather than `isStaff(ctx.user)`: the wrapper's `CHEF_STAFF`
+        // gate has already established it, and re-deriving it here would
+        // suggest there is a caller for whom it might be false.
+        return ok(toAppointmentView(outcome.appointment, true))
+
+      case 'gone':
+        return fail('NOT_FOUND', 'We could not find that engagement.')
+
+      case 'terminal':
+        return fail(
+          'CONFLICT',
+          `A ${outcome.status.toLowerCase().replace(/_/g, ' ')} engagement cannot be re-priced.`
+        )
+
+      case 'countMoved':
+        return fail(
+          'CONFLICT',
+          'The party size changed while you were pricing this engagement. Please reload and quote again.',
+          {
+            guestCount: [
+              `It is now ${String(outcome.stored)} ${outcome.stored === 1 ? 'guest' : 'guests'}.`,
+            ],
+          }
         )
 
       default: {

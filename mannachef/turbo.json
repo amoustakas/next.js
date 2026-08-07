@@ -28,6 +28,16 @@
       "dependsOn": ["^build"],
       "outputs": []
     },
+    "@mannachef/web#verify": {
+      // The web harnesses drive the real Server Actions against the generated
+      // Prisma client, and `@mannachef/db`'s `verify:conflict-targets` runs
+      // `prisma generate` as it goes — so the two must not overlap. Ordering
+      // them is also the right failure order: if `prisma/migrations` does not
+      // reproduce `schema.prisma` (MCV-042), every downstream failure is a
+      // consequence of that and should be read after it, not before.
+      "dependsOn": ["^build", "@mannachef/db#verify"],
+      "outputs": []
+    },
     "db:generate": {
       "cache": false
     },

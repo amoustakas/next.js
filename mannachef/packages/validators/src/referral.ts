@@ -667,11 +667,36 @@ const referralProgramCommonShape = {
    * permissive branch is a default that is doing the deciding. Without a floor,
    * a one-dollar invoice earns a full referral reward, which is the second half
    * of the abuse MCV-030 closed. Whoever sets the offer says what the floor is.
+   *
+   * Since MCV-043 this figure is also the one the offer has to pay for itself
+   * out of — see {@link programEconomicsBalance} — so `0` with any reward at all
+   * is refused unless `allowLossLeader` is set. `0` still does not mean "every
+   * invoice": `findQualifyingInvoice` refuses one that was paid for nothing
+   * whatever the floor says.
    */
   minimumQualifyingInvoiceCents: moneyCentsSchema.max(MAX_REWARD_CENTS, {
     error:
       'A qualifying invoice tops out at $10,000. Please arrange larger thresholds by hand.',
   }),
+  /**
+   * The owner's acknowledgement that this offer deliberately pays out more than
+   * the invoice that earns it (MCV-043).
+   *
+   * Defaulted to `false` rather than required, and it is the one figure on this
+   * shape that is: a default is only doing the deciding when it picks the
+   * permissive branch, and this one picks the strict branch. An operator who
+   * omits it gets an offer that must pay for itself, and the only way to reach
+   * the permissive branch is to type the word.
+   *
+   * See {@link programEconomicsBalance} for what "pays for itself" means
+   * arithmetically, and the `ReferralProgram` model in `schema.prisma` for why
+   * the aggregate cost of the programme rests entirely on it.
+   */
+  allowLossLeader: z
+    .boolean({
+      error: 'Please say whether this offer is allowed to run at a loss.',
+    })
+    .default(false),
   /**
    * Whether the offer is being made at all.
    *
@@ -685,6 +710,170 @@ const referralProgramCommonShape = {
     error: 'Please say whether this offer is being made.',
   }),
 } as const
+
+/**
+ * What one referred household is worth to the business, in whole cents, at the
+ * cheapest invoice that can qualify (MCV-043).
+ *
+ * Positive is profit, zero is break-even, negative is a loss leader.
+ *
+ * ## Why the floor is the only invoice worth checking
+ *
+ * The reward an inviter earns is either flat (`FIXED_CREDIT`, `FREE_MEAL`,
+ * `FREE_DELIVERY`) or a share of the invoice bounded at 100%
+ * (`PERCENT_DISCOUNT`), so `invoice − ownerReward(invoice)` never decreases as
+ * the invoice grows. An offer that breaks even at the floor therefore breaks
+ * even at every invoice above it, and one that loses money at the floor loses
+ * money at its most favourable case. Checking one point checks all of them.
+ *
+ * The arithmetic mirrors `ownerRewardCents` in
+ * `apps/web/src/server/actions/referral.ts`, which is the function that actually
+ * pays out; its `MAX_REWARD_CENTS` clamp is not restated because it cannot bind
+ * here — the floor is capped at `MAX_REWARD_CENTS` and the percentage at 100, so
+ * their product never exceeds the clamp.
+ */
+export function programEconomicsBalance(offer: {
+  readonly rewardType: RewardType
+  readonly rewardValueCents?: number | undefined
+  readonly rewardValuePercent?: number | undefined
+  readonly refereeRewardCents?: number | null | undefined
+  readonly minimumQualifyingInvoiceCents: number
+}): number {
+  const floor = offer.minimumQualifyingInvoiceCents
+
+  const ownerRewardAtFloor =
+    referralRewardValueKind(offer.rewardType) === 'PERCENT'
+      ? Math.round((floor * (offer.rewardValuePercent ?? 0)) / 100)
+      : (offer.rewardValueCents ?? 0)
+
+  return floor - ownerRewardAtFloor - (offer.refereeRewardCents ?? 0)
+}
+
+const LOSS_LEADER_ERROR =
+  'This offer pays out more than the invoice that earns it, so every referral would cost the house money. Please raise the qualifying invoice, lower the rewards, or tick "allowed to run at a loss" to say the loss is intended.'
+
+/**
+ * The referee's half of the offer, as a number the economics check can use.
+ *
+ * `null` means "stand down": the field is present but is not a usable number,
+ * so it has already recorded its own issue and a second, vaguer one about the
+ * economics would only bury it. Absent and `null` both mean the offer rewards
+ * only the inviter, which is zero.
+ *
+ * It is read from the *raw* object rather than declared as a dependency because
+ * `crossFieldMixed` skips its check entirely when a declared dependency is
+ * missing — and this one is missing in the ordinary case, which would switch the
+ * rule off for exactly the offers that need it least conspicuously.
+ */
+function refereeRewardForEconomics(raw: {
+  readonly refereeRewardCents?: unknown
+}): number | null {
+  const value = raw.refereeRewardCents
+
+  if (value === undefined || value === null) {
+    return 0
+  }
+
+  return typeof value === 'number' && Number.isFinite(value) ? value : null
+}
+
+/**
+ * The economics rule for the three reward kinds measured in cash.
+ *
+ * Declared once and attached to each of the three branches, rather than to the
+ * union: a `z.discriminatedUnion` dispatches on the discriminant before any
+ * member's checks run, so a check on the union would have to re-derive which
+ * value column is live. On the branch it belongs to, the column is simply a
+ * required field.
+ *
+ * `rewardType` is a declared dependency even though the branch already pins it
+ * to a literal, so that the value handed to {@link programEconomicsBalance} is
+ * the offer's own discriminant rather than one of the three restated here — the
+ * three do agree, and a rule that relies on their agreeing is a rule that breaks
+ * silently when a fourth cash-measured kind is added.
+ */
+const CASH_ECONOMICS_CONFIG = {
+  deps: {
+    rewardType: 'string',
+    rewardValueCents: 'number',
+    minimumQualifyingInvoiceCents: 'number',
+    allowLossLeader: 'boolean',
+  },
+  error: LOSS_LEADER_ERROR,
+  path: ['minimumQualifyingInvoiceCents'],
+} as const
+
+/** The predicate half of {@link CASH_ECONOMICS_CONFIG}. */
+function cashOfferPaysForItself(
+  values: {
+    rewardType: RewardType
+    rewardValueCents: number
+    minimumQualifyingInvoiceCents: number
+    allowLossLeader: boolean
+  },
+  raw: { readonly refereeRewardCents?: unknown }
+): boolean {
+  if (values.allowLossLeader) {
+    return true
+  }
+
+  const referee = refereeRewardForEconomics(raw)
+
+  if (referee === null) {
+    return true
+  }
+
+  return (
+    programEconomicsBalance({
+      rewardType: values.rewardType,
+      rewardValueCents: values.rewardValueCents,
+      refereeRewardCents: referee,
+      minimumQualifyingInvoiceCents: values.minimumQualifyingInvoiceCents,
+    }) >= 0
+  )
+}
+
+/** The same rule for the one reward kind measured as a share of the invoice. */
+const PERCENT_ECONOMICS_CONFIG = {
+  deps: {
+    rewardType: 'string',
+    rewardValuePercent: 'number',
+    minimumQualifyingInvoiceCents: 'number',
+    allowLossLeader: 'boolean',
+  },
+  error: LOSS_LEADER_ERROR,
+  path: ['minimumQualifyingInvoiceCents'],
+} as const
+
+/** The predicate half of {@link PERCENT_ECONOMICS_CONFIG}. */
+function percentOfferPaysForItself(
+  values: {
+    rewardType: RewardType
+    rewardValuePercent: number
+    minimumQualifyingInvoiceCents: number
+    allowLossLeader: boolean
+  },
+  raw: { readonly refereeRewardCents?: unknown }
+): boolean {
+  if (values.allowLossLeader) {
+    return true
+  }
+
+  const referee = refereeRewardForEconomics(raw)
+
+  if (referee === null) {
+    return true
+  }
+
+  return (
+    programEconomicsBalance({
+      rewardType: values.rewardType,
+      rewardValuePercent: values.rewardValuePercent,
+      refereeRewardCents: referee,
+      minimumQualifyingInvoiceCents: values.minimumQualifyingInvoiceCents,
+    }) >= 0
+  )
+}
 
 /**
  * Setting the standing offer.
@@ -705,6 +894,21 @@ const referralProgramCommonShape = {
  * to police. Writing the whole offer at once means the coherence rule is the
  * union's, enforced at the boundary, and the action can write the row without
  * merging anything against what is already there.
+ *
+ * ## The economics rule (MCV-043)
+ *
+ * Every branch also carries {@link programEconomicsBalance}: the rewards this
+ * offer pays out for one referred household may not exceed the smallest invoice
+ * that can earn them, unless `allowLossLeader` says the loss is the point. That
+ * rule is only checkable on a whole offer, which is the second argument for
+ * stating the programme all at once — a patch that lowered the floor without
+ * mentioning the reward would have nothing to compare it against.
+ *
+ * The same invariant is a `CHECK` constraint
+ * (`ReferralProgram_reward_economics_check`, added in the
+ * `0003_mcv043_referral_economics_and_requote` migration), for the reason the
+ * reward pairing is: this is the one row a caller who is not an administrator
+ * can cause money to be paid out against.
  */
 export const referralProgramUpsertSchema = z.discriminatedUnion(
   'rewardType',
@@ -716,7 +920,12 @@ export const referralProgramUpsertSchema = z.discriminatedUnion(
         rewardValueCents: rewardCentsSchema,
         ...referralProgramCommonShape,
       })
-      .strict(),
+      .strict()
+      .check(
+        crossFieldMixed(CASH_ECONOMICS_CONFIG, (values, raw) =>
+          cashOfferPaysForItself(values, raw)
+        )
+      ),
     z
       .object({
         rewardType: z.literal('PERCENT_DISCOUNT'),
@@ -724,7 +933,12 @@ export const referralProgramUpsertSchema = z.discriminatedUnion(
         rewardValuePercent: rewardPercentSchema,
         ...referralProgramCommonShape,
       })
-      .strict(),
+      .strict()
+      .check(
+        crossFieldMixed(PERCENT_ECONOMICS_CONFIG, (values, raw) =>
+          percentOfferPaysForItself(values, raw)
+        )
+      ),
     z
       .object({
         rewardType: z.literal('FREE_MEAL'),
@@ -732,7 +946,12 @@ export const referralProgramUpsertSchema = z.discriminatedUnion(
         rewardValueCents: rewardCentsSchema,
         ...referralProgramCommonShape,
       })
-      .strict(),
+      .strict()
+      .check(
+        crossFieldMixed(CASH_ECONOMICS_CONFIG, (values, raw) =>
+          cashOfferPaysForItself(values, raw)
+        )
+      ),
     z
       .object({
         rewardType: z.literal('FREE_DELIVERY'),
@@ -740,7 +959,12 @@ export const referralProgramUpsertSchema = z.discriminatedUnion(
         rewardValueCents: rewardCentsSchema,
         ...referralProgramCommonShape,
       })
-      .strict(),
+      .strict()
+      .check(
+        crossFieldMixed(CASH_ECONOMICS_CONFIG, (values, raw) =>
+          cashOfferPaysForItself(values, raw)
+        )
+      ),
   ],
   { error: 'Please choose the reward this programme should grant.' }
 )

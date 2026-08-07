@@ -66,6 +66,7 @@ export const REFERRAL_PROGRAM_SELECT = {
   defaultMaxRedemptions: true,
   defaultExpiryDays: true,
   minimumQualifyingInvoiceCents: true,
+  allowLossLeader: true,
   isActive: true,
   updatedById: true,
   updatedAt: true,
@@ -86,6 +87,14 @@ export interface ReferralProgramView {
   readonly defaultMaxRedemptions: number | null
   readonly defaultExpiryDays: number | null
   readonly minimumQualifyingInvoiceCents: number
+  /**
+   * Somebody has said, on this row, that the offer is allowed to pay out more
+   * than the invoice that earns it (MCV-043). It is surfaced to the admin OS
+   * rather than kept internal precisely because it is an acknowledgement: a
+   * screen that showed the figures without showing that this was ticked would
+   * be hiding the one field that explains them.
+   */
+  readonly allowLossLeader: boolean
   readonly isActive: boolean
   readonly updatedById: string | null
   readonly updatedAt: Date
@@ -113,6 +122,7 @@ export function toReferralProgramView(
     defaultMaxRedemptions: row.defaultMaxRedemptions,
     defaultExpiryDays: row.defaultExpiryDays,
     minimumQualifyingInvoiceCents: row.minimumQualifyingInvoiceCents,
+    allowLossLeader: row.allowLossLeader,
     isActive: row.isActive,
     updatedById: row.updatedById,
     updatedAt: row.updatedAt,
@@ -261,11 +271,14 @@ export async function resolveProgramCodeTerms(
  * referral counts as earned, in whole cents.
  *
  * `0` when no programme row exists at all, which is the same answer the column
- * defaults to and the same behaviour the platform had before MCV-030 — every
- * paid invoice qualifies. Read from the row **whether or not the offer is
- * active**, for the reason given on {@link readReferralProgramRow}: switching
- * the offer off withdraws it from new codes, it does not change what "paid"
- * means for the ones already out there.
+ * defaults to: every paid invoice qualifies. Note that `0` has not meant "every
+ * invoice" since MCV-043 — `findQualifyingInvoice` requires the invoice to have
+ * been paid for a non-zero amount whatever the floor is, so a Stripe trial-start
+ * or a fully discounted invoice is refused by a programme with no floor at all.
+ * Read from the row **whether or not the offer is active**, for the reason given
+ * on {@link readReferralProgramRow}: switching the offer off withdraws it from
+ * new codes, it does not change what "paid" means for the ones already out
+ * there.
  *
  * Every caller of `findQualifyingInvoice` passes this. It is not defaulted at
  * the call site, because `0` is the permissive reading and a default that

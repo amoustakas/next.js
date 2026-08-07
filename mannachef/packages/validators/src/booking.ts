@@ -1044,6 +1044,21 @@ export type AppointmentMenuItemSelectionInput = z.input<
   typeof appointmentMenuItemSelectionSchema
 >
 
+/**
+ * How many will be dining.
+ *
+ * Declared once because two schemas need it with different defaulting:
+ * {@link appointmentMutableShape} takes it with `.default(2)`, and
+ * {@link appointmentRepriceSchema} takes it *required*, as the party size the
+ * person quoting says they quoted for.
+ */
+const guestCountSchema = z
+  .int({ error: 'Please tell us how many will be dining.' })
+  .min(MIN_GUEST_COUNT, { error: 'We cook for at least one guest.' })
+  .max(MAX_GUEST_COUNT, {
+    error: `For more than ${MAX_GUEST_COUNT} guests, speak with us about catering.`,
+  })
+
 const appointmentMutableShape = {
   serviceType: serviceTypeSchema.default('IN_HOME_DINNER'),
   /** The window this engagement was booked into, when it came from the diary. */
@@ -1053,13 +1068,7 @@ const appointmentMutableShape = {
   prepStartsAt: isoDateTimeSchema.optional(),
   travelBufferBeforeMinutes: travelBufferSchema.default(0),
   travelBufferAfterMinutes: travelBufferSchema.default(0),
-  guestCount: z
-    .int({ error: 'Please tell us how many will be dining.' })
-    .min(MIN_GUEST_COUNT, { error: 'We cook for at least one guest.' })
-    .max(MAX_GUEST_COUNT, {
-      error: `For more than ${MAX_GUEST_COUNT} guests, speak with us about catering.`,
-    })
-    .default(2),
+  guestCount: guestCountSchema.default(2),
   /** Flattened onto `addressLine1 … country` on `ChefAppointment` by the action. */
   address: addressSchema.optional(),
   accessNotes: z
@@ -1333,6 +1342,67 @@ export const appointmentUpdateSchema = buildUpdateSchema(
 )
 export type AppointmentUpdateInput = z.infer<typeof appointmentUpdateSchema>
 export type AppointmentUpdateRawInput = z.input<typeof appointmentUpdateSchema>
+
+/**
+ * Re-quoting an engagement (MCV-043, finding G).
+ *
+ * ## Why this is its own schema rather than a corner of the update
+ *
+ * Money on an engagement is staff-owned — `booking.ts` writes
+ * `totalCents: staffCaller ? input.totalCents : 0` — and moving an engagement
+ * in time refuses every money field outright, on the stated grounds that
+ * "re-pricing, re-plating and rewriting the kitchen's notes are separate,
+ * separately-audited changes". This is that separate change, and giving it its
+ * own schema is what lets it be separately audited: an action taking
+ * `appointmentUpdateSchema` would accept a payload that re-priced the dinner
+ * *and* moved it, and the audit trail could no longer say which of the two the
+ * caller meant.
+ *
+ * ## Why every figure is required
+ *
+ * Same reasoning as `referralProgramUpsertSchema`: this is a statement of the
+ * whole quote rather than a patch to part of one. A partial re-quote that
+ * carried `totalCents` and left `depositCents` behind would leave the row
+ * holding half of one price and half of another, and the deposit-fits-within-
+ * total rule could not be checked without merging against storage first.
+ *
+ * ## `guestCount` is the compare-and-swap, not a change
+ *
+ * It is the party size the person quoting says they quoted *for*, exactly as
+ * `from` on {@link appointmentStatusTransitionSchema} is the status the caller
+ * says they saw. The action compares it against the stored row and refuses on a
+ * mismatch; it never writes it to `guestCount`. Without it, a household
+ * rescheduling from four guests to forty *while* the concierge is typing the
+ * four-person figure would have the concierge's quote stamped as the price of
+ * the forty-person dinner — which is the very substitution this task exists to
+ * make impossible.
+ */
+export const appointmentRepriceSchema = z
+  .object({
+    appointmentId: cuidSchema,
+    /** The party size this quote was made for. Checked, never written. */
+    guestCount: guestCountSchema,
+    totalCents: moneyCentsSchema,
+    depositCents: moneyCentsSchema,
+    gratuityCents: moneyCentsSchema,
+    currency: currencySchema,
+  })
+  .strict()
+  .check(
+    crossField(
+      {
+        deps: ['totalCents', 'depositCents'],
+        as: 'number',
+        error: DEPOSIT_ERROR,
+        path: ['depositCents'],
+      },
+      (values) => depositFitsWithinTotal(values)
+    )
+  )
+export type AppointmentRepriceInput = z.infer<typeof appointmentRepriceSchema>
+export type AppointmentRepriceRawInput = z.input<
+  typeof appointmentRepriceSchema
+>
 
 // =============================================================================
 // 5. The appointment state machine

@@ -30,6 +30,11 @@
  * | `getInvoice`                | `SESSION`   | `requireInvoiceOwnership`               |
  * | `getBillingDashboard`       | `ADMIN`     | n/a — house aggregate                   |
  *
+ * Ownership is not the whole of it on `changeSubscription`. Owning the row says
+ * *which* subscription may be moved; the *terms* of the move — `effectiveAt`,
+ * `prorationBehavior`, `quantity` — are the house's below `ADMIN`, and the
+ * payload's are discarded. See {@link resolveSubscriptionChangeTerms}.
+ *
  * `CHEF_STAFF` is deliberately **not** privileged anywhere in this module. A
  * chef needs a household's allergies, not its bank statements; the ownership
  * guards for `invoice` and `subscription` default their bypass to `ADMIN` for
@@ -97,9 +102,11 @@ import {
   userSubscriptionFilterSchema,
   withTemporalCoercion,
   type BillingInterval,
+  type ChangeEffectiveAt,
   type InvoiceLineKind,
   type InvoiceSortBy,
   type InvoiceStatus,
+  type ProrationBehavior,
   type SortDirection,
   type SubscriptionPlanSortBy,
   type SubscriptionStatus,
@@ -113,6 +120,10 @@ import {
   type ActionResult,
 } from '@/server/actions/types'
 import { Prisma, prisma } from '@/server/db'
+import {
+  resolveRedemptionEligibility,
+  REDEMPTION_REFUSALS,
+} from '@/server/referral-eligibility'
 import {
   requireAppointmentOwnership,
   requireInvoiceOwnership,
@@ -180,6 +191,21 @@ const TERMINAL_SUBSCRIPTION_STATUSES: readonly SubscriptionStatus[] = [
   'CANCELED',
   'INCOMPLETE_EXPIRED',
 ]
+
+/**
+ * How often one identity may move a subscription's plan.
+ *
+ * MCV-041's exploit was not a single call but a loop — upgrade, hold the dear
+ * plan unbilled, downgrade before renewal, repeat — and the action carried no
+ * limit at all. The proration policy is what makes the loop unprofitable; this
+ * is what makes it slow, and it is the same defence in depth `createCheckoutSession`
+ * applies to the other Stripe write a signed-in caller can reach.
+ */
+const SUBSCRIPTION_CHANGE_RATE_LIMIT = {
+  tokens: 12,
+  windowMs: 60 * 60 * 1_000,
+  scope: 'identity',
+} as const
 
 /** Money that has moved, for the "collected in window" figure. */
 const SETTLED_PAYMENT_STATUSES = [
@@ -1707,9 +1733,30 @@ interface ResolvedReferralCode {
  * Check an invitation code on the caller's behalf.
  *
  * Returns `null` when no code was offered, the resolved code when it is
- * genuinely redeemable, or a `{ failure }` envelope to hand straight back. The
- * four ways a code fails are all the caller's to fix, so each one gets its own
- * sentence on the `referralCode` field.
+ * genuinely redeemable, or a `{ failure }` envelope to hand straight back. Each
+ * way a code fails is the caller's to fix, so each one gets its own sentence on
+ * the `referralCode` field.
+ *
+ * ## The rules are not this module's (MCV-041, finding F)
+ *
+ * They are {@link resolveRedemptionEligibility}'s, shared with the portal's
+ * redemption form and with the Stripe webhook that does the actual write. This
+ * function used to restate a *subset* of them inline — it checked the owner's
+ * identity, the expiry, the cap and the same-code rule, and omitted
+ * `sharesEmailIdentity` and the one-live-redemption rule entirely. So the
+ * cheapest self-referral there is, a plus-addressed second account, was refused
+ * by the portal and waved through by Checkout, and the webhook downstream
+ * checked fewer rules still. Two definitions of "valid redemption" is the
+ * defect; there is now one.
+ *
+ * The household heuristic applies here whatever the caller's role, because
+ * `createCheckoutSession` is the caller paying for **their own** subscription —
+ * there is no "acting for somebody else" case for an `ADMIN` to need the escape
+ * hatch on. An administrator arranging a redemption by hand goes through
+ * `redeemReferralCode`, which has one.
+ *
+ * Nothing is written here. Eligibility can lapse between opening a session and
+ * paying for it, so the webhook re-runs the same predicate before it writes.
  */
 async function resolveReferralCode(
   db: typeof prisma,
@@ -1720,57 +1767,27 @@ async function resolveReferralCode(
     return null
   }
 
-  const row = await db.referralCode.findUnique({
-    where: { code },
-    select: {
-      id: true,
-      code: true,
-      ownerId: true,
-      isActive: true,
-      expiresAt: true,
-      maxRedemptions: true,
-      redemptionCount: true,
-    },
-  })
+  const eligibility = await resolveRedemptionEligibility(
+    db,
+    { kind: 'code', code },
+    userId,
+    { applyHouseholdHeuristic: true }
+  )
 
-  const invalid = (message: string): { failure: ActionFailure } => ({
-    failure: fail('VALIDATION', message, { referralCode: [message] }),
-  })
+  if (eligibility.kind === 'refused') {
+    const terms = REDEMPTION_REFUSALS[eligibility.reason]
 
-  if (row === null || !row.isActive) {
-    return invalid('That invitation code is not one we recognise.')
+    return {
+      failure:
+        terms.code === 'NOT_FOUND'
+          ? fail('NOT_FOUND', terms.message)
+          : fail('VALIDATION', terms.message, {
+              referralCode: [terms.message],
+            }),
+    }
   }
 
-  if (row.expiresAt !== null && row.expiresAt.getTime() <= Date.now()) {
-    return invalid('That invitation code has expired.')
-  }
-
-  if (
-    row.maxRedemptions !== null &&
-    row.redemptionCount >= row.maxRedemptions
-  ) {
-    return invalid('That invitation code has already been fully redeemed.')
-  }
-
-  if (row.ownerId === userId) {
-    return invalid('An invitation code cannot be redeemed by its own owner.')
-  }
-
-  const alreadyRedeemed = await db.referralRedemption.findUnique({
-    where: {
-      referralCodeId_referredUserId: {
-        referralCodeId: row.id,
-        referredUserId: userId,
-      },
-    },
-    select: { id: true },
-  })
-
-  if (alreadyRedeemed !== null) {
-    return invalid('You have already used that invitation code.')
-  }
-
-  return { id: row.id, code: row.code }
+  return { id: eligibility.code.id, code: eligibility.code.code }
 }
 
 // =============================================================================
@@ -1855,6 +1872,111 @@ export const listSubscriptions = withAction(
 // 9. Subscriptions — the lifecycle
 // =============================================================================
 
+/** The two commercial terms of a plan move, after policy has had its say. */
+interface SubscriptionChangeTerms {
+  readonly effectiveAt: ChangeEffectiveAt
+  readonly prorationBehavior: ProrationBehavior
+  /**
+   * `true` when the caller's `effectiveAt` or `prorationBehavior` was
+   * discarded. Logged rather than returned: the substitution is policy, not an
+   * error, and telling a browser which of its fields were ignored is a map of
+   * where to push next.
+   */
+  readonly overridden: boolean
+}
+
+/**
+ * What Stripe is actually told about a plan move, as opposed to what the
+ * browser asked for (MCV-041).
+ *
+ * `subscriptionChangeSchema` accepts `effectiveAt` and `prorationBehavior` from
+ * the caller, and both were forwarded to Stripe untouched. Neither is a
+ * preference: together they decide **whether the difference in price is
+ * billed**, and the item's `price` is swapped immediately either way — there is
+ * no branch anywhere in this action that defers the swap. `PERIOD_END`
+ * therefore never delayed anything; it only suppressed the invoice, and
+ * `prorationBehavior: 'none'` did the same thing by the shorter route.
+ *
+ * So a `CLIENT` on a $50 plan could post
+ * `{ action: 'UPGRADE', planId: <$500 plan>, prorationBehavior: 'none' }`,
+ * receive the dear plan at once, be charged nothing for the remainder of the
+ * period, and then move back down before renewal — which swaps the price again,
+ * so even the renewal is raised at the cheap rate. Repeated, that is a premium
+ * plan held indefinitely at the entry price.
+ *
+ * The direction checks in {@link changeSubscription} already refuse the
+ * mirror-image of this through `DOWNGRADE`; this function closes the same
+ * outcome through `UPGRADE`, and takes both fields away from everybody below
+ * `ADMIN` on both arms.
+ *
+ * ## An upgrade always prorates, for everybody
+ *
+ * Not `privileged ? … : …`. A price rise that bills nothing is a gift of the
+ * unbilled remainder, and it is one Stripe records nowhere — no invoice line,
+ * no credit note, nothing naming who decided. An `ADMIN` who means to make that
+ * gift has instruments that do leave a record ({@link createManualInvoice}, and
+ * the reward ledger in `actions/referral.ts`), so nothing is lost but the
+ * silence. `effectiveAt` is forced to `IMMEDIATELY` alongside it because the
+ * upgrade *is* immediate — saying `PERIOD_END` over the top of an immediate
+ * price swap was only ever a way of spelling "and do not bill me".
+ *
+ * ## A downgrade below `ADMIN` takes the house's terms
+ *
+ * `PERIOD_END` and `none`: the subscriber keeps everything the period they have
+ * already paid for entitles them to, and the lighter price applies from the
+ * next invoice. Those are the schema's own defaults for the arm — the
+ * difference is that they are now the house's decision rather than a value the
+ * browser happened not to override. An `ADMIN` still states both per change,
+ * which is what makes a hand-arranged settlement possible at all.
+ */
+function resolveSubscriptionChangeTerms(
+  action: 'UPGRADE' | 'DOWNGRADE',
+  requested: {
+    readonly effectiveAt: ChangeEffectiveAt
+    readonly prorationBehavior: ProrationBehavior
+  },
+  privileged: boolean
+): SubscriptionChangeTerms {
+  if (action === 'UPGRADE') {
+    return {
+      effectiveAt: 'IMMEDIATELY',
+      prorationBehavior: 'create_prorations',
+      overridden:
+        requested.effectiveAt !== 'IMMEDIATELY' ||
+        requested.prorationBehavior !== 'create_prorations',
+    }
+  }
+
+  if (privileged) {
+    return {
+      effectiveAt: requested.effectiveAt,
+      prorationBehavior: requested.prorationBehavior,
+      overridden: false,
+    }
+  }
+
+  return {
+    effectiveAt: 'PERIOD_END',
+    prorationBehavior: 'none',
+    overridden:
+      requested.effectiveAt !== 'PERIOD_END' ||
+      requested.prorationBehavior !== 'none',
+  }
+}
+
+/**
+ * What Stripe's `proration_behavior` is set to for a resolved set of terms.
+ *
+ * The `PERIOD_END → 'none'` mapping is the one described on
+ * {@link changeSubscription}, kept here so that the single expression Stripe is
+ * handed cannot drift from the terms policy just decided.
+ */
+function prorationBehaviorFor(
+  terms: SubscriptionChangeTerms
+): Stripe.SubscriptionUpdateParams.ProrationBehavior {
+  return terms.effectiveAt === 'PERIOD_END' ? 'none' : terms.prorationBehavior
+}
+
 /**
  * Upgrade, downgrade, pause, resume, or cancel a subscription.
  *
@@ -1875,6 +1997,18 @@ export const listSubscriptions = withAction(
  * A `CLIENT` may only ever act on their own. An `ADMIN` may act for anybody,
  * through the guard's documented bypass.
  *
+ * ## Ownership is not the whole of the authorisation (MCV-041)
+ *
+ * It was, and that was the bug. Owning a subscription says which row may be
+ * changed; it says nothing about *on what terms*. Three fields on the two plan
+ * arms decide the terms and all three arrived from the browser —
+ * `effectiveAt`, `prorationBehavior` and `quantity`. Below `ADMIN` none of them
+ * is now read: the first two come from
+ * {@link resolveSubscriptionChangeTerms} and the third stays at whatever the
+ * subscription already carries. This is the shape `actions/referral.ts` and
+ * `actions/booking.ts` use for every other server-owned figure — the payload is
+ * accepted, and then the value that costs money is taken from the house.
+ *
  * ## How `PERIOD_END` is expressed to Stripe
  *
  * Stripe has no "change the price later" flag short of a subscription schedule.
@@ -1883,8 +2017,20 @@ export const listSubscriptions = withAction(
  * so the subscriber keeps everything they have already paid for and the new
  * rate applies from the next invoice. That is precisely the guarantee
  * `changeEffectiveAtSchema` documents for `PERIOD_END`, so the two are mapped
- * onto each other and the caller's `prorationBehavior` is overridden. On
- * `IMMEDIATELY` the caller's choice stands.
+ * onto each other by {@link prorationBehaviorFor} and the `prorationBehavior`
+ * of the resolved terms is overridden. On `IMMEDIATELY` the resolved terms
+ * stand.
+ *
+ * Note what that mapping does **not** do: it does not defer the plan. The
+ * `items` update below swaps `price` unconditionally, so `PERIOD_END` has
+ * always meant "now, but do not bill for the remainder". An upgrade is
+ * therefore never `PERIOD_END`, whoever asks.
+ *
+ * ## Rate limited
+ *
+ * Each plan move is a write against Stripe on our account's quota, and MCV-041
+ * turned on repeating one. Twelve an hour per identity is more changes of mind
+ * than a household has and few enough that a loop is pointless.
  *
  * ## How a pause is expressed to Stripe
  *
@@ -1900,10 +2046,13 @@ export const changeSubscription = withAction(
     name: 'subscription.change',
     auth: 'SESSION',
     input: subscriptionChangeSchema,
+    rateLimit: SUBSCRIPTION_CHANGE_RATE_LIMIT,
     revalidatePaths: BILLING_REVALIDATE_PATHS,
     revalidateTags: BILLING_REVALIDATE_TAGS,
   },
   async (ctx, input): Promise<ActionResult<SubscriptionView>> => {
+    const privileged = isBillingAdmin(ctx.user.role)
+
     const owned = await requireSubscriptionOwnership(
       ctx.user,
       input.subscriptionId
@@ -2023,7 +2172,34 @@ export const changeSubscription = withAction(
           )
         }
 
-        const quantity = input.quantity ?? current.quantity
+        // `quantity` is places at the table, and places are billed. The
+        // direction checks above compare the two plans' **unit** prices, so a
+        // caller free to set it could walk straight around them: "downgrade"
+        // from one place on a $500 plan to twenty on a $499 one is a cheaper
+        // unit price and four-fifths more service, and on the downgrade arm's
+        // `none` it would arrive unbilled. It is not a preference either, for
+        // the same reason `booking.ts` writes `totalCents: staffCaller ?
+        // input.totalCents : 0` — so below `ADMIN` the subscription keeps the
+        // quantity it has and the payload's figure is discarded. Buying more
+        // places is a commercial conversation, not a field on a plan change.
+        const quantity = privileged
+          ? (input.quantity ?? current.quantity)
+          : current.quantity
+
+        const terms = resolveSubscriptionChangeTerms(
+          input.action,
+          input,
+          privileged
+        )
+
+        if (terms.overridden || (!privileged && input.quantity !== undefined)) {
+          // Not a failure: the request is honoured, on the house's terms. It is
+          // logged because a client repeatedly posting terms that are being
+          // discarded is worth an operator seeing. No amounts, no payload.
+          console.warn(
+            `[action:${ctx.actionName}] ${input.action} on subscription ${current.id} took server terms (${terms.effectiveAt}/${terms.prorationBehavior}, quantity ${quantity}); caller was not a billing administrator or asked for an unbillable upgrade.`
+          )
+        }
 
         const updated = await stripe.subscriptions.update(
           owned.data.stripeSubscriptionId,
@@ -2033,10 +2209,7 @@ export const changeSubscription = withAction(
               // Any additional items are left exactly as they are; this
               // platform sells one plan per subscription.
             ],
-            proration_behavior:
-              input.effectiveAt === 'PERIOD_END'
-                ? 'none'
-                : input.prorationBehavior,
+            proration_behavior: prorationBehaviorFor(terms),
             metadata: {
               [STRIPE_CUSTOMER_USER_ID_KEY]: current.userId,
               mannachefPlanId: target.id,

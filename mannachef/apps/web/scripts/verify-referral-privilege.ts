@@ -730,8 +730,13 @@ async function scenarioSelfReferralAndFloor(): Promise<void> {
     const where = lastInvoiceLookup(calls).args['where']
 
     assert.ok(where !== null && typeof where === 'object')
+    // `gt: 0` joined the predicate in MCV-043 and is asserted here rather than
+    // in a scenario of its own: this is the assertion that reads the *whole*
+    // shape of the qualification query, so a condition silently dropped from it
+    // fails here whichever condition it was.
     assert.deepEqual((where as Row)['amountPaidCents'], {
       gte: PROGRAM.minimumQualifyingInvoiceCents,
+      gt: 0,
     })
   })
 

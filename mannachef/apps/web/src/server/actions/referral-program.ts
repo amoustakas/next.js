@@ -117,6 +117,15 @@ export const readReferralProgram = withAction(
  *
  * `create` and `update` carry the same figures because an upsert of a singleton
  * is a statement about the whole row either way.
+ *
+ * ## What the schema has already refused (MCV-043)
+ *
+ * That the rewards this offer pays out for one referred household exceed the
+ * smallest invoice that can earn them, without `allowLossLeader` saying so.
+ * There is no re-derivation of that rule here — `referralProgramUpsertSchema`
+ * owns it, the `ReferralProgram_reward_economics_check` constraint restates it
+ * where `psql` cannot walk around it, and a third copy in this body would be a
+ * third place for it to drift.
  */
 export const updateReferralProgram = withAction(
   {
@@ -149,6 +158,13 @@ export const updateReferralProgram = withAction(
       defaultMaxRedemptions: input.defaultMaxRedemptions ?? null,
       defaultExpiryDays: input.defaultExpiryDays ?? null,
       minimumQualifyingInvoiceCents: input.minimumQualifyingInvoiceCents,
+      // Taken from the payload, unlike `updatedById` below, because it *is* the
+      // operator's statement — the whole value of the column is that a human
+      // typed it. `referralProgramUpsertSchema` has already refused the payload
+      // if the figures need it and it is absent, and
+      // `ReferralProgram_reward_economics_check` refuses the write if they do
+      // and it is false. See the economics note on the `ReferralProgram` model.
+      allowLossLeader: input.allowLossLeader,
       isActive: input.isActive,
       // From the session, never from the payload.
       updatedById: ctx.user.id,
