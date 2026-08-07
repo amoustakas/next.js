@@ -1,3 +1,6 @@
+# Self-contained MannaChef Turborepo (own toolchain, not part of this workspace)
+mannachef/
+
 # Build artifacts
 .next/
 .turbo/

@@ -1,0 +1,25 @@
+# Dependencies
+node_modules/
+.pnpm-store/
+
+# Build output
+.next/
+.turbo/
+dist/
+out/
+*.tsbuildinfo
+
+# Prisma generated client
+packages/db/src/generated/
+packages/db/prisma/migrations/dev.db*
+
+# Environment — never commit real values
+.env
+.env.local
+.env.*.local
+
+# Logs & OS noise
+*.log
+npm-debug.log*
+pnpm-debug.log*
+.DS_Store

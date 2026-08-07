@@ -3,6 +3,9 @@ import { globalIgnores } from 'eslint/config'
 export default globalIgnores([
   '**/.*/**/*', // Default of ESLint legacy config
   '**/node_modules',
+  // Self-contained MannaChef Turborepo; it has its own toolchain and is not
+  // part of the Next.js framework workspace.
+  'mannachef/**/*',
   '**/.next/**/*',
   '**/_next/**/*',
   '**/.vscode/**/*',
