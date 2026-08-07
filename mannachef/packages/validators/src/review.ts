@@ -27,6 +27,12 @@
  *     `./common`. The submission, update and moderation schemas stay strict —
  *     they are request bodies, where a string in place of a number is a bug in
  *     the caller rather than an artefact of the transport.
+ *  6. Every cross-field rule that reads a field's *value* goes through
+ *     `crossField` from `./common` and attaches with `.check(...)`, not
+ *     `.refine(...)` (MCV-009). An object-level `.refine()` runs even when a
+ *     nested field has already failed, and it is handed the raw, un-narrowed
+ *     value — so `?createdFrom=foo&createdTo=bar` threw a `TypeError` out of
+ *     `safeParse` rather than returning `{ success: false }`.
  */
 
 import { z } from 'zod'
@@ -34,6 +40,7 @@ import { z } from 'zod'
 import {
   MAX_SEARCH_LENGTH,
   buildUpdateSchema,
+  crossField,
   cuidSchema,
   hasUniqueValues,
   isoDateTimeSchema,
@@ -414,15 +421,26 @@ export const reviewBulkModerationSchema = z
       .optional(),
   })
   .strict()
-  .refine(
-    (value) =>
-      value.action !== 'REJECT' ||
-      (value.moderationNote != null &&
-        value.moderationNote.length >= MIN_MODERATION_NOTE_LENGTH),
-    {
-      error: 'Please record why these reviews were not published.',
-      path: ['moderationNote'],
-    }
+  /**
+   * `moderationNote` is *conditionally required*, so it cannot be a dependency:
+   * declaring it would skip the rule in the one case it exists for — an absent
+   * note on a rejection. Only `action` is declared, and the note is read from
+   * the raw payload behind an explicit `typeof` guard, which is what keeps the
+   * `.length` read safe. See MCV-008 in `./common`.
+   */
+  .check(
+    crossField(
+      {
+        deps: ['action'],
+        as: 'string',
+        error: 'Please record why these reviews were not published.',
+        path: ['moderationNote'],
+      },
+      ({ action }, raw) =>
+        action !== 'REJECT' ||
+        (typeof raw.moderationNote === 'string' &&
+          raw.moderationNote.length >= MIN_MODERATION_NOTE_LENGTH)
+    )
   )
 export type ReviewBulkModerationInput = z.infer<
   typeof reviewBulkModerationSchema
@@ -515,25 +533,34 @@ export const reviewFilterSchema = paginationSchema
     createdTo: withTemporalCoercion(isoDateTimeSchema.optional()),
     sortBy: reviewSortBySchema,
   })
-  .refine(
-    ({ minRating, maxRating }) =>
-      minRating === undefined ||
-      maxRating === undefined ||
-      minRating <= maxRating,
-    {
-      error: 'The lowest rating must not exceed the highest one.',
-      path: ['maxRating'],
-    }
-  )
-  .refine(
-    ({ createdFrom, createdTo }) =>
-      createdFrom === undefined ||
-      createdTo === undefined ||
-      createdFrom.getTime() <= createdTo.getTime(),
-    {
-      error: 'The earlier date must fall on or before the later one.',
-      path: ['createdTo'],
-    }
+  /**
+   * Every bound here is a `z.preprocess` pipe, and a pipe that fails does not
+   * abort the object around it. `?minRating=foo&maxRating=bar` therefore left
+   * the old rating `.refine()` comparing two strings, and
+   * `?createdFrom=foo&createdTo=bar` left the temporal one calling `.getTime()`
+   * on a string — an unhandled `TypeError`, and a 500 from a `GET` route that
+   * should have answered 400.
+   */
+  .check(
+    crossField(
+      {
+        deps: ['minRating', 'maxRating'],
+        as: 'number',
+        error: 'The lowest rating must not exceed the highest one.',
+        path: ['maxRating'],
+      },
+      ({ minRating, maxRating }) => minRating <= maxRating
+    ),
+    crossField(
+      {
+        deps: ['createdFrom', 'createdTo'],
+        as: 'date',
+        error: 'The earlier date must fall on or before the later one.',
+        path: ['createdTo'],
+      },
+      ({ createdFrom, createdTo }) =>
+        createdFrom.getTime() <= createdTo.getTime()
+    )
   )
 export type ReviewFilterInput = z.infer<typeof reviewFilterSchema>
 export type ReviewFilterRawInput = z.input<typeof reviewFilterSchema>

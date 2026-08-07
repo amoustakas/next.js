@@ -22,9 +22,16 @@
  *
  * The export sets of all fifteen modules were enumerated with the TypeScript
  * compiler API (`checker.getExportsOfModule`) rather than by reading them, and
- * diffed for duplicate names. Across 774 exports there is exactly **one**
- * collision, and it is a genuine difference of meaning rather than an accident:
- * `intake.ts` and `referral.ts` both declare `MAX_REFERRAL_CODE_LENGTH`.
+ * diffed for duplicate names. Across the 794 module-level exports counted at
+ * the time of writing there is exactly **one** collision, and it is a genuine
+ * difference of meaning rather than an accident: `intake.ts` and `referral.ts`
+ * both declare `MAX_REFERRAL_CODE_LENGTH`.
+ *
+ * The figure is a measurement, not a promise — it moves whenever a module gains
+ * a declaration. What must not move is the *count of collisions*, and that is
+ * not left to the comment: two `export *` declarations publishing one name make
+ * it ambiguous, so the compiler reports it (see "How the collision is resolved"
+ * below) rather than picking a winner.
  *
  *  - `referral.ts` → `12`. The longest code `generateReferralCode` will mint,
  *    and the ceiling `referralCodeSchema` enforces. This is the referral
@@ -67,9 +74,38 @@
  * being exported from *here*. Both directions are mutation-tested — removing
  * each declaration in turn is verified to break the build.
  *
- * This is why the barrel is fifteen star exports rather than 774 enumerated
+ * This is why the barrel is fifteen star exports rather than 794 enumerated
  * names. The enumerated form had to be edited every time any module gained a
  * declaration, and an omission was invisible until something failed to import.
+ *
+ * ## Names that changed module in MCV-010
+ *
+ * Four constants and one helper were hoisted into `common.ts`, which is the one
+ * kind of refactor the star-export form does *not* protect against. Moving a
+ * name from one starred module to another leaves this file untouched and leaves
+ * the build green, so nothing here would have noticed if the hoist had dropped
+ * a name on the way.
+ *
+ * Only one of the five was previously public: `MAX_NOTE_LENGTH`, exported by
+ * `booking.ts` and shadowed by an unexported twin in `referral.ts`. It now has
+ * a single declaration in `common.ts` and reaches this barrel through
+ * `export * from './common'` instead of `export * from './booking'` — the same
+ * name, the same value, a different route. The other four —
+ * `MAX_STRIPE_ID_LENGTH`, `MAX_SORT_ORDER`, `MAX_FILTER_TAGS` and
+ * `stripeIdSchema` — were module-local in both of their homes, so they are
+ * *additions* to the public surface rather than relocations within it, and no
+ * alias was needed to keep anything working. `payment.ts`'s spelling of the
+ * helper, `stripeReferenceSchema`, is simply gone; it was never exported, so
+ * nothing could have been importing it.
+ *
+ * `userActivationSchema` and its two inferred types are new in the same pass,
+ * closing the `User.isActive` coverage gap documented at the head of `user.ts`.
+ *
+ * The assertions at the foot of this file cover all of it, in the same
+ * self-referential style as the collision guards: they read `Barrel.X`, so they
+ * fail if a hoisted name stops being published from *here*, and they pin the
+ * values, so they fail if a future edit re-declares one of them somewhere else
+ * with a different number.
  *
  * `verbatimModuleSyntax` is on, so type-only re-exports use `export type`.
  */
@@ -138,8 +174,11 @@ export { MAX_REFERRAL_CODE_LENGTH as MAX_INTAKE_REFERRAL_CODE_LENGTH } from './i
 // =============================================================================
 
 import type * as Barrel from './index'
+import type * as BookingModule from './booking'
+import type * as CommonModule from './common'
 import type * as IntakeModule from './intake'
 import type * as ReferralModule from './referral'
+import type * as UserModule from './user'
 
 /** Fails to instantiate unless `T` is exactly `true`. */
 type Assert<T extends true> = T
@@ -184,4 +223,78 @@ export type _BarrelNamesAreDistinct = Assert<
   typeof Barrel.MAX_REFERRAL_CODE_LENGTH extends typeof Barrel.MAX_INTAKE_REFERRAL_CODE_LENGTH
     ? false
     : true
+>
+
+// =============================================================================
+// Compile-time guard on the MCV-010 hoists
+//
+// Same technique, different failure mode. The collision guards above protect a
+// name that two modules want; these protect a name that changed which module
+// owns it. Both are invisible to `export *` on its own.
+// =============================================================================
+
+/**
+ * `MAX_NOTE_LENGTH` is the only one of the hoisted names that was already
+ * public, so it is the only one that could regress rather than simply fail to
+ * appear. It must still be on the barrel and must still be 2,000 — a caller
+ * that bounded a textarea by it should not notice the move at all.
+ */
+export type _BarrelNoteLengthIsTwoThousand = Assert<
+  typeof Barrel.MAX_NOTE_LENGTH extends 2_000 ? true : false
+>
+
+/**
+ * ...and it must reach the barrel from `common.ts`. `booking.ts` re-declaring
+ * or re-exporting it would make this fail, which is the regression the value
+ * check above cannot see: two declarations agreeing on 2,000 today is exactly
+ * the state MCV-010 removed, and it satisfies every assertion about the number.
+ */
+export type _NoteLengthLeftBooking = Assert<
+  'MAX_NOTE_LENGTH' extends keyof typeof BookingModule ? false : true
+>
+
+export type _NoteLengthLivesInCommon = Assert<
+  typeof CommonModule.MAX_NOTE_LENGTH extends 2_000 ? true : false
+>
+
+/** The three limits that were module-local in two homes apiece. */
+export type _BarrelStripeIdLengthIs255 = Assert<
+  typeof Barrel.MAX_STRIPE_ID_LENGTH extends 255 ? true : false
+>
+
+export type _BarrelSortOrderIsTenThousand = Assert<
+  typeof Barrel.MAX_SORT_ORDER extends 10_000 ? true : false
+>
+
+export type _BarrelFilterTagsIsTwenty = Assert<
+  typeof Barrel.MAX_FILTER_TAGS extends 20 ? true : false
+>
+
+/**
+ * The hoisted helper. Comparing against `CommonModule`'s own declaration rather
+ * than against a structural shape means this fails if the barrel ever publishes
+ * a *different* `stripeIdSchema` — which is what a re-declaration in `billing`
+ * or `payment` would amount to.
+ */
+export type _BarrelStripeIdSchemaIsCommons = Assert<
+  typeof Barrel.stripeIdSchema extends typeof CommonModule.stripeIdSchema
+    ? true
+    : false
+>
+
+/**
+ * The `User.isActive` coverage gap is closed and stays closed. Reading these
+ * through `Barrel` is what makes them load-bearing: `user.ts` could keep the
+ * declarations while something here stopped publishing them.
+ */
+export type _BarrelPublishesUserActivation = Assert<
+  typeof Barrel.userActivationSchema extends typeof UserModule.userActivationSchema
+    ? true
+    : false
+>
+
+export type _BarrelPublishesSelfDeactivationGuard = Assert<
+  typeof Barrel.isSelfDeactivation extends typeof UserModule.isSelfDeactivation
+    ? true
+    : false
 >

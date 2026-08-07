@@ -32,14 +32,26 @@
  *     the create, update and webhook schemas stay strict, because a string where
  *     a number belongs in a request body is a bug in the caller rather than an
  *     artefact of the transport.
+ *  6. Every cross-field rule that reads a field's *value* — a date, a figure, a
+ *     list of invoice lines — goes through `crossField` / `crossFieldMixed`
+ *     from `./common` and attaches with `.check(...)`, not `.refine(...)`
+ *     (MCV-009). An object-level `.refine()` runs even when a nested field has
+ *     already failed, and it is handed the raw, un-narrowed value, so
+ *     `?issuedFrom=foo&issuedTo=bar` on the `invoice.list` route threw a
+ *     `TypeError` out of `safeParse` — a 500 where a 400 belonged. Rules that
+ *     only compare fields (`successUrl !== cancelUrl`, `trialIsOfferable`) stay
+ *     as plain refinements: they dereference nothing and cannot throw.
  */
 
 import { z } from 'zod'
 
 import {
   MAX_SEARCH_LENGTH,
+  MAX_SORT_ORDER,
   MS_PER_DAY,
   buildUpdateSchema,
+  crossField,
+  crossFieldMixed,
   cuidSchema,
   currencySchema,
   hasUniqueValues,
@@ -50,6 +62,7 @@ import {
   paginationSchema,
   queryFlag,
   slugSchema,
+  stripeIdSchema,
   urlSchema,
   withNumericCoercion,
   withTemporalCoercion,
@@ -78,9 +91,6 @@ const MAX_DESCRIPTION_LENGTH = 4_000
 /** Generous ceiling for a `@db.Text` memo or reason. */
 const MAX_MEMO_LENGTH = 2_000
 
-/** Matches every Stripe identifier column — `@db.VarChar(255)`. */
-const MAX_STRIPE_ID_LENGTH = 255
-
 /** Matches `Invoice.number` — `@db.VarChar(64)`. */
 const MAX_INVOICE_NUMBER_LENGTH = 64
 
@@ -98,9 +108,6 @@ const MAX_FEATURE_LENGTH = 160
 
 /** How many selling points one plan card may carry before it stops selling. */
 export const MAX_PLAN_FEATURES = 20
-
-/** A manual position within the plan ladder. */
-const MAX_SORT_ORDER = 10_000
 
 /** $1,000,000.00 — the ceiling on any single amount we will invoice. */
 export const MAX_AMOUNT_CENTS = 100_000_000
@@ -151,31 +158,20 @@ const INVOICE_NUMBER_PATTERN = /^[A-Z0-9][A-Z0-9-]{2,63}$/
 const SHA256_PATTERN = /^[0-9a-f]{64}$/
 
 // =============================================================================
-// Local helpers
+// Helpers — none are local to this module
 // =============================================================================
 
 /**
- * Only one helper is genuinely local to billing. Everything that used to sit
- * here — `hasUniqueValues`, `withoutDefaults`, `hasSomethingToSave`,
- * `NOTHING_TO_SAVE_MESSAGE`, `queryFlag`, `optionalProse` and `isInTheFuture` —
- * now lives in `./common` and is imported at the head of this file.
+ * Nothing is local to billing any more. `hasUniqueValues`, `withoutDefaults`,
+ * `hasSomethingToSave`, `NOTHING_TO_SAVE_MESSAGE`, `queryFlag`, `optionalProse`
+ * and `isInTheFuture` moved to `./common` in MCV-004; `stripeIdSchema` followed
+ * them in MCV-010, once the audit found `payment.ts` carrying a byte-identical
+ * copy under the name `stripeReferenceSchema`. `MAX_STRIPE_ID_LENGTH`, which
+ * only ever existed to bound that helper, moved with it.
+ *
+ * The Stripe *patterns* above stay here. They are facts about the billing
+ * tables, not shared vocabulary.
  */
-
-/** A Stripe identifier of a known shape. */
-function stripeIdSchema(
-  pattern: RegExp,
-  missingMessage: string,
-  shapeMessage: string
-) {
-  return z
-    .string({ error: missingMessage })
-    .trim()
-    .min(1, { error: missingMessage })
-    .max(MAX_STRIPE_ID_LENGTH, {
-      error: 'That Stripe reference is longer than our records allow.',
-    })
-    .refine((value) => pattern.test(value), { error: shapeMessage })
-}
 
 // =============================================================================
 // Shared money & Stripe field schemas
@@ -454,15 +450,23 @@ export const subscriptionPlanFilterSchema = paginationSchema
     maxPriceCents: withNumericCoercion(amountCentsSchema.optional()),
     sortBy: subscriptionPlanSortBySchema,
   })
-  .refine(
-    ({ minPriceCents, maxPriceCents }) =>
-      minPriceCents === undefined ||
-      maxPriceCents === undefined ||
-      minPriceCents <= maxPriceCents,
-    {
-      error: 'The lower price must not exceed the higher one.',
-      path: ['maxPriceCents'],
-    }
+  /**
+   * Both bounds are `z.preprocess` pipes, and a pipe that fails does not abort
+   * the object it sits in — so `?minPriceCents=foo&maxPriceCents=bar` reached
+   * the old `.refine()` with two strings and compared them lexically, quietly
+   * passing or failing on nonsense. `crossField` runs the rule only once both
+   * bounds are finite numbers. See MCV-008 in `./common`.
+   */
+  .check(
+    crossField(
+      {
+        deps: ['minPriceCents', 'maxPriceCents'],
+        as: 'number',
+        error: 'The lower price must not exceed the higher one.',
+        path: ['maxPriceCents'],
+      },
+      ({ minPriceCents, maxPriceCents }) => minPriceCents <= maxPriceCents
+    )
   )
 export type SubscriptionPlanFilterInput = z.infer<
   typeof subscriptionPlanFilterSchema
@@ -642,18 +646,34 @@ export const subscriptionChangeSchema = z.discriminatedUnion(
         ),
       })
       .strict()
-      .refine(({ pausedUntil }) => isInTheFuture(pausedUntil), {
-        error: 'Please choose a date in the future for service to resume.',
-        path: ['pausedUntil'],
-      })
-      .refine(
-        ({ pausedUntil }) =>
-          pausedUntil.getTime() - Date.now() <= MAX_PAUSE_DAYS * MS_PER_DAY,
-        {
-          error:
-            'A subscription may rest for up to six months. Beyond that, please cancel and rejoin when you are ready.',
-          path: ['pausedUntil'],
-        }
+      /**
+       * `pausedUntil` is an `isoDateTimeSchema`, which is a `z.ZodPipe`: a
+       * field that fails does not abort the branch, so
+       * `{ action: 'PAUSE', pausedUntil: 'foo' }` reached `isInTheFuture` with
+       * a string and threw a `TypeError` out of `safeParse`. Both rules now run
+       * only once `pausedUntil` is a real `Date`.
+       */
+      .check(
+        crossField(
+          {
+            deps: ['pausedUntil'],
+            as: 'date',
+            error: 'Please choose a date in the future for service to resume.',
+            path: ['pausedUntil'],
+          },
+          ({ pausedUntil }) => isInTheFuture(pausedUntil)
+        ),
+        crossField(
+          {
+            deps: ['pausedUntil'],
+            as: 'date',
+            error:
+              'A subscription may rest for up to six months. Beyond that, please cancel and rejoin when you are ready.',
+            path: ['pausedUntil'],
+          },
+          ({ pausedUntil }) =>
+            pausedUntil.getTime() - Date.now() <= MAX_PAUSE_DAYS * MS_PER_DAY
+        )
       ),
     z
       .object({
@@ -663,12 +683,16 @@ export const subscriptionChangeSchema = z.discriminatedUnion(
         resumeAt: isoDateTimeSchema.optional(),
       })
       .strict()
-      .refine(
-        ({ resumeAt }) => resumeAt === undefined || isInTheFuture(resumeAt),
-        {
-          error: 'Please choose a date in the future for service to resume.',
-          path: ['resumeAt'],
-        }
+      .check(
+        crossField(
+          {
+            deps: ['resumeAt'],
+            as: 'date',
+            error: 'Please choose a date in the future for service to resume.',
+            path: ['resumeAt'],
+          },
+          ({ resumeAt }) => isInTheFuture(resumeAt)
+        )
       ),
     z
       .object({
@@ -692,12 +716,16 @@ export const subscriptionChangeSchema = z.discriminatedUnion(
         ),
       })
       .strict()
-      .refine(
-        ({ cancelAt }) => cancelAt === undefined || isInTheFuture(cancelAt),
-        {
-          error: 'Please choose a closing date in the future.',
-          path: ['cancelAt'],
-        }
+      .check(
+        crossField(
+          {
+            deps: ['cancelAt'],
+            as: 'date',
+            error: 'Please choose a closing date in the future.',
+            path: ['cancelAt'],
+          },
+          ({ cancelAt }) => isInTheFuture(cancelAt)
+        )
       )
       .refine(
         ({ cancelAtPeriodEnd, cancelAt }) =>
@@ -761,15 +789,24 @@ export const userSubscriptionFilterSchema = paginationSchema
     renewingFrom: withTemporalCoercion(isoDateTimeSchema.optional()),
     renewingUntil: withTemporalCoercion(isoDateTimeSchema.optional()),
   })
-  .refine(
-    ({ renewingFrom, renewingUntil }) =>
-      renewingFrom === undefined ||
-      renewingUntil === undefined ||
-      renewingFrom.getTime() <= renewingUntil.getTime(),
-    {
-      error: 'The earlier date must fall on or before the later one.',
-      path: ['renewingUntil'],
-    }
+  /**
+   * `?renewingFrom=foo&renewingUntil=bar` used to call `.getTime()` on the
+   * string `'foo'` — an unhandled `TypeError`, so a `GET` on `subscription.list`
+   * answered 500 rather than 400. The bounds are pipes and a failing pipe does
+   * not abort the object, which is why the `=== undefined` clauses were not
+   * enough.
+   */
+  .check(
+    crossField(
+      {
+        deps: ['renewingFrom', 'renewingUntil'],
+        as: 'date',
+        error: 'The earlier date must fall on or before the later one.',
+        path: ['renewingUntil'],
+      },
+      ({ renewingFrom, renewingUntil }) =>
+        renewingFrom.getTime() <= renewingUntil.getTime()
+    )
   )
 export type UserSubscriptionFilterInput = z.infer<
   typeof userSubscriptionFilterSchema
@@ -835,22 +872,35 @@ export const manualInvoiceLineItemSchema = z
       .optional(),
   })
   .strict()
-  .refine(
-    ({ quantity, unitAmountCents, amountCents }) =>
-      amountCents === undefined || amountCents === quantity * unitAmountCents,
-    {
-      error:
-        'This line does not add up — the total should be the quantity times the unit price.',
-      path: ['amountCents'],
-    }
-  )
-  .refine(
-    ({ quantity, unitAmountCents }) =>
-      quantity * unitAmountCents <= MAX_AMOUNT_CENTS,
-    {
-      error: 'That line comes to more than we invoice in a single entry.',
-      path: ['unitAmountCents'],
-    }
+  /**
+   * Both rules do arithmetic on the figures, so both are guarded: a dependency
+   * that is absent, non-numeric or `NaN` skips the rule rather than firing a
+   * misleading "does not add up" on top of the issue that field already
+   * reported. An omitted `amountCents` skips the first rule exactly as the
+   * `=== undefined` clause used to.
+   */
+  .check(
+    crossField(
+      {
+        deps: ['quantity', 'unitAmountCents', 'amountCents'],
+        as: 'number',
+        error:
+          'This line does not add up — the total should be the quantity times the unit price.',
+        path: ['amountCents'],
+      },
+      ({ quantity, unitAmountCents, amountCents }) =>
+        amountCents === quantity * unitAmountCents
+    ),
+    crossField(
+      {
+        deps: ['quantity', 'unitAmountCents'],
+        as: 'number',
+        error: 'That line comes to more than we invoice in a single entry.',
+        path: ['unitAmountCents'],
+      },
+      ({ quantity, unitAmountCents }) =>
+        quantity * unitAmountCents <= MAX_AMOUNT_CENTS
+    )
   )
 export type ManualInvoiceLineItemInput = z.infer<
   typeof manualInvoiceLineItemSchema
@@ -865,6 +915,49 @@ export function lineItemAmountCents(line: {
   unitAmountCents: number
 }): number {
   return line.quantity * line.unitAmountCents
+}
+
+/**
+ * Whether one line of an invoice agrees with its own arithmetic.
+ *
+ * Written against `unknown` rather than `ManualInvoiceLineItemInput` on
+ * purpose. `manualInvoiceCreateSchema` checks this a second time, at the level
+ * of the whole invoice, and the whole point of that second reading is that it
+ * still speaks up when the line itself has already reported a problem — so the
+ * value it is handed may be anything the caller sent. A line that is not an
+ * object, or whose figures are not numbers, is passed over: it has an issue of
+ * its own already, and a second complaint about arithmetic would only bury it.
+ */
+function lineTotalAgrees(line: unknown): boolean {
+  if (typeof line !== 'object' || line === null) {
+    return true
+  }
+
+  const candidate: {
+    quantity?: unknown
+    unitAmountCents?: unknown
+    amountCents?: unknown
+  } = line
+
+  if (candidate.amountCents === undefined) {
+    return true
+  }
+
+  if (
+    typeof candidate.amountCents !== 'number' ||
+    typeof candidate.quantity !== 'number' ||
+    typeof candidate.unitAmountCents !== 'number'
+  ) {
+    return true
+  }
+
+  return (
+    candidate.amountCents ===
+    lineItemAmountCents({
+      quantity: candidate.quantity,
+      unitAmountCents: candidate.unitAmountCents,
+    })
+  )
 }
 
 /** Everything an invoice footer prints, derived from the lines and the discount. */
@@ -958,50 +1051,86 @@ export const manualInvoiceCreateSchema = z
       .default(false),
   })
   .strict()
-  .refine(
-    (value) => {
-      const totals = computeInvoiceTotals(value)
-      return value.discountCents <= totals.subtotalCents + totals.taxCents
-    },
-    {
-      error: 'A discount cannot be larger than the invoice it reduces.',
-      path: ['discountCents'],
-    }
-  )
-  .refine(
-    (value) =>
-      value.expectedTotalCents === undefined ||
-      value.expectedTotalCents === computeInvoiceTotals(value).amountDueCents,
-    {
-      error:
-        'The total does not match the lines above. Please review the invoice before sending it.',
-      path: ['expectedTotalCents'],
-    }
-  )
-  .refine(
-    (value) => computeInvoiceTotals(value).amountDueCents <= MAX_AMOUNT_CENTS,
-    {
-      error:
-        'This invoice comes to more than we settle in one document. Please split it.',
-      path: ['lineItems'],
-    }
-  )
-  .refine((value) => value.dueAt === undefined || isInTheFuture(value.dueAt), {
-    error: 'Please choose a due date in the future.',
-    path: ['dueAt'],
-  })
-  .refine(
-    (value) =>
-      value.lineItems.every(
-        (line) =>
-          line.amountCents === undefined ||
-          line.amountCents === lineItemAmountCents(line)
-      ),
-    {
-      error:
-        'One of these lines does not add up. Please check the quantities and unit prices.',
-      path: ['lineItems'],
-    }
+  /**
+   * Four of these five rules walk `lineItems`, and the fifth reads a `Date` off
+   * `dueAt` — an `isoDateTimeSchema`, and therefore a `z.ZodPipe` that does not
+   * abort the object when it fails. `{ dueAt: 'foo' }` used to call
+   * `isInTheFuture('foo')` and throw a `TypeError` out of `safeParse`.
+   *
+   * Declaring `lineItems` and `discountCents` as dependencies makes the totals
+   * safe to compute: a `lineItems` that is not an array, or that reported an
+   * issue of its own, skips the arithmetic instead of adding a second, less
+   * useful complaint on top of the first.
+   */
+  .check(
+    crossFieldMixed(
+      {
+        deps: { lineItems: 'array', discountCents: 'number' },
+        error: 'A discount cannot be larger than the invoice it reduces.',
+        path: ['discountCents'],
+      },
+      ({ lineItems, discountCents }) => {
+        const totals = computeInvoiceTotals({ lineItems, discountCents })
+
+        return discountCents <= totals.subtotalCents + totals.taxCents
+      }
+    ),
+    crossFieldMixed(
+      {
+        deps: {
+          lineItems: 'array',
+          discountCents: 'number',
+          expectedTotalCents: 'number',
+        },
+        error:
+          'The total does not match the lines above. Please review the invoice before sending it.',
+        path: ['expectedTotalCents'],
+      },
+      ({ lineItems, discountCents, expectedTotalCents }) =>
+        expectedTotalCents ===
+        computeInvoiceTotals({ lineItems, discountCents }).amountDueCents
+    ),
+    crossFieldMixed(
+      {
+        deps: { lineItems: 'array', discountCents: 'number' },
+        error:
+          'This invoice comes to more than we settle in one document. Please split it.',
+        path: ['lineItems'],
+      },
+      ({ lineItems, discountCents }) =>
+        computeInvoiceTotals({ lineItems, discountCents }).amountDueCents <=
+        MAX_AMOUNT_CENTS
+    ),
+    crossField(
+      {
+        deps: ['dueAt'],
+        as: 'date',
+        error: 'Please choose a due date in the future.',
+        path: ['dueAt'],
+      },
+      ({ dueAt }) => isInTheFuture(dueAt)
+    ),
+    /**
+     * The one rule here that deliberately declares *no* dependency.
+     *
+     * `manualInvoiceLineItemSchema` already rejects a line whose stated total
+     * disagrees with its arithmetic, at `['lineItems', i, 'amountCents']`. This
+     * second reading exists to say the same thing again at the level of the
+     * whole invoice — so declaring `lineItems` as a dependency would suppress
+     * it in the only situation it ever fires in, quietly deleting the rule.
+     * Totality comes from `lineTotalAgrees` instead, which guards every value
+     * it touches.
+     */
+    crossFieldMixed(
+      {
+        deps: {},
+        error:
+          'One of these lines does not add up. Please check the quantities and unit prices.',
+        path: ['lineItems'],
+      },
+      (_values, raw) =>
+        !Array.isArray(raw.lineItems) || raw.lineItems.every(lineTotalAgrees)
+    )
   )
 export type ManualInvoiceCreateInput = z.infer<typeof manualInvoiceCreateSchema>
 export type ManualInvoiceCreateRawInput = z.input<
@@ -1082,35 +1211,43 @@ export const invoiceFilterSchema = paginationSchema
     dueTo: withTemporalCoercion(isoDateTimeSchema.optional()),
     sortBy: invoiceSortBySchema,
   })
-  .refine(
-    ({ minAmountDueCents, maxAmountDueCents }) =>
-      minAmountDueCents === undefined ||
-      maxAmountDueCents === undefined ||
-      minAmountDueCents <= maxAmountDueCents,
-    {
-      error: 'The lower amount must not exceed the higher one.',
-      path: ['maxAmountDueCents'],
-    }
-  )
-  .refine(
-    ({ issuedFrom, issuedTo }) =>
-      issuedFrom === undefined ||
-      issuedTo === undefined ||
-      issuedFrom.getTime() <= issuedTo.getTime(),
-    {
-      error: 'The earlier date must fall on or before the later one.',
-      path: ['issuedTo'],
-    }
-  )
-  .refine(
-    ({ dueFrom, dueTo }) =>
-      dueFrom === undefined ||
-      dueTo === undefined ||
-      dueFrom.getTime() <= dueTo.getTime(),
-    {
-      error: 'The earlier date must fall on or before the later one.',
-      path: ['dueTo'],
-    }
+  /**
+   * Six pipes, three ordering rules, and — before MCV-009 — one unhandled
+   * `TypeError` for anybody who mistyped a date. `invoice.list` is a `GET`
+   * route, so `?issuedFrom=foo&issuedTo=bar` is a two-word query string that
+   * used to answer 500 instead of 400: a failing pipe does not abort the object
+   * around it, so the old `=== undefined` clauses waved the raw string through
+   * to `.getTime()`. All three rules now run only on well-typed dependencies.
+   */
+  .check(
+    crossField(
+      {
+        deps: ['minAmountDueCents', 'maxAmountDueCents'],
+        as: 'number',
+        error: 'The lower amount must not exceed the higher one.',
+        path: ['maxAmountDueCents'],
+      },
+      ({ minAmountDueCents, maxAmountDueCents }) =>
+        minAmountDueCents <= maxAmountDueCents
+    ),
+    crossField(
+      {
+        deps: ['issuedFrom', 'issuedTo'],
+        as: 'date',
+        error: 'The earlier date must fall on or before the later one.',
+        path: ['issuedTo'],
+      },
+      ({ issuedFrom, issuedTo }) => issuedFrom.getTime() <= issuedTo.getTime()
+    ),
+    crossField(
+      {
+        deps: ['dueFrom', 'dueTo'],
+        as: 'date',
+        error: 'The earlier date must fall on or before the later one.',
+        path: ['dueTo'],
+      },
+      ({ dueFrom, dueTo }) => dueFrom.getTime() <= dueTo.getTime()
+    )
   )
 export type InvoiceFilterInput = z.infer<typeof invoiceFilterSchema>
 export type InvoiceFilterRawInput = z.input<typeof invoiceFilterSchema>

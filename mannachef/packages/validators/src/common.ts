@@ -84,6 +84,47 @@ const MAX_URL_LENGTH = 2048
 const MAX_ADDRESS_LINE_LENGTH = 200
 const MAX_LOCALITY_LENGTH = 120
 
+// -----------------------------------------------------------------------------
+// Cross-domain limits (MCV-010)
+//
+// Each of these was declared independently in two domain modules with the same
+// value and the same intent, which is exactly what rule 3 at the head of this
+// file forbids. They live here now; the domain modules import them.
+//
+// A limit that merely *happens* to share a number with another is not a
+// duplicate and stays where it is — `MAX_TAGLINE_LENGTH`, `MAX_REASON_LENGTH`
+// and `REFERRAL_CODE_PATTERN` were each confirmed to be a distinct concept and
+// were deliberately left in their own modules.
+// -----------------------------------------------------------------------------
+
+/**
+ * Matches every Stripe identifier column in the schema — all are
+ * `@db.VarChar(255)`. Previously declared in both `billing.ts` and `payment.ts`.
+ */
+export const MAX_STRIPE_ID_LENGTH = 255
+
+/**
+ * Highest manual sort position any ladder accepts — plans in `billing.ts`,
+ * dishes and categories in `menu.ts`. Comfortably beyond any real list.
+ */
+export const MAX_SORT_ORDER = 10_000
+
+/**
+ * How many tag handles a single filter may combine. Shared by the media library
+ * and the menu, which filter over the same `Tag` table.
+ */
+export const MAX_FILTER_TAGS = 20
+
+/**
+ * Generous ceiling for a `@db.Text` note, memo or reason.
+ *
+ * `booking.ts` exported this and `referral.ts` shadowed it with an identical
+ * local copy, so the barrel published one of two constants that had to be kept
+ * in step by hand. Both now import it from here, and the barrel's
+ * `MAX_NOTE_LENGTH` is this declaration.
+ */
+export const MAX_NOTE_LENGTH = 2_000
+
 // =============================================================================
 // Identifiers
 // =============================================================================
@@ -242,6 +283,519 @@ export const ratingSchema = z
 export type Rating = z.infer<typeof ratingSchema>
 
 // =============================================================================
+// Cross-field refinement (MCV-008)
+// =============================================================================
+
+/**
+ * Object-level refinements that dereference more than one field, made
+ * structurally incapable of throwing.
+ *
+ * ## The bug this replaces
+ *
+ * In zod 4 an object-level `.refine()` / `.superRefine()` runs against the
+ * **raw, un-narrowed** value, and it still runs when a *nested field* has
+ * already failed. Whether the parent aborts depends on the wrapper kind of the
+ * field that failed:
+ *
+ *  - A plain field (`z.number()`) that fails records an issue with
+ *    `continue: undefined`. `util.aborted(payload)` is then `true` and the
+ *    object's own checks are skipped. Safe by accident.
+ *  - A `z.ZodPipe` field — which is what every `.transform(...).refine(...)`
+ *    chain produces, including {@link isoDateTimeSchema},
+ *    {@link phoneSchema}, {@link urlSchema}, and
+ *    {@link canadianPostalCodeSchema} — records its issue with
+ *    `continue: true`. `util.aborted(payload)` stays `false`, the object's
+ *    checks run anyway, and the refinement receives the original string.
+ *
+ * So this, which reads perfectly innocently:
+ *
+ * ```ts
+ * z.object({ start: isoDateTimeSchema, end: isoDateTimeSchema })
+ *   .refine(({ start, end }) => end.getTime() > start.getTime(), { … })
+ * ```
+ *
+ * does not return `{ success: false }` for `{ start: 'foo', end: 'bar' }`. It
+ * throws `TypeError: end.getTime is not a function` straight out of
+ * `safeParse` — which, for a filter schema fed from a query string, is an
+ * HTTP 500 where an HTTP 400 belongs.
+ *
+ * ## What zod 4 does and does not offer
+ *
+ * It offers exactly one supported hook, and this file uses it.
+ * `$ZodSuperRefineParams.when` is public, documented in the shipped `.d.ts`
+ * ("If provided, the refinement runs only when this returns `true`"), and
+ * receives the public `ParsePayload`, whose `issues: $ZodRawIssue[]` field is
+ * likewise public — no `@internal` marker, no `_zod` prefix. At the moment an
+ * object's checks run, `payload.issues` already holds every issue its own
+ * properties produced, each carrying a `path` relative to the object. That is
+ * enough to answer "did *this* field already fail?" without touching an
+ * internal.
+ *
+ * There is no supported way to receive an object-level refinement's value
+ * *narrowed*, so the helpers below pair the `when` gate with explicit runtime
+ * type guards. The two are deliberately redundant:
+ *
+ *  - `when` is the *precise* half. It suppresses the check when a declared
+ *    dependency produced an issue even if that value happens to still be the
+ *    right runtime type — `z.string().min(5)` failing leaves a string behind,
+ *    and firing a range error on top of "too short" is noise.
+ *  - The guards are the *total* half. They cannot be defeated by a future zod
+ *    changing when checks run, by a `continue` flag flipping, or by an author
+ *    forgetting a dependency: if a value is not the declared runtime type, the
+ *    predicate is never invoked, so it cannot throw.
+ *
+ * Note that supplying `when` also opts out of zod's default abort behaviour —
+ * the check now runs even when an *unrelated* field failed hard. That is the
+ * better reading: an invalid `staffProfileId` should not hide a genuinely
+ * inverted date range, and the dependency guards make running safe.
+ *
+ * ## Using them
+ *
+ * These return a `z.core.$ZodCheck`, so they attach with `.check(...)` rather
+ * than `.refine(...)`. That is an upgrade in its own right: `.check()` returns
+ * `this`, so a `ZodObject` stays a `ZodObject` and remains `.extend()`-able,
+ * and several checks can be attached in one call.
+ *
+ * ```ts
+ * // Before — throws on { start: 'foo', end: 'bar' }
+ * z.object({ start: isoDateTimeSchema, end: isoDateTimeSchema })
+ *   .strict()
+ *   .refine(({ start, end }) => end.getTime() > start.getTime(), {
+ *     error: 'The end of the window must fall after its start.',
+ *     path: ['end'],
+ *   })
+ *
+ * // After — returns { success: false } naming `start` and `end`
+ * z.object({ start: isoDateTimeSchema, end: isoDateTimeSchema })
+ *   .strict()
+ *   .check(
+ *     crossField(
+ *       {
+ *         deps: ['start', 'end'],
+ *         as: 'date',
+ *         error: 'The end of the window must fall after its start.',
+ *         path: ['end'],
+ *       },
+ *       ({ start, end }) => end.getTime() > start.getTime()
+ *     )
+ *   )
+ * ```
+ *
+ * `deps` is constrained to the keys of the object being refined, so a
+ * misspelled dependency is a compile error rather than a check that silently
+ * never runs. The predicate receives only those keys, already narrowed —
+ * `start` and `end` are `Date`, not `Date | undefined` and not `unknown` —
+ * which is why the body needs no guard clause of its own.
+ */
+
+/** The runtime types a cross-field dependency may be narrowed to. */
+export type CrossFieldKind =
+  'date' | 'number' | 'string' | 'array' | 'boolean' | 'present'
+
+/**
+ * Maps a {@link CrossFieldKind} to the TypeScript type its guard proves.
+ *
+ * `'present'` is the escape hatch for a dependency whose type the helper has no
+ * opinion about — an enum member, a nested object, a discriminant. It proves
+ * only that the value is neither `undefined` nor `null`, which is still enough
+ * to stop the common "read a property of an absent field" crash.
+ */
+export interface CrossFieldRuntimeType {
+  readonly date: Date
+  readonly number: number
+  readonly string: string
+  readonly array: readonly unknown[]
+  readonly boolean: boolean
+  readonly present: NonNullable<unknown>
+}
+
+/**
+ * The declared field type intersected with the guarded runtime type.
+ *
+ * `Date | undefined` narrowed by `'date'` is `Date`. A field the shape types as
+ * `unknown` — or as something with no overlap at all — falls back to the
+ * guarded type, so the predicate is never handed `never`.
+ */
+type NarrowedTo<Value, Runtime> = [Extract<Value, Runtime>] extends [never]
+  ? Runtime
+  : Extract<Value, Runtime>
+
+/** What a {@link crossField} predicate receives: the deps, already narrowed. */
+export type CrossFieldValues<
+  Shape,
+  Key extends keyof Shape,
+  Kind extends CrossFieldKind,
+> = {
+  readonly [P in Key]-?: NarrowedTo<Shape[P], CrossFieldRuntimeType[Kind]>
+}
+
+/** A per-key runtime type declaration, for {@link crossFieldMixed}. */
+export type CrossFieldKindMap<Shape> = {
+  readonly [P in keyof Shape]?: CrossFieldKind
+}
+
+/** What a {@link crossFieldMixed} predicate receives. */
+export type CrossFieldMixedValues<
+  Shape,
+  Kinds extends CrossFieldKindMap<Shape>,
+> = {
+  readonly [P in keyof Kinds & keyof Shape]-?: Kinds[P] extends CrossFieldKind
+    ? NarrowedTo<Shape[P], CrossFieldRuntimeType[Kinds[P]]>
+    : never
+}
+
+/**
+ * The whole object under refinement, offered to the predicate as a second
+ * argument for the rare check that also consults a field it cannot declare as
+ * a dependency.
+ *
+ * Every value is `unknown` on purpose. At the moment an object-level check
+ * runs, a field that parsed cleanly holds its output type but a field that
+ * failed still holds whatever the caller sent, so `Partial<Shape>` would be a
+ * lie. Anything read from here has to be guarded by hand — which is the nudge
+ * to declare it in `deps` instead.
+ */
+export type CrossFieldRaw<Shape> = {
+  readonly [P in keyof Shape]?: unknown
+}
+
+/** The runtime half. One total predicate per {@link CrossFieldKind}. */
+const CROSS_FIELD_GUARDS: {
+  readonly [Kind in CrossFieldKind]: (
+    value: unknown
+  ) => value is CrossFieldRuntimeType[Kind]
+} = {
+  // An `Invalid Date` is a `Date`, and `NaN` comparisons quietly evaluate to
+  // `false` — which would *fire* a "must fall after" message rather than skip
+  // it. Both kinds screen out their non-finite member for that reason.
+  date: (value): value is Date =>
+    value instanceof Date && !Number.isNaN(value.getTime()),
+  number: (value): value is number =>
+    typeof value === 'number' && Number.isFinite(value),
+  string: (value): value is string => typeof value === 'string',
+  array: (value): value is readonly unknown[] => Array.isArray(value),
+  boolean: (value): value is boolean => typeof value === 'boolean',
+  present: (value): value is NonNullable<unknown> =>
+    value !== undefined && value !== null,
+}
+
+/** A dependency reduced to the pair the runtime actually needs. */
+type CrossFieldDependency = readonly [key: PropertyKey, kind: CrossFieldKind]
+
+/**
+ * Collects the declared dependencies, or reports that the check must be
+ * skipped.
+ *
+ * Returns `undefined` — meaning "skip, silently" — when the value is not an
+ * object at all, or when any single dependency is absent or of the wrong
+ * runtime type. That field has already produced its own precise issue; a second
+ * object-level issue about it would only bury the first.
+ */
+function collectCrossFieldDependencies(
+  value: unknown,
+  dependencies: readonly CrossFieldDependency[]
+): Record<PropertyKey, unknown> | undefined {
+  if (typeof value !== 'object' || value === null) {
+    return undefined
+  }
+
+  const source = value as Record<PropertyKey, unknown>
+  const collected: Record<PropertyKey, unknown> = {}
+
+  for (const [key, kind] of dependencies) {
+    const candidate = source[key]
+
+    if (!CROSS_FIELD_GUARDS[kind](candidate)) {
+      return undefined
+    }
+
+    collected[key] = candidate
+  }
+
+  return collected
+}
+
+/**
+ * True when one of the declared dependencies has already recorded an issue.
+ *
+ * Issue paths at this point are relative to the object being refined, so the
+ * head of the path is the field name. A nested failure inside a dependency —
+ * `['address', 'postalCode']` for a dependency named `address` — counts, which
+ * is correct: the dependency as a whole is not trustworthy.
+ */
+function crossFieldDependencyFailed(
+  dependencies: readonly CrossFieldDependency[],
+  issues: readonly z.core.$ZodRawIssue[]
+): boolean {
+  for (const issue of issues) {
+    const head = issue.path?.[0]
+
+    if (head === undefined) {
+      continue
+    }
+
+    for (const [key] of dependencies) {
+      if (key === head) {
+        return true
+      }
+    }
+  }
+
+  return false
+}
+
+/** The message and issue placement shared by both public helpers. */
+interface CrossFieldIssueConfig {
+  /** Rendered verbatim under the input. Write it in the brand's voice. */
+  readonly error: string
+  /**
+   * Where the issue is attached, relative to the object being refined. Omit it
+   * and the issue lands on the object itself, exactly as a bare `.refine()`
+   * would place it — but a cross-field rule almost always has one field it can
+   * sensibly blame, and naming it is what lets a form highlight an input.
+   */
+  readonly path?: readonly PropertyKey[]
+}
+
+/**
+ * Which fields each built check reads, keyed by the check object itself.
+ *
+ * A `$ZodCheck` is an opaque closure once built: the `deps` array is captured
+ * by `when` and by the predicate wrapper, and nothing about it survives into a
+ * shape anything else can read. That is fine for parsing and useless for
+ * *testing*, because the one payload most likely to crash an object-level
+ * refinement is the one where two fields it dereferences are both garbage —
+ * `?startsFrom=foo&startsUntil=bar` — and a harness cannot generate that pair
+ * unless it can discover the pair.
+ *
+ * The dependency list is therefore recorded here as the check is built. A
+ * `WeakMap` rather than a property on the check, so nothing observable is added
+ * to the object zod stores in `def.checks`, and so a discarded schema is not
+ * held alive by the registry.
+ */
+const crossFieldDependencyRegistry = new WeakMap<object, readonly string[]>()
+
+/**
+ * The field names a cross-field check declared as dependencies, or `undefined`
+ * for anything that is not one of ours.
+ *
+ * Read it off the entries of a `ZodObject`'s `_zod.def.checks`:
+ *
+ * ```ts
+ * for (const check of schema._zod.def.checks ?? []) {
+ *   const deps = crossFieldDependencyKeys(check)
+ *   // deps === ['startsFrom', 'startsUntil'] for the booking-window rule
+ * }
+ * ```
+ *
+ * `scripts/fuzz-schemas.ts` uses it to aim: every unordered pair drawn from a
+ * returned list becomes a payload in which *both* fields are hostile, which is
+ * the exact shape that used to reach a refinement's body with two strings and
+ * throw `TypeError: end.getTime is not a function` out of `safeParse`.
+ */
+export function crossFieldDependencyKeys(
+  check: unknown
+): readonly string[] | undefined {
+  if (typeof check !== 'object' || check === null) {
+    return undefined
+  }
+
+  return crossFieldDependencyRegistry.get(check)
+}
+
+/**
+ * The single place a cross-field check is actually built. Both public helpers
+ * are thin, well-typed doors onto this.
+ */
+function buildCrossFieldCheck<Shape>(
+  dependencies: readonly CrossFieldDependency[],
+  config: CrossFieldIssueConfig,
+  predicate: (
+    values: Record<PropertyKey, unknown>,
+    raw: Record<PropertyKey, unknown>
+  ) => boolean
+): z.core.$ZodCheck<Shape> {
+  const check = z.superRefine<Shape>(
+    (value, ctx) => {
+      // `value` is typed as `Shape` by zod but is the *raw* input whenever a
+      // field failed — which is the entire premise of this section. Nothing
+      // below trusts that type.
+      const raw: unknown = value
+      const values = collectCrossFieldDependencies(raw, dependencies)
+
+      if (values === undefined) {
+        return
+      }
+
+      if (predicate(values, raw as Record<PropertyKey, unknown>)) {
+        return
+      }
+
+      const issue: {
+        code: 'custom'
+        message: string
+        input: unknown
+        path?: PropertyKey[]
+      } = { code: 'custom', message: config.error, input: raw }
+
+      if (config.path !== undefined) {
+        issue.path = [...config.path]
+      }
+
+      ctx.addIssue(issue)
+    },
+    {
+      when: (payload) =>
+        !crossFieldDependencyFailed(dependencies, payload.issues),
+    }
+  )
+
+  // `PropertyKey` covers symbols; only the string keys are addressable from a
+  // JSON body or a query string, which is all the harness can synthesise.
+  crossFieldDependencyRegistry.set(
+    check,
+    dependencies
+      .map(([key]) => key)
+      .filter((key): key is string => typeof key === 'string')
+  )
+
+  return check
+}
+
+/** Options for {@link crossField}. */
+export interface CrossFieldConfig<
+  Shape,
+  Key extends keyof Shape,
+  Kind extends CrossFieldKind,
+> extends CrossFieldIssueConfig {
+  /**
+   * The fields this check reads. At least one, all of them real keys of the
+   * object being refined — a typo will not compile.
+   */
+  readonly deps: readonly [Key, ...Key[]]
+  /** The runtime type every dependency must have for the check to run. */
+  readonly as: Kind
+}
+
+/**
+ * A cross-field check whose dependencies all share one runtime type.
+ *
+ * Attach it with `.check(...)`:
+ *
+ * ```ts
+ * export const bookingWindowSchema = z
+ *   .object({ startsAt: isoDateTimeSchema, endsAt: isoDateTimeSchema })
+ *   .strict()
+ *   .check(
+ *     crossField(
+ *       {
+ *         deps: ['startsAt', 'endsAt'],
+ *         as: 'date',
+ *         error: 'The service must end after it begins.',
+ *         path: ['endsAt'],
+ *       },
+ *       ({ startsAt, endsAt }) => endsAt.getTime() > startsAt.getTime()
+ *     )
+ *   )
+ * ```
+ *
+ * The predicate returns `true` when the input is **acceptable**, matching
+ * `.refine()`. It is never called unless every dependency is present and of
+ * the declared runtime type, so it needs no `=== undefined` guards and cannot
+ * throw on a bad input.
+ *
+ * Optional dependencies are handled by that same rule: a filter whose
+ * `startsFrom` was simply not supplied skips the check rather than failing it,
+ * which is the behaviour every hand-written `value.x === undefined || …` chain
+ * was reaching for.
+ */
+export function crossField<
+  Shape,
+  Key extends keyof Shape,
+  Kind extends CrossFieldKind,
+>(
+  config: CrossFieldConfig<Shape, Key, Kind>,
+  predicate: (
+    values: CrossFieldValues<Shape, Key, Kind>,
+    raw: CrossFieldRaw<Shape>
+  ) => boolean
+): z.core.$ZodCheck<Shape> {
+  const dependencies: CrossFieldDependency[] = config.deps.map((key) => [
+    key,
+    config.as,
+  ])
+
+  return buildCrossFieldCheck<Shape>(dependencies, config, (values, raw) =>
+    predicate(
+      values as CrossFieldValues<Shape, Key, Kind>,
+      raw as CrossFieldRaw<Shape>
+    )
+  )
+}
+
+/** Options for {@link crossFieldMixed}. */
+export interface CrossFieldMixedConfig<
+  Shape,
+  Kinds extends CrossFieldKindMap<Shape>,
+> extends CrossFieldIssueConfig {
+  /**
+   * The fields this check reads, each with its own runtime type. Keys are
+   * constrained to the object's own keys, so a typo will not compile.
+   */
+  readonly deps: Kinds
+}
+
+/**
+ * The heterogeneous variant: one runtime type per dependency.
+ *
+ * ```ts
+ * .check(
+ *   crossFieldMixed(
+ *     {
+ *       deps: { isBlackout: 'boolean', reason: 'string' },
+ *       error: 'Please say why this window is closed.',
+ *       path: ['reason'],
+ *     },
+ *     ({ isBlackout, reason }) => !isBlackout || reason.trim().length > 0
+ *   )
+ * )
+ * ```
+ *
+ * Everything true of {@link crossField} is true here: the predicate sees only
+ * the declared dependencies, each narrowed to its declared type, and it is not
+ * called at all unless every one of them is present and correctly typed.
+ */
+export function crossFieldMixed<Shape, Kinds extends CrossFieldKindMap<Shape>>(
+  config: CrossFieldMixedConfig<Shape, Kinds>,
+  predicate: (
+    values: CrossFieldMixedValues<Shape, Kinds>,
+    raw: CrossFieldRaw<Shape>
+  ) => boolean
+): z.core.$ZodCheck<Shape> {
+  const dependencies: CrossFieldDependency[] = []
+
+  // `Object.entries` over an unresolved generic widens the value side to
+  // `{} | null`, so the map is read through its declared shape instead.
+  const declared: Readonly<Record<string, CrossFieldKind | undefined>> =
+    config.deps
+
+  for (const key of Object.keys(declared)) {
+    const kind = declared[key]
+
+    if (kind !== undefined) {
+      dependencies.push([key, kind])
+    }
+  }
+
+  return buildCrossFieldCheck<Shape>(dependencies, config, (values, raw) =>
+    predicate(
+      values as CrossFieldMixedValues<Shape, Kinds>,
+      raw as CrossFieldRaw<Shape>
+    )
+  )
+}
+
+// =============================================================================
 // Time
 // =============================================================================
 
@@ -289,9 +843,12 @@ export type MinutesFromMidnight = z.infer<typeof minutesFromMidnightSchema>
  */
 export const endMinutesFromMidnightSchema = z
   .int({ error: 'Please choose a closing time.' })
-  .min(0, { error: 'A closing time cannot fall before midnight.' })
+  // 1, not 0: a window that closes at 00:00 has no duration. This mirrors the
+  // `CHECK ("endMinute" >= 1 AND "endMinute" <= 1440)` constraint on
+  // `ChefAvailability` — the database rejects 0, so the parser must too.
+  .min(1, { error: 'A closing time must fall after midnight.' })
   .max(MINUTES_PER_DAY, {
-    error: 'A closing time must fall between 00:00 and midnight.',
+    error: 'A closing time must fall between 00:01 and midnight.',
   })
 export type EndMinutesFromMidnight = z.infer<
   typeof endMinutesFromMidnightSchema
@@ -309,6 +866,13 @@ export type DurationMinutes = z.infer<typeof durationMinutesSchema>
 /**
  * A window of time. Deliberately exclusive: an engagement that ends at the very
  * moment it begins is not an engagement.
+ *
+ * The ordering rule goes through {@link crossField} rather than `.refine()`.
+ * `isoDateTimeSchema` is a `z.ZodPipe`, so a field that fails does *not* abort
+ * the parent object, and the plain refinement this replaced reached
+ * `end.getTime()` on the string `'bar'` — `dateRangeSchema.safeParse({ start:
+ * 'foo', end: 'bar' })` threw a `TypeError` instead of returning
+ * `{ success: false }`. See the "Cross-field refinement" section above.
  */
 export const dateRangeSchema = z
   .object({
@@ -316,10 +880,17 @@ export const dateRangeSchema = z
     end: isoDateTimeSchema,
   })
   .strict()
-  .refine(({ start, end }) => end.getTime() > start.getTime(), {
-    error: 'The end of the window must fall after its start.',
-    path: ['end'],
-  })
+  .check(
+    crossField(
+      {
+        deps: ['start', 'end'],
+        as: 'date',
+        error: 'The end of the window must fall after its start.',
+        path: ['end'],
+      },
+      ({ start, end }) => end.getTime() > start.getTime()
+    )
+  )
 export type DateRange = z.infer<typeof dateRangeSchema>
 export type DateRangeInput = z.input<typeof dateRangeSchema>
 
@@ -978,3 +1549,42 @@ export function withTemporalCoercion<Schema extends z.core.SomeType>(
  */
 export const coercedIsoDateTimeSchema = withTemporalCoercion(isoDateTimeSchema)
 export type CoercedIsoDateTime = z.infer<typeof coercedIsoDateTimeSchema>
+
+// -----------------------------------------------------------------------------
+// Stripe references (MCV-010)
+// -----------------------------------------------------------------------------
+
+/**
+ * A Stripe identifier of a known shape, bounded by the column width.
+ *
+ * `billing.ts` called this `stripeIdSchema` and `payment.ts` called it
+ * `stripeReferenceSchema`; the two bodies were byte-identical down to the
+ * over-long message, so this is the one definition of both. Neither copy was
+ * exported, so nothing needed an alias to keep the barrel's surface intact —
+ * this is a *new* public name rather than a replacement for an old one.
+ *
+ * The *patterns* stay in the domain modules. A `price_` prefix is a fact about
+ * billing and a `pi_` prefix is a fact about payments; what is shared is the
+ * envelope around them — trim, reject blank, bound by `MAX_STRIPE_ID_LENGTH`,
+ * then match.
+ *
+ * The body is the two copies unchanged, including the `.refine(...)` rather
+ * than a `.regex(...)`: the former lets each call site state its own boutique
+ * "begins with price_" message, which is the whole reason the helper takes a
+ * `shapeMessage` at all. Pass a stateless pattern — a `/g` or `/y` flag would
+ * carry `lastIndex` across parses, and neither existing caller uses one.
+ */
+export function stripeIdSchema(
+  pattern: RegExp,
+  missingMessage: string,
+  shapeMessage: string
+) {
+  return z
+    .string({ error: missingMessage })
+    .trim()
+    .min(1, { error: missingMessage })
+    .max(MAX_STRIPE_ID_LENGTH, {
+      error: 'That Stripe reference is longer than our records allow.',
+    })
+    .refine((value) => pattern.test(value), { error: shapeMessage })
+}

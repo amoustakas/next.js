@@ -41,6 +41,8 @@ import { z } from 'zod'
 import {
   MAX_SEARCH_LENGTH,
   buildUpdateSchema,
+  crossField,
+  crossFieldMixed,
   cuidSchema,
   hasUniqueValues,
   isNotInTheFuture,
@@ -316,26 +318,39 @@ export const onboardingStageAdvanceSchema = z
     occurredAt: pastMomentSchema.optional(),
   })
   .strict()
-  .refine(({ from, to }) => canAdvanceTo(from, to), {
-    error: 'A household cannot move between those two stages.',
-    path: ['to'],
-  })
-  .refine(
-    ({ to, abandonedReason }) =>
-      to !== ONBOARDING_ABANDONED_STAGE || abandonedReason !== undefined,
-    {
-      error: 'Please record why this household did not join us.',
-      path: ['abandonedReason'],
-    }
-  )
-  .refine(
-    ({ to, abandonedReason }) =>
-      to === ONBOARDING_ABANDONED_STAGE || abandonedReason === undefined,
-    {
-      error:
-        'A reason for leaving belongs only on a household that is being let go.',
-      path: ['abandonedReason'],
-    }
+  .check(
+    // `from` and `to` are declared dependencies so a stage the enum rejected
+    // produces its own issue and not also "cannot move between those two
+    // stages", which would be a second complaint about the same typo.
+    // `abandonedReason` is read from the raw object rather than declared,
+    // because both rules below turn on whether it is there at all.
+    crossFieldMixed(
+      {
+        deps: { from: 'present', to: 'present' },
+        error: 'A household cannot move between those two stages.',
+        path: ['to'],
+      },
+      ({ from, to }) => canAdvanceTo(from, to)
+    ),
+    crossFieldMixed(
+      {
+        deps: { to: 'present' },
+        error: 'Please record why this household did not join us.',
+        path: ['abandonedReason'],
+      },
+      ({ to }, raw) =>
+        to !== ONBOARDING_ABANDONED_STAGE || raw.abandonedReason !== undefined
+    ),
+    crossFieldMixed(
+      {
+        deps: { to: 'present' },
+        error:
+          'A reason for leaving belongs only on a household that is being let go.',
+        path: ['abandonedReason'],
+      },
+      ({ to }, raw) =>
+        to === ONBOARDING_ABANDONED_STAGE || raw.abandonedReason === undefined
+    )
   )
 export type OnboardingStageAdvanceInput = z.infer<
   typeof onboardingStageAdvanceSchema
@@ -520,45 +535,55 @@ export const onboardingFlowFilterSchema = paginationSchema
     lastAdvancedTo: withTemporalCoercion(isoDateTimeSchema.optional()),
     sortBy: onboardingFlowSortBySchema,
   })
-  .refine(
-    ({ minProgressPercent, maxProgressPercent }) =>
-      minProgressPercent === undefined ||
-      maxProgressPercent === undefined ||
-      minProgressPercent <= maxProgressPercent,
-    {
-      error: 'The lowest progress must not exceed the highest one.',
-      path: ['maxProgressPercent'],
-    }
-  )
-  .refine(
-    ({ startedFrom, startedTo }) =>
-      startedFrom === undefined ||
-      startedTo === undefined ||
-      startedFrom.getTime() <= startedTo.getTime(),
-    {
-      error: 'The earlier date must fall on or before the later one.',
-      path: ['startedTo'],
-    }
-  )
-  .refine(
-    ({ lastAdvancedFrom, lastAdvancedTo }) =>
-      lastAdvancedFrom === undefined ||
-      lastAdvancedTo === undefined ||
-      lastAdvancedFrom.getTime() <= lastAdvancedTo.getTime(),
-    {
-      error: 'The earlier date must fall on or before the later one.',
-      path: ['lastAdvancedTo'],
-    }
-  )
-  .refine(
-    ({ completedOnly, abandonedOnly, inProgressOnly }) =>
-      [completedOnly, abandonedOnly, inProgressOnly].filter(Boolean).length <=
-      1,
-    {
-      error:
-        'A journey is either under way, completed, or abandoned — please choose one.',
-      path: ['inProgressOnly'],
-    }
+  .check(
+    // The two date windows are the crash sites: both bounds are
+    // `withTemporalCoercion(isoDateTimeSchema.optional())`, a `z.ZodPipe`, so
+    // `?startedFrom=foo` left the raw string on the object and the old
+    // `=== undefined ||` chain walked straight into `.getTime()` on it. The
+    // other two rules are guarded for the same reason in reverse: a rejected
+    // bound or flag should produce its own issue and no second one.
+    crossField(
+      {
+        deps: ['minProgressPercent', 'maxProgressPercent'],
+        as: 'number',
+        error: 'The lowest progress must not exceed the highest one.',
+        path: ['maxProgressPercent'],
+      },
+      ({ minProgressPercent, maxProgressPercent }) =>
+        minProgressPercent <= maxProgressPercent
+    ),
+    crossField(
+      {
+        deps: ['startedFrom', 'startedTo'],
+        as: 'date',
+        error: 'The earlier date must fall on or before the later one.',
+        path: ['startedTo'],
+      },
+      ({ startedFrom, startedTo }) =>
+        startedFrom.getTime() <= startedTo.getTime()
+    ),
+    crossField(
+      {
+        deps: ['lastAdvancedFrom', 'lastAdvancedTo'],
+        as: 'date',
+        error: 'The earlier date must fall on or before the later one.',
+        path: ['lastAdvancedTo'],
+      },
+      ({ lastAdvancedFrom, lastAdvancedTo }) =>
+        lastAdvancedFrom.getTime() <= lastAdvancedTo.getTime()
+    ),
+    crossField(
+      {
+        deps: ['completedOnly', 'abandonedOnly', 'inProgressOnly'],
+        as: 'boolean',
+        error:
+          'A journey is either under way, completed, or abandoned — please choose one.',
+        path: ['inProgressOnly'],
+      },
+      ({ completedOnly, abandonedOnly, inProgressOnly }) =>
+        [completedOnly, abandonedOnly, inProgressOnly].filter(Boolean).length <=
+        1
+    )
   )
 export type OnboardingFlowFilterInput = z.infer<
   typeof onboardingFlowFilterSchema

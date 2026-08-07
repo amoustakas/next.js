@@ -22,6 +22,8 @@ import { z } from 'zod'
 import {
   addressSchema,
   buildUpdateSchema,
+  crossField,
+  crossFieldMixed,
   cuidSchema,
   currencySchema,
   durationMinutesSchema,
@@ -100,6 +102,26 @@ export const MAX_REFERRAL_CODE_LENGTH = 40
 
 /** Referral codes are typed by hand, so we accept letters, digits, and hyphens. */
 const REFERRAL_CODE_PATTERN = /^[A-Z0-9][A-Z0-9-]*$/
+
+/**
+ * The epoch milliseconds of a value that really is a usable `Date`, or
+ * `undefined` for anything else.
+ *
+ * The array-level rules on `preferredDates` go through this instead of calling
+ * `date.getTime()` directly. In zod 4 an element that fails a `z.ZodPipe` — and
+ * `isoDateTimeSchema` is one — does not abort its array, so those rules can be
+ * handed the caller's raw string. Skipping such an element loses nothing: it
+ * has already produced its own, more precise issue.
+ */
+function parsedInstant(value: unknown): number | undefined {
+  if (!(value instanceof Date)) {
+    return undefined
+  }
+
+  const instant = value.getTime()
+
+  return Number.isNaN(instant) ? undefined : instant
+}
 
 // =============================================================================
 // Free-text lists (MCV-004 / MCV-005)
@@ -185,13 +207,38 @@ function householdAddsUp(value: {
 const HOUSEHOLD_SUM_ERROR =
   'The adults and children should add up to the size of the household.'
 
+/**
+ * ## Why the cross-field rules in this file are attached with `.check(…)`
+ *
+ * A zod 4 object-level `.refine()` still runs when one of the object's own
+ * fields has already failed, and it receives that field's *raw* value. Every
+ * date here is an `isoDateTimeSchema`, which is a `z.ZodPipe` and therefore
+ * does not abort its parent object on failure — so
+ * `clientIntakeUpdateSchema.safeParse({ clientProfileId: …, submittedAt: 'foo' })`
+ * threw `TypeError: value.submittedAt.getTime is not a function` rather than
+ * returning `{ success: false }`.
+ *
+ * `crossField` / `crossFieldMixed` (see `common.ts`) declare which fields a rule
+ * reads, skip the rule when one of them has already produced an issue, and hand
+ * the predicate values that are guaranteed present and of the declared runtime
+ * type. Rules that only test *presence* — "a follow-up outcome needs a
+ * follow-up date" — stay plain `.refine()`s: they must fire precisely when a
+ * field is missing, which is the one thing a declared dependency suppresses.
+ */
 export const intakeHouseholdStepSchema = z
   .object(householdStepShape)
   .strict()
-  .refine(householdAddsUp, {
-    error: HOUSEHOLD_SUM_ERROR,
-    path: ['householdSize'],
-  })
+  .check(
+    crossField(
+      {
+        deps: ['householdSize', 'adults', 'children'],
+        as: 'number',
+        error: HOUSEHOLD_SUM_ERROR,
+        path: ['householdSize'],
+      },
+      (values) => householdAddsUp(values)
+    )
+  )
 export type IntakeHouseholdStep = z.infer<typeof intakeHouseholdStepSchema>
 export type IntakeHouseholdStepInput = z.input<typeof intakeHouseholdStepSchema>
 
@@ -311,10 +358,16 @@ const PETS_NOTE_ERROR =
 export const intakeKitchenStepSchema = z
   .object(kitchenStepShape)
   .strict()
-  .refine(petsNoteIsConsistent, {
-    error: PETS_NOTE_ERROR,
-    path: ['hasPets'],
-  })
+  .check(
+    crossFieldMixed(
+      {
+        deps: { hasPets: 'boolean', petsNote: 'string' },
+        error: PETS_NOTE_ERROR,
+        path: ['hasPets'],
+      },
+      (values) => petsNoteIsConsistent(values)
+    )
+  )
 export type IntakeKitchenStep = z.infer<typeof intakeKitchenStepSchema>
 export type IntakeKitchenStepInput = z.input<typeof intakeKitchenStepSchema>
 
@@ -504,14 +557,25 @@ const clientIntakeShape = {
 export const clientIntakeSchema = z
   .object(clientIntakeShape)
   .strict()
-  .refine(householdAddsUp, {
-    error: HOUSEHOLD_SUM_ERROR,
-    path: ['householdSize'],
-  })
-  .refine(petsNoteIsConsistent, {
-    error: PETS_NOTE_ERROR,
-    path: ['hasPets'],
-  })
+  .check(
+    crossField(
+      {
+        deps: ['householdSize', 'adults', 'children'],
+        as: 'number',
+        error: HOUSEHOLD_SUM_ERROR,
+        path: ['householdSize'],
+      },
+      (values) => householdAddsUp(values)
+    ),
+    crossFieldMixed(
+      {
+        deps: { hasPets: 'boolean', petsNote: 'string' },
+        error: PETS_NOTE_ERROR,
+        path: ['hasPets'],
+      },
+      (values) => petsNoteIsConsistent(values)
+    )
+  )
 export type ClientIntake = z.infer<typeof clientIntakeSchema>
 export type ClientIntakeInput = z.input<typeof clientIntakeSchema>
 
@@ -529,22 +593,33 @@ export const clientIntakeCreateSchema = z
     ...clientIntakeShape,
   })
   .strict()
-  .refine(householdAddsUp, {
-    error: HOUSEHOLD_SUM_ERROR,
-    path: ['householdSize'],
-  })
-  .refine(petsNoteIsConsistent, {
-    error: PETS_NOTE_ERROR,
-    path: ['hasPets'],
-  })
-  .refine(
-    (value) =>
-      value.submittedAt === undefined ||
-      value.submittedAt.getTime() <= Date.now(),
-    {
-      error: 'An intake form cannot have been submitted in the future.',
-      path: ['submittedAt'],
-    }
+  .check(
+    crossField(
+      {
+        deps: ['householdSize', 'adults', 'children'],
+        as: 'number',
+        error: HOUSEHOLD_SUM_ERROR,
+        path: ['householdSize'],
+      },
+      (values) => householdAddsUp(values)
+    ),
+    crossFieldMixed(
+      {
+        deps: { hasPets: 'boolean', petsNote: 'string' },
+        error: PETS_NOTE_ERROR,
+        path: ['hasPets'],
+      },
+      (values) => petsNoteIsConsistent(values)
+    ),
+    crossField(
+      {
+        deps: ['submittedAt'],
+        as: 'date',
+        error: 'An intake form cannot have been submitted in the future.',
+        path: ['submittedAt'],
+      },
+      ({ submittedAt }) => submittedAt.getTime() <= Date.now()
+    )
   )
 export type ClientIntakeCreateInput = z.infer<typeof clientIntakeCreateSchema>
 export type ClientIntakeCreateRawInput = z.input<
@@ -576,45 +651,39 @@ export const clientIntakeUpdateSchema = buildUpdateSchema(
   { ...clientIntakeShape, submittedAt: isoDateTimeSchema },
   { requireKeys: { clientProfileId: cuidSchema } }
 )
-  .refine(
-    (value) => {
-      if (
-        value.householdSize === undefined ||
-        value.adults === undefined ||
-        value.children === undefined
-      ) {
-        return true
-      }
-
-      return householdAddsUp({
-        householdSize: value.householdSize,
-        adults: value.adults,
-        children: value.children,
-      })
-    },
-    { error: HOUSEHOLD_SUM_ERROR, path: ['householdSize'] }
-  )
-  .refine(
-    (value) => {
-      if (value.hasPets === undefined) {
-        return true
-      }
-
-      return petsNoteIsConsistent({
-        hasPets: value.hasPets,
-        petsNote: value.petsNote,
-      })
-    },
-    { error: PETS_NOTE_ERROR, path: ['hasPets'] }
-  )
-  .refine(
-    (value) =>
-      value.submittedAt === undefined ||
-      value.submittedAt.getTime() <= Date.now(),
-    {
-      error: 'An intake form cannot have been submitted in the future.',
-      path: ['submittedAt'],
-    }
+  /**
+   * The hand-written `=== undefined` chains these three rules used to open with
+   * are gone: `crossField` does not call a predicate until every declared
+   * dependency is present, so an edit that names only some of the fields skips
+   * the rule instead of having to opt out of it.
+   */
+  .check(
+    crossField(
+      {
+        deps: ['householdSize', 'adults', 'children'],
+        as: 'number',
+        error: HOUSEHOLD_SUM_ERROR,
+        path: ['householdSize'],
+      },
+      (values) => householdAddsUp(values)
+    ),
+    crossFieldMixed(
+      {
+        deps: { hasPets: 'boolean', petsNote: 'string' },
+        error: PETS_NOTE_ERROR,
+        path: ['hasPets'],
+      },
+      (values) => petsNoteIsConsistent(values)
+    ),
+    crossField(
+      {
+        deps: ['submittedAt'],
+        as: 'date',
+        error: 'An intake form cannot have been submitted in the future.',
+        path: ['submittedAt'],
+      },
+      ({ submittedAt }) => submittedAt.getTime() <= Date.now()
+    )
   )
 export type ClientIntakeUpdateInput = z.infer<typeof clientIntakeUpdateSchema>
 export type ClientIntakeUpdateRawInput = z.input<
@@ -759,17 +828,44 @@ export const consultationRequestSchema = z
       .max(MAX_PREFERRED_CONSULTATION_DATES, {
         error: `Please offer up to ${MAX_PREFERRED_CONSULTATION_DATES} times and we will confirm one of them.`,
       })
-      .refine((dates) => dates.every((date) => date.getTime() > Date.now()), {
-        error: 'Every time you offer must fall in the future.',
-      })
+      /**
+       * Both rules below read each element through {@link parsedInstant}
+       * rather than calling `date.getTime()` directly.
+       *
+       * `isoDateTimeSchema` is a `z.ZodPipe`, and in zod 4 a failing pipe
+       * *element* does not abort its array the way a failing plain schema does
+       * — the array's own checks run anyway, holding whatever the caller sent.
+       * `safeParse({ …, preferredDates: ['foo'] })` therefore threw
+       * `TypeError: date.getTime is not a function` instead of reporting the
+       * malformed date. Elements that did not survive parsing are skipped here;
+       * each has already produced its own, more precise issue.
+       */
+      .refine(
+        (dates) =>
+          dates.every((date) => {
+            const instant = parsedInstant(date)
+            return instant === undefined || instant > Date.now()
+          }),
+        {
+          error: 'Every time you offer must fall in the future.',
+        }
+      )
       /**
        * Mapped to epoch milliseconds first: `hasUniqueValues` compares by
        * identity, and two `Date` objects for the same instant are not the same
        * object. This is the pattern `common.ts` documents for structural values.
        */
-      .refine((dates) => hasUniqueValues(dates.map((date) => date.getTime())), {
-        error: 'Please offer times that differ from one another.',
-      }),
+      .refine(
+        (dates) =>
+          hasUniqueValues(
+            dates
+              .map((date) => parsedInstant(date))
+              .filter((instant): instant is number => instant !== undefined)
+          ),
+        {
+          error: 'Please offer times that differ from one another.',
+        }
+      ),
     durationMinutes: durationMinutesSchema
       .min(MIN_CONSULTATION_MINUTES, {
         error: 'A consultation needs at least a quarter of an hour.',
@@ -930,14 +1026,27 @@ const CONVERSION_OUTCOME_ERROR =
 export const consultationInterviewSchema = z
   .object(consultationInterviewShape)
   .strict()
-  .refine(completionFollowsStart, {
-    error: COMPLETION_AFTER_START_ERROR,
-    path: ['completedAt'],
-  })
-  .refine(followUpFollowsSchedule, {
-    error: FOLLOW_UP_AFTER_SCHEDULE_ERROR,
-    path: ['followUpAt'],
-  })
+  .check(
+    crossField(
+      {
+        deps: ['startedAt', 'completedAt'],
+        as: 'date',
+        error: COMPLETION_AFTER_START_ERROR,
+        path: ['completedAt'],
+      },
+      (values) => completionFollowsStart(values)
+    ),
+    crossField(
+      {
+        deps: ['scheduledFor', 'followUpAt'],
+        as: 'date',
+        error: FOLLOW_UP_AFTER_SCHEDULE_ERROR,
+        path: ['followUpAt'],
+      },
+      (values) => followUpFollowsSchedule(values)
+    )
+  )
+  /** Presence-only rules: nothing is dereferenced, and both must fire on absence. */
   .refine(
     (value) =>
       value.outcome !== 'FOLLOW_UP_REQUIRED' || value.followUpAt !== undefined,
@@ -982,14 +1091,27 @@ export const consultationInterviewUpdateSchema = buildUpdateSchema(
   consultationInterviewEditableShape,
   { requireKeys: { consultationInterviewId: cuidSchema } }
 )
-  .refine(completionFollowsStart, {
-    error: COMPLETION_AFTER_START_ERROR,
-    path: ['completedAt'],
-  })
-  .refine(followUpFollowsSchedule, {
-    error: FOLLOW_UP_AFTER_SCHEDULE_ERROR,
-    path: ['followUpAt'],
-  })
+  .check(
+    crossField(
+      {
+        deps: ['startedAt', 'completedAt'],
+        as: 'date',
+        error: COMPLETION_AFTER_START_ERROR,
+        path: ['completedAt'],
+      },
+      (values) => completionFollowsStart(values)
+    ),
+    crossField(
+      {
+        deps: ['scheduledFor', 'followUpAt'],
+        as: 'date',
+        error: FOLLOW_UP_AFTER_SCHEDULE_ERROR,
+        path: ['followUpAt'],
+      },
+      (values) => followUpFollowsSchedule(values)
+    )
+  )
+  /** Presence-only rules: nothing is dereferenced, and both must fire on absence. */
   .refine(
     (value) =>
       value.outcome !== 'FOLLOW_UP_REQUIRED' || value.followUpAt !== undefined,
@@ -1116,23 +1238,27 @@ export const prospectConversionSchema = z
       .optional(),
   })
   .strict()
-  .refine(
-    (value) =>
-      value.convertedAt === undefined ||
-      value.convertedAt.getTime() <= Date.now(),
-    {
-      error: 'A household cannot have joined us at a moment still to come.',
-      path: ['convertedAt'],
-    }
+  .check(
+    crossField(
+      {
+        deps: ['convertedAt'],
+        as: 'date',
+        error: 'A household cannot have joined us at a moment still to come.',
+        path: ['convertedAt'],
+      },
+      ({ convertedAt }) => convertedAt.getTime() <= Date.now()
+    ),
+    crossField(
+      {
+        deps: ['followUpAt'],
+        as: 'date',
+        error: 'A follow-up must be arranged for a moment still ahead of us.',
+        path: ['followUpAt'],
+      },
+      ({ followUpAt }) => followUpAt.getTime() > Date.now()
+    )
   )
-  .refine(
-    (value) =>
-      value.followUpAt === undefined || value.followUpAt.getTime() > Date.now(),
-    {
-      error: 'A follow-up must be arranged for a moment still ahead of us.',
-      path: ['followUpAt'],
-    }
-  )
+  /** Presence-only from here down; see the note above `intakeHouseholdStepSchema`. */
   .refine(
     (value) =>
       value.outcome !== 'FOLLOW_UP_REQUIRED' || value.followUpAt !== undefined,

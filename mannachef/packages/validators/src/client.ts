@@ -47,6 +47,7 @@ import { z } from 'zod'
 
 import {
   buildUpdateSchema,
+  crossFieldMixed,
   cuidSchema,
   optionalProse,
   phoneSchema,
@@ -178,14 +179,22 @@ export const clientProfileCreateSchema = z
     ...clientProfileWritableShape,
   })
   .strict()
-  .refine(
-    (value) =>
-      !clientSourceRequiresDetail(value.source) || value.sourceDetail != null,
-    {
-      error:
-        'Please say a little more — who referred them, which partner, or what "other" means.',
-      path: ['sourceDetail'],
-    }
+  .check(
+    // `source` is the dependency, so a value the enum rejected produces that
+    // one issue rather than also being asked for a detail it cannot need.
+    // `sourceDetail` is read from the raw object because its absence is the
+    // thing being caught, and a declared dependency that is absent would skip
+    // the check instead of firing it.
+    crossFieldMixed(
+      {
+        deps: { source: 'present' },
+        error:
+          'Please say a little more — who referred them, which partner, or what "other" means.',
+        path: ['sourceDetail'],
+      },
+      ({ source }, raw) =>
+        !clientSourceRequiresDetail(source) || raw.sourceDetail != null
+    )
   )
 export type ClientProfileCreateInput = z.infer<typeof clientProfileCreateSchema>
 export type ClientProfileCreateRawInput = z.input<

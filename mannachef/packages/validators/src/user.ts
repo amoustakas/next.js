@@ -31,11 +31,29 @@
  *  5. `email`, `emailVerified`, `lastLoginAt` and `deactivatedAt` are not
  *     writable through these schemas. Email identity belongs to the adapter and
  *     its verification flow; changing it through a profile form would silently
- *     re-key the account.
+ *     re-key the account. `deactivatedAt` is a *derived* stamp — see
+ *     {@link userActivationSchema}, which is the schema that causes it to be
+ *     written without accepting it from the caller.
  *  6. `userFilterSchema` is reachable over GET, so its bounds coerce. The
  *     profile update and the role assignment stay strict — they are request
  *     bodies, and a role arriving as something other than a `Role` is a bug in
  *     the caller rather than an artefact of the transport.
+ *
+ * ## `User.isActive` (MCV-010)
+ *
+ * The MCV-005 pass added the role assignment and the profile update and then
+ * stopped, which left `User.isActive` in an odd position: read everywhere and
+ * written nowhere. `sessionUserSchema` in `@mannachef/api-contract` publishes
+ * it to every client, `userFilterSchema` below narrows by it through
+ * `activeOnly`, `@@index([role, isActive])` exists to make that narrowing fast
+ * — and no schema in this package would validate a change to it. It was not in
+ * rule 4's or rule 5's exclusion list either, so the gap read as an oversight
+ * rather than a decision, which is what it was.
+ *
+ * {@link userActivationSchema} closes it. Deactivation is the second of the two
+ * admin-only mutations on an account, alongside the role change, and it is
+ * treated the same way: a target, the new state, and a reason for the audit
+ * trail that is required and required to say something.
  */
 
 import { z } from 'zod'
@@ -44,6 +62,8 @@ import { timeZoneSchema } from './booking'
 import {
   MAX_SEARCH_LENGTH,
   buildUpdateSchema,
+  crossField,
+  crossFieldMixed,
   cuidSchema,
   hasUniqueValues,
   isoDateTimeSchema,
@@ -69,11 +89,28 @@ export const MAX_LOCALE_LENGTH = 12
 /** Where the whole platform reads until we publish a second language. */
 export const DEFAULT_LOCALE = 'en-CA'
 
-/** A role change is never recorded without an explanation this long at least. */
-export const MIN_ROLE_CHANGE_REASON_LENGTH = 8
+/**
+ * An admin-only change to somebody's account is never recorded without an
+ * explanation this long at least.
+ *
+ * There are two such changes — the role assignment and the activation toggle —
+ * and they write the same kind of artefact to the same audit trail, so they
+ * share one pair of bounds rather than each declaring their own. That is the
+ * MCV-010 rule applied prospectively: the second copy is never written.
+ */
+export const MIN_ACCOUNT_AUDIT_REASON_LENGTH = 8
 
-/** Generous ceiling for the audit-trail reason on a role change. */
-export const MAX_ROLE_CHANGE_REASON_LENGTH = 500
+/** Generous ceiling for the audit-trail reason on an admin-only account change. */
+export const MAX_ACCOUNT_AUDIT_REASON_LENGTH = 500
+
+/**
+ * The role-change spellings, kept because they are part of the published
+ * surface of `@mannachef/validators` and removing an exported name is a
+ * breaking change dressed up as a tidy-up. They are the same two numbers, by
+ * construction rather than by coincidence.
+ */
+export const MIN_ROLE_CHANGE_REASON_LENGTH = MIN_ACCOUNT_AUDIT_REASON_LENGTH
+export const MAX_ROLE_CHANGE_REASON_LENGTH = MAX_ACCOUNT_AUDIT_REASON_LENGTH
 
 /** How many roles one query may narrow by — there are only four. */
 const ROLE_COUNT = 4
@@ -121,6 +158,27 @@ export const localeSchema = z
   })
   .default(DEFAULT_LOCALE)
 export type Locale = z.infer<typeof localeSchema>
+
+/**
+ * The audit-trail reason attached to an admin-only account change.
+ *
+ * Required, trimmed, and required to say something: `MIN_ACCOUNT_AUDIT_REASON_LENGTH`
+ * is checked *after* the trim, so eight spaces is not an explanation. Each call
+ * site supplies its own copy because "why is this access level changing" and
+ * "why is this account being closed" are different questions, and a shared
+ * message would have to be vague enough to answer neither well.
+ */
+function accountAuditReasonSchema(messages: {
+  readonly missing: string
+  readonly tooShort: string
+  readonly tooLong: string
+}) {
+  return z
+    .string({ error: messages.missing })
+    .trim()
+    .min(MIN_ACCOUNT_AUDIT_REASON_LENGTH, { error: messages.tooShort })
+    .max(MAX_ACCOUNT_AUDIT_REASON_LENGTH, { error: messages.tooLong })
+}
 
 // =============================================================================
 // 1. The profile a person edits about themselves
@@ -261,16 +319,12 @@ export const roleAssignmentSchema = z
     /** The role it is changing to. */
     role: roleSchema,
     /** Written to the audit trail verbatim. */
-    reason: z
-      .string({ error: 'Please record why this access level is changing.' })
-      .trim()
-      .min(MIN_ROLE_CHANGE_REASON_LENGTH, {
-        error:
-          'Please record why this access level is changing — a few words at least.',
-      })
-      .max(MAX_ROLE_CHANGE_REASON_LENGTH, {
-        error: 'Please keep the reason to 500 characters or fewer.',
-      }),
+    reason: accountAuditReasonSchema({
+      missing: 'Please record why this access level is changing.',
+      tooShort:
+        'Please record why this access level is changing — a few words at least.',
+      tooLong: 'Please keep the reason to 500 characters or fewer.',
+    }),
     /**
      * Who is making the change. Optional on the wire; the action prefers the
      * session and passes these only so the refusal can be rendered client-side.
@@ -279,16 +333,144 @@ export const roleAssignmentSchema = z
     actorRole: roleSchema.optional(),
   })
   .strict()
-  .refine((value) => !isSelfRoleEscalation(value), {
-    error:
-      'You cannot raise your own access level — ask someone above you to make this change.',
-    path: ['role'],
-  })
+  .check(
+    // All four fields the predicate reads are declared dependencies, which
+    // reproduces its own opening guard exactly: `isSelfRoleEscalation` returns
+    // `false` — no escalation — the moment either actor field is absent, and a
+    // declared dependency that is absent skips the check. What the guard adds
+    // is the case the hand-written clause could not cover: an `actorRole` the
+    // enum rejected now produces that one issue rather than being compared
+    // against `ROLE_HIERARCHY` as though it were a role.
+    crossFieldMixed(
+      {
+        deps: {
+          userId: 'string',
+          role: 'present',
+          actorUserId: 'string',
+          actorRole: 'present',
+        },
+        error:
+          'You cannot raise your own access level — ask someone above you to make this change.',
+        path: ['role'],
+      },
+      (value) => !isSelfRoleEscalation(value)
+    )
+  )
 export type RoleAssignmentInput = z.infer<typeof roleAssignmentSchema>
 export type RoleAssignmentRawInput = z.input<typeof roleAssignmentSchema>
 
 // =============================================================================
-// 3. Filtering
+// 3. Activation (MCV-010)
+// =============================================================================
+
+/**
+ * True when this payload is somebody closing their own account.
+ *
+ * As with {@link isSelfRoleEscalation}, the actor is optional on the wire and
+ * the trustworthy source is the session — an action that has resolved one
+ * should pass its own id rather than believe this field. When it *is* supplied
+ * the schema uses it, so the refusal renders under the control instead of
+ * arriving as a server error after the click.
+ *
+ * Reactivating yourself is not this case and is not blocked: it is unreachable
+ * anyway, because a deactivated account cannot hold a session to act with.
+ */
+export function isSelfDeactivation(input: {
+  readonly userId: string
+  readonly isActive: boolean
+  readonly actorUserId?: string | undefined
+}): boolean {
+  if (input.actorUserId === undefined) {
+    return false
+  }
+
+  return !input.isActive && input.actorUserId === input.userId
+}
+
+/**
+ * Deactivating an account, or bringing one back.
+ *
+ * This is the schema `User.isActive` did not have. The column is read by
+ * `sessionUserSchema` in `@mannachef/api-contract`, narrowed by `activeOnly`
+ * below, and indexed by `@@index([role, isActive])`; until now nothing in this
+ * package validated a write to it.
+ *
+ * ## Why it is not part of `userProfileUpdateSchema`
+ *
+ * Because it is not a profile field. Everything in
+ * {@link userProfileWritableShape} is something a person may change about their
+ * own account, and the action permits the write when the id is the caller's own
+ * *or* the caller is at least `ADMIN`. Deactivation admits only the second
+ * half of that rule, and folding it in would have widened a self-service form
+ * into an account-closure control. Keeping it separate also keeps the reason
+ * mandatory, which a `.partial()` update shape could not do.
+ *
+ * ## Why `isActive` carries no default
+ *
+ * A default here would decide the one thing the payload exists to state, and
+ * would let `{ userId, reason }` parse into a deactivation nobody asked for.
+ * The caller says which way the switch is moving. This is the same rule MCV-010
+ * applied to `reverseLedgerEntry` in `./referral`.
+ *
+ * ## What the action does with it
+ *
+ * `deactivatedAt` is not accepted from the caller — rule 5 at the head of this
+ * file. The action stamps it `now()` when `isActive` is `false` and clears it to
+ * `null` when `isActive` is `true`, so the column can never disagree with the
+ * flag. `reason` goes to the audit trail, not to a `User` column.
+ *
+ * The action still performs the checks a schema cannot: that the caller is at
+ * least `ADMIN`, and — per `mannachef/CONTRACT.md` §5 — that they are not
+ * closing an account ranked above their own, which is {@link canAssignRole}'s
+ * rule read in the other direction.
+ */
+export const userActivationSchema = z
+  .object({
+    /** The account whose access is being withdrawn or restored. */
+    userId: cuidSchema,
+    /** `false` closes the account; `true` reopens it. Never defaulted. */
+    isActive: z.boolean({
+      error: 'Please say whether this account should be active.',
+    }),
+    /** Written to the audit trail verbatim. */
+    reason: accountAuditReasonSchema({
+      missing: 'Please record why this account is being closed or reopened.',
+      tooShort:
+        'Please record why this account is being closed or reopened — a few words at least.',
+      tooLong: 'Please keep the reason to 500 characters or fewer.',
+    }),
+    /**
+     * Who is making the change. Optional on the wire; the action prefers the
+     * session and passes this only so the refusal can be rendered client-side.
+     */
+    actorUserId: cuidSchema.optional(),
+  })
+  .strict()
+  .check(
+    // Both fields the predicate reads beyond `isActive` are declared, so the
+    // check is skipped entirely when `actorUserId` is absent — which reproduces
+    // `isSelfDeactivation`'s own opening guard — and when either id failed
+    // `cuidSchema`, which is the case a hand-written clause would have compared
+    // as though it were an id.
+    crossFieldMixed(
+      {
+        deps: {
+          userId: 'string',
+          isActive: 'boolean',
+          actorUserId: 'string',
+        },
+        error:
+          'You cannot close your own account — ask another administrator to do it.',
+        path: ['userId'],
+      },
+      (value) => !isSelfDeactivation(value)
+    )
+  )
+export type UserActivationInput = z.infer<typeof userActivationSchema>
+export type UserActivationRawInput = z.input<typeof userActivationSchema>
+
+// =============================================================================
+// 4. Filtering
 // =============================================================================
 
 /** How the account list is ordered; direction comes from `sortDirection`. */
@@ -350,35 +532,46 @@ export const userFilterSchema = paginationSchema
     lastLoginTo: withTemporalCoercion(isoDateTimeSchema.optional()),
     sortBy: userSortBySchema,
   })
-  .refine(
-    ({ createdFrom, createdTo }) =>
-      createdFrom === undefined ||
-      createdTo === undefined ||
-      createdFrom.getTime() <= createdTo.getTime(),
-    {
-      error: 'The earlier date must fall on or before the later one.',
-      path: ['createdTo'],
-    }
-  )
-  .refine(
-    ({ lastLoginFrom, lastLoginTo }) =>
-      lastLoginFrom === undefined ||
-      lastLoginTo === undefined ||
-      lastLoginFrom.getTime() <= lastLoginTo.getTime(),
-    {
-      error: 'The earlier date must fall on or before the later one.',
-      path: ['lastLoginTo'],
-    }
-  )
-  .refine(
-    ({ neverSignedInOnly, lastLoginFrom, lastLoginTo }) =>
-      !neverSignedInOnly ||
-      (lastLoginFrom === undefined && lastLoginTo === undefined),
-    {
-      error:
-        'An account that has never signed in has no sign-in date to narrow by.',
-      path: ['neverSignedInOnly'],
-    }
+  .check(
+    // Both date windows are the crash site: every bound is
+    // `withTemporalCoercion(isoDateTimeSchema.optional())`, a `z.ZodPipe`,
+    // whose failure does not abort the object's checks, so `?createdFrom=foo`
+    // reached `.getTime()` on the raw string. The third rule keeps reading the
+    // two sign-in bounds from the raw object, because what it asks of them is
+    // whether they were supplied at all — a malformed bound was supplied, and
+    // still contradicts `neverSignedInOnly`.
+    crossField(
+      {
+        deps: ['createdFrom', 'createdTo'],
+        as: 'date',
+        error: 'The earlier date must fall on or before the later one.',
+        path: ['createdTo'],
+      },
+      ({ createdFrom, createdTo }) =>
+        createdFrom.getTime() <= createdTo.getTime()
+    ),
+    crossField(
+      {
+        deps: ['lastLoginFrom', 'lastLoginTo'],
+        as: 'date',
+        error: 'The earlier date must fall on or before the later one.',
+        path: ['lastLoginTo'],
+      },
+      ({ lastLoginFrom, lastLoginTo }) =>
+        lastLoginFrom.getTime() <= lastLoginTo.getTime()
+    ),
+    crossField(
+      {
+        deps: ['neverSignedInOnly'],
+        as: 'boolean',
+        error:
+          'An account that has never signed in has no sign-in date to narrow by.',
+        path: ['neverSignedInOnly'],
+      },
+      ({ neverSignedInOnly }, raw) =>
+        !neverSignedInOnly ||
+        (raw.lastLoginFrom === undefined && raw.lastLoginTo === undefined)
+    )
   )
 export type UserFilterInput = z.infer<typeof userFilterSchema>
 export type UserFilterRawInput = z.input<typeof userFilterSchema>

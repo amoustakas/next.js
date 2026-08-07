@@ -53,6 +53,8 @@ import {
   MAX_SEARCH_LENGTH,
   buildUpdateSchema,
   countryCodeSchema,
+  crossField,
+  crossFieldMixed,
   cuidSchema,
   currencySchema,
   freeTextList,
@@ -256,16 +258,21 @@ export const staffProfileCreateSchema = z
     ...staffProfileWritableShape,
   })
   .strict()
-  .refine(
-    (value) =>
-      value.baseCountry == null ||
-      value.baseCity != null ||
-      value.baseRegion != null,
-    {
-      error:
-        'A country on its own is not a base — please add a city or region.',
-      path: ['baseCity'],
-    }
+  .check(
+    // `baseCountry` is the dependency: the rule only has anything to say once a
+    // country has been given, and a `baseCountry` the ISO 3166 check rejected
+    // should produce that one issue rather than also this one. `baseCity` and
+    // `baseRegion` are read from the raw object because it is their absence the
+    // rule is about, and a declared dependency that is absent skips the check.
+    crossFieldMixed(
+      {
+        deps: { baseCountry: 'present' },
+        error:
+          'A country on its own is not a base — please add a city or region.',
+        path: ['baseCity'],
+      },
+      (_country, raw) => raw.baseCity != null || raw.baseRegion != null
+    )
   )
 export type StaffProfileCreateInput = z.infer<typeof staffProfileCreateSchema>
 export type StaffProfileCreateRawInput = z.input<
@@ -400,21 +407,35 @@ const staffSharedFilterShape = {
   maxServiceRadiusKm: withNumericCoercion(serviceRadiusKmSchema.optional()),
 } as const
 
-/** True when a rate window is either open-ended or the right way round. */
-function hasOrderedRateWindow(value: {
-  minHourlyRateCents?: number | undefined
-  maxHourlyRateCents?: number | undefined
-}): boolean {
-  return (
-    value.minHourlyRateCents === undefined ||
-    value.maxHourlyRateCents === undefined ||
-    value.minHourlyRateCents <= value.maxHourlyRateCents
-  )
-}
-
 /** The message both filters attach to an inverted rate window. */
 const INVERTED_RATE_WINDOW_MESSAGE =
   'The lowest rate must not exceed the highest one.'
+
+/**
+ * The rate window, shared by the public directory and the admin roster.
+ *
+ * Attached with `.check(crossField(...))` rather than `.refine(...)`. Both
+ * bounds are `withNumericCoercion(hourlyRateCentsSchema.optional())`, which is
+ * a `z.ZodPipe`: a bound that fails does not abort the object's own checks, so
+ * `?minHourlyRateCents=foo` used to reach the comparison holding a raw string
+ * and quietly report an inverted window on top of the real error. The guard
+ * makes the rule total — an absent *or* malformed bound skips it, which is what
+ * the `=== undefined ||` chain this replaced was reaching for.
+ */
+const ORDERED_RATE_WINDOW_CONFIG = {
+  deps: ['minHourlyRateCents', 'maxHourlyRateCents'],
+  as: 'number',
+  error: INVERTED_RATE_WINDOW_MESSAGE,
+  path: ['maxHourlyRateCents'],
+} as const
+
+/** The predicate half of {@link ORDERED_RATE_WINDOW_CONFIG}. */
+function hasOrderedRateWindow(value: {
+  minHourlyRateCents: number
+  maxHourlyRateCents: number
+}): boolean {
+  return value.minHourlyRateCents <= value.maxHourlyRateCents
+}
 
 // =============================================================================
 // 3. The public chef directory
@@ -449,10 +470,11 @@ export const staffDirectoryFilterSchema = paginationSchema
     ),
     sortBy: staffDirectorySortBySchema,
   })
-  .refine(hasOrderedRateWindow, {
-    error: INVERTED_RATE_WINDOW_MESSAGE,
-    path: ['maxHourlyRateCents'],
-  })
+  .check(
+    crossField(ORDERED_RATE_WINDOW_CONFIG, (value) =>
+      hasOrderedRateWindow(value)
+    )
+  )
 export type StaffDirectoryFilterInput = z.infer<
   typeof staffDirectoryFilterSchema
 >
@@ -498,19 +520,20 @@ export const staffRosterFilterSchema = paginationSchema
     createdTo: withTemporalCoercion(isoDateTimeSchema.optional()),
     sortBy: staffRosterSortBySchema,
   })
-  .refine(hasOrderedRateWindow, {
-    error: INVERTED_RATE_WINDOW_MESSAGE,
-    path: ['maxHourlyRateCents'],
-  })
-  .refine(
-    ({ createdFrom, createdTo }) =>
-      createdFrom === undefined ||
-      createdTo === undefined ||
-      createdFrom.getTime() <= createdTo.getTime(),
-    {
-      error: 'The earlier date must fall on or before the later one.',
-      path: ['createdTo'],
-    }
+  .check(
+    crossField(ORDERED_RATE_WINDOW_CONFIG, (value) =>
+      hasOrderedRateWindow(value)
+    ),
+    crossField(
+      {
+        deps: ['createdFrom', 'createdTo'],
+        as: 'date',
+        error: 'The earlier date must fall on or before the later one.',
+        path: ['createdTo'],
+      },
+      ({ createdFrom, createdTo }) =>
+        createdFrom.getTime() <= createdTo.getTime()
+    )
   )
 export type StaffRosterFilterInput = z.infer<typeof staffRosterFilterSchema>
 export type StaffRosterFilterRawInput = z.input<typeof staffRosterFilterSchema>

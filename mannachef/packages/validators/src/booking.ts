@@ -20,6 +20,8 @@ import { z } from 'zod'
 import {
   addressSchema,
   buildUpdateSchema,
+  crossField,
+  crossFieldMixed,
   cuidSchema,
   currencySchema,
   durationMinutesSchema,
@@ -27,6 +29,7 @@ import {
   hasUniqueValues,
   isoDateTimeSchema,
   MAX_DURATION_MINUTES,
+  MAX_NOTE_LENGTH,
   minutesFromMidnightSchema,
   moneyCentsSchema,
   MS_PER_DAY,
@@ -97,8 +100,18 @@ export const MAX_COURSE_ORDER = 20
 /** `ChefAvailability.reason` is `VarChar(280)`. */
 export const MAX_REASON_LENGTH = 280
 
-/** `@db.Text` note columns. Long, but not unbounded. */
-export const MAX_NOTE_LENGTH = 2000
+/**
+ * `MAX_NOTE_LENGTH` was declared and exported here, and `referral.ts` carried
+ * an identical unexported shadow of it. Two declarations of one rule meant the
+ * barrel published whichever of them `export *` reached first, and keeping the
+ * pair in step was a manual chore. MCV-010 moved the single declaration to
+ * `./common`, which is where the import at the head of this file comes from.
+ *
+ * It is deliberately *not* re-exported from here. `export * from './common'` in
+ * the barrel already publishes it, so `@mannachef/validators` still exports
+ * `MAX_NOTE_LENGTH` with the same value; re-exporting it would put two paths to
+ * one binding through the barrel for no gain.
+ */
 
 /** `ChefAvailability.timeZone` / `StaffProfile.calendarTimeZone` are `VarChar(64)`. */
 const MAX_TIME_ZONE_LENGTH = 64
@@ -167,6 +180,28 @@ const travelBufferSchema = z
 // =============================================================================
 // Shared temporal predicates
 // =============================================================================
+
+/**
+ * ## Why every cross-field rule below is attached with `.check(crossField(…))`
+ *
+ * In zod 4 an object-level `.refine()` runs even when one of the object's own
+ * fields has already failed, and it is handed the *raw* value for that field.
+ * `isoDateTimeSchema` is a `z.ZodPipe` (union → transform → refine), and a
+ * failing `ZodPipe` records its issue with `continue: true`, so it does not
+ * abort the parent object the way a plain `z.number()` would.
+ *
+ * The consequence was a crash rather than a validation error:
+ * `bookingSlotFilterSchema.safeParse({ startsFrom: 'foo', startsUntil: 'bar' })`
+ * threw `TypeError: value.startsUntil.getTime is not a function`. Over GET that
+ * is an HTTP 500 from a two-character query string.
+ *
+ * `crossField` (see `common.ts`) fixes both halves: it declares which fields a
+ * rule reads, suppresses the rule when one of them has already produced an
+ * issue, and runs the predicate only once every declared field is present and
+ * of the right runtime type. The predicates below keep their `undefined`
+ * guards so they remain callable from a server action on a merged row, but the
+ * helper means those guards are no longer what stands between a typo and a 500.
+ */
 
 interface Window {
   readonly startsAt?: Date | undefined
@@ -289,15 +324,25 @@ const availabilityBaseShape = {
   ...availabilityWindowShape,
 } as const
 
+/**
+ * `reason` is typed `unknown` rather than `string | undefined` because this
+ * predicate is reached through `crossField`'s raw view of the object: the rule
+ * has to *fire* when the reason is absent, so `reason` cannot be a declared
+ * dependency (a declared dependency that is absent skips the check). The
+ * `typeof` test below reproduces the original `value.reason !== undefined &&
+ * value.reason.length > 0` exactly — a non-string reason has no `.length`, so
+ * the old expression was already false for it — without reading `.length` off
+ * a value that might be `null`.
+ */
 function blackoutCarriesAReason(value: {
   readonly isBlackout?: boolean | undefined
-  readonly reason?: string | undefined
+  readonly reason?: unknown
 }): boolean {
   if (value.isBlackout !== true) {
     return true
   }
 
-  return value.reason !== undefined && value.reason.length > 0
+  return typeof value.reason === 'string' && value.reason.length > 0
 }
 
 const BLACKOUT_REASON_ERROR =
@@ -321,18 +366,36 @@ export const chefAvailabilityCreateSchema = z
     ...availabilityBaseShape,
   })
   .strict()
-  .refine(minuteWindowClosesAfterItOpens, {
-    error: MINUTE_WINDOW_ORDER_ERROR,
-    path: ['endMinute'],
-  })
-  .refine(effectiveRangeIsOrdered, {
-    error: EFFECTIVE_RANGE_ERROR,
-    path: ['effectiveUntil'],
-  })
-  .refine(blackoutCarriesAReason, {
-    error: BLACKOUT_REASON_ERROR,
-    path: ['reason'],
-  })
+  .check(
+    crossField(
+      {
+        deps: ['startMinute', 'endMinute'],
+        as: 'number',
+        error: MINUTE_WINDOW_ORDER_ERROR,
+        path: ['endMinute'],
+      },
+      (values) => minuteWindowClosesAfterItOpens(values)
+    ),
+    crossField(
+      {
+        deps: ['effectiveFrom', 'effectiveUntil'],
+        as: 'date',
+        error: EFFECTIVE_RANGE_ERROR,
+        path: ['effectiveUntil'],
+      },
+      (values) => effectiveRangeIsOrdered(values)
+    ),
+    crossField(
+      {
+        deps: ['isBlackout'],
+        as: 'boolean',
+        error: BLACKOUT_REASON_ERROR,
+        path: ['reason'],
+      },
+      ({ isBlackout }, raw) =>
+        blackoutCarriesAReason({ isBlackout, reason: raw.reason })
+    )
+  )
 export type ChefAvailabilityCreateInput = z.infer<
   typeof chefAvailabilityCreateSchema
 >
@@ -356,37 +419,57 @@ export const availabilityOverrideSchema = z
     ...availabilityBaseShape,
   })
   .strict()
-  .refine(minuteWindowClosesAfterItOpens, {
-    error: MINUTE_WINDOW_ORDER_ERROR,
-    path: ['endMinute'],
-  })
-  .refine(effectiveRangeIsOrdered, {
-    error: EFFECTIVE_RANGE_ERROR,
-    path: ['effectiveUntil'],
-  })
-  .refine(blackoutCarriesAReason, {
-    error: BLACKOUT_REASON_ERROR,
-    path: ['reason'],
-  })
-  .refine(
-    (value) =>
-      value.effectiveFrom === undefined ||
-      value.specificDate.getTime() >= value.effectiveFrom.getTime(),
-    {
-      error:
-        'The date this override covers must fall on or after the date the rule starts applying.',
-      path: ['specificDate'],
-    }
-  )
-  .refine(
-    (value) =>
-      value.effectiveUntil === undefined ||
-      value.specificDate.getTime() <= value.effectiveUntil.getTime(),
-    {
-      error:
-        'The date this override covers must fall on or before the date the rule stops applying.',
-      path: ['specificDate'],
-    }
+  .check(
+    crossField(
+      {
+        deps: ['startMinute', 'endMinute'],
+        as: 'number',
+        error: MINUTE_WINDOW_ORDER_ERROR,
+        path: ['endMinute'],
+      },
+      (values) => minuteWindowClosesAfterItOpens(values)
+    ),
+    crossField(
+      {
+        deps: ['effectiveFrom', 'effectiveUntil'],
+        as: 'date',
+        error: EFFECTIVE_RANGE_ERROR,
+        path: ['effectiveUntil'],
+      },
+      (values) => effectiveRangeIsOrdered(values)
+    ),
+    crossField(
+      {
+        deps: ['isBlackout'],
+        as: 'boolean',
+        error: BLACKOUT_REASON_ERROR,
+        path: ['reason'],
+      },
+      ({ isBlackout }, raw) =>
+        blackoutCarriesAReason({ isBlackout, reason: raw.reason })
+    ),
+    crossField(
+      {
+        deps: ['specificDate', 'effectiveFrom'],
+        as: 'date',
+        error:
+          'The date this override covers must fall on or after the date the rule starts applying.',
+        path: ['specificDate'],
+      },
+      ({ specificDate, effectiveFrom }) =>
+        specificDate.getTime() >= effectiveFrom.getTime()
+    ),
+    crossField(
+      {
+        deps: ['specificDate', 'effectiveUntil'],
+        as: 'date',
+        error:
+          'The date this override covers must fall on or before the date the rule stops applying.',
+        path: ['specificDate'],
+      },
+      ({ specificDate, effectiveUntil }) =>
+        specificDate.getTime() <= effectiveUntil.getTime()
+    )
   )
 export type AvailabilityOverrideInput = z.infer<
   typeof availabilityOverrideSchema
@@ -437,18 +520,41 @@ export const chefAvailabilityUpdateSchema = buildUpdateSchema(
   },
   { requireKeys: { availabilityId: cuidSchema } }
 )
-  .refine(minuteWindowClosesAfterItOpens, {
-    error: MINUTE_WINDOW_ORDER_ERROR,
-    path: ['endMinute'],
-  })
-  .refine(effectiveRangeIsOrdered, {
-    error: EFFECTIVE_RANGE_ERROR,
-    path: ['effectiveUntil'],
-  })
-  .refine(blackoutCarriesAReason, {
-    error: BLACKOUT_REASON_ERROR,
-    path: ['reason'],
-  })
+  .check(
+    crossField(
+      {
+        deps: ['startMinute', 'endMinute'],
+        as: 'number',
+        error: MINUTE_WINDOW_ORDER_ERROR,
+        path: ['endMinute'],
+      },
+      (values) => minuteWindowClosesAfterItOpens(values)
+    ),
+    crossField(
+      {
+        deps: ['effectiveFrom', 'effectiveUntil'],
+        as: 'date',
+        error: EFFECTIVE_RANGE_ERROR,
+        path: ['effectiveUntil'],
+      },
+      (values) => effectiveRangeIsOrdered(values)
+    ),
+    crossField(
+      {
+        deps: ['isBlackout'],
+        as: 'boolean',
+        error: BLACKOUT_REASON_ERROR,
+        path: ['reason'],
+      },
+      ({ isBlackout }, raw) =>
+        blackoutCarriesAReason({ isBlackout, reason: raw.reason })
+    )
+  )
+  /**
+   * Left as a plain `.refine()` deliberately: this rule reads only whether the
+   * two fields are *present*, never their values, so it cannot throw on a
+   * malformed payload and has nothing to narrow.
+   */
   .refine(
     (value) =>
       value.dayOfWeek === undefined || value.specificDate === undefined,
@@ -504,9 +610,15 @@ function holdExpiresBeforeService(value: {
   return value.holdsUntil.getTime() < value.startsAt.getTime()
 }
 
+/**
+ * `holdsUntil` is `unknown` for the same reason `blackoutCarriesAReason`'s
+ * `reason` is: the rule exists to catch an *absent* expiry, so the field cannot
+ * be a declared `crossField` dependency. Only its presence is read, never a
+ * property of it, so nothing here can throw.
+ */
 function heldSlotCarriesAnExpiry(value: {
   readonly status?: string | undefined
-  readonly holdsUntil?: Date | undefined
+  readonly holdsUntil?: unknown
 }): boolean {
   if (value.status !== 'HELD') {
     return true
@@ -530,26 +642,54 @@ export const bookingSlotCreateSchema = z
     ...bookingSlotMutableShape,
   })
   .strict()
-  .refine(windowEndsAfterItBegins, {
-    error: WINDOW_ORDER_ERROR,
-    path: ['endsAt'],
-  })
-  .refine(windowIsLongEnough, {
-    error: WINDOW_TOO_SHORT_ERROR,
-    path: ['endsAt'],
-  })
-  .refine(windowFitsInOneDay, {
-    error: WINDOW_TOO_LONG_ERROR,
-    path: ['endsAt'],
-  })
-  .refine(holdExpiresBeforeService, {
-    error: HOLD_ORDER_ERROR,
-    path: ['holdsUntil'],
-  })
-  .refine(heldSlotCarriesAnExpiry, {
-    error: HELD_WITHOUT_EXPIRY_ERROR,
-    path: ['holdsUntil'],
-  })
+  .check(
+    crossField(
+      {
+        deps: ['startsAt', 'endsAt'],
+        as: 'date',
+        error: WINDOW_ORDER_ERROR,
+        path: ['endsAt'],
+      },
+      (values) => windowEndsAfterItBegins(values)
+    ),
+    crossField(
+      {
+        deps: ['startsAt', 'endsAt'],
+        as: 'date',
+        error: WINDOW_TOO_SHORT_ERROR,
+        path: ['endsAt'],
+      },
+      (values) => windowIsLongEnough(values)
+    ),
+    crossField(
+      {
+        deps: ['startsAt', 'endsAt'],
+        as: 'date',
+        error: WINDOW_TOO_LONG_ERROR,
+        path: ['endsAt'],
+      },
+      (values) => windowFitsInOneDay(values)
+    ),
+    crossField(
+      {
+        deps: ['startsAt', 'holdsUntil'],
+        as: 'date',
+        error: HOLD_ORDER_ERROR,
+        path: ['holdsUntil'],
+      },
+      (values) => holdExpiresBeforeService(values)
+    ),
+    crossField(
+      {
+        deps: ['status'],
+        as: 'string',
+        error: HELD_WITHOUT_EXPIRY_ERROR,
+        path: ['holdsUntil'],
+      },
+      ({ status }, raw) =>
+        heldSlotCarriesAnExpiry({ status, holdsUntil: raw.holdsUntil })
+    )
+  )
 export type BookingSlotCreateInput = z.infer<typeof bookingSlotCreateSchema>
 export type BookingSlotCreateRawInput = z.input<typeof bookingSlotCreateSchema>
 
@@ -568,27 +708,54 @@ export type BookingSlotCreateRawInput = z.input<typeof bookingSlotCreateSchema>
 export const bookingSlotUpdateSchema = buildUpdateSchema(
   bookingSlotMutableShape,
   { requireKeys: { bookingSlotId: cuidSchema } }
+).check(
+  crossField(
+    {
+      deps: ['startsAt', 'endsAt'],
+      as: 'date',
+      error: WINDOW_ORDER_ERROR,
+      path: ['endsAt'],
+    },
+    (values) => windowEndsAfterItBegins(values)
+  ),
+  crossField(
+    {
+      deps: ['startsAt', 'endsAt'],
+      as: 'date',
+      error: WINDOW_TOO_SHORT_ERROR,
+      path: ['endsAt'],
+    },
+    (values) => windowIsLongEnough(values)
+  ),
+  crossField(
+    {
+      deps: ['startsAt', 'endsAt'],
+      as: 'date',
+      error: WINDOW_TOO_LONG_ERROR,
+      path: ['endsAt'],
+    },
+    (values) => windowFitsInOneDay(values)
+  ),
+  crossField(
+    {
+      deps: ['startsAt', 'holdsUntil'],
+      as: 'date',
+      error: HOLD_ORDER_ERROR,
+      path: ['holdsUntil'],
+    },
+    (values) => holdExpiresBeforeService(values)
+  ),
+  crossField(
+    {
+      deps: ['status'],
+      as: 'string',
+      error: HELD_WITHOUT_EXPIRY_ERROR,
+      path: ['holdsUntil'],
+    },
+    ({ status }, raw) =>
+      heldSlotCarriesAnExpiry({ status, holdsUntil: raw.holdsUntil })
+  )
 )
-  .refine(windowEndsAfterItBegins, {
-    error: WINDOW_ORDER_ERROR,
-    path: ['endsAt'],
-  })
-  .refine(windowIsLongEnough, {
-    error: WINDOW_TOO_SHORT_ERROR,
-    path: ['endsAt'],
-  })
-  .refine(windowFitsInOneDay, {
-    error: WINDOW_TOO_LONG_ERROR,
-    path: ['endsAt'],
-  })
-  .refine(holdExpiresBeforeService, {
-    error: HOLD_ORDER_ERROR,
-    path: ['holdsUntil'],
-  })
-  .refine(heldSlotCarriesAnExpiry, {
-    error: HELD_WITHOUT_EXPIRY_ERROR,
-    path: ['holdsUntil'],
-  })
 export type BookingSlotUpdateInput = z.infer<typeof bookingSlotUpdateSchema>
 export type BookingSlotUpdateRawInput = z.input<typeof bookingSlotUpdateSchema>
 
@@ -613,15 +780,24 @@ export const bookingSlotFilterSchema = paginationSchema
       'Please choose whether to show only open windows.'
     ),
   })
-  .refine(
-    (value) =>
-      value.startsFrom === undefined ||
-      value.startsUntil === undefined ||
-      value.startsUntil.getTime() > value.startsFrom.getTime(),
-    {
-      error: 'The end of the range must fall after its start.',
-      path: ['startsUntil'],
-    }
+  /**
+   * The minimal reproduction of the bug this whole pattern exists for:
+   * `safeParse({ startsFrom: 'foo', startsUntil: 'bar' })` used to throw
+   * `TypeError: value.startsUntil.getTime is not a function` instead of
+   * returning `{ success: false }`, turning a mistyped query string on a
+   * `PUBLIC` route into an unauthenticated HTTP 500.
+   */
+  .check(
+    crossField(
+      {
+        deps: ['startsFrom', 'startsUntil'],
+        as: 'date',
+        error: 'The end of the range must fall after its start.',
+        path: ['startsUntil'],
+      },
+      ({ startsFrom, startsUntil }) =>
+        startsUntil.getTime() > startsFrom.getTime()
+    )
   )
 export type BookingSlotFilter = z.infer<typeof bookingSlotFilterSchema>
 export type BookingSlotFilterInput = z.input<typeof bookingSlotFilterSchema>
@@ -652,10 +828,17 @@ export const weeklyRecurrenceRuleSchema = z
     timeZone: timeZoneSchema,
   })
   .strict()
-  .refine(minuteWindowClosesAfterItOpens, {
-    error: MINUTE_WINDOW_ORDER_ERROR,
-    path: ['endMinute'],
-  })
+  .check(
+    crossField(
+      {
+        deps: ['startMinute', 'endMinute'],
+        as: 'number',
+        error: MINUTE_WINDOW_ORDER_ERROR,
+        path: ['endMinute'],
+      },
+      (values) => minuteWindowClosesAfterItOpens(values)
+    )
+  )
 export type WeeklyRecurrenceRule = z.infer<typeof weeklyRecurrenceRuleSchema>
 export type WeeklyRecurrenceRuleInput = z.input<
   typeof weeklyRecurrenceRuleSchema
@@ -747,35 +930,57 @@ export const recurringSlotGenerationSchema = z
       .default(false),
   })
   .strict()
-  .refine((value) => value.startsOn.getTime() >= Date.now() - MS_PER_DAY, {
-    error:
-      'The diary opens from today onward — please choose a start date that is not in the past.',
-    path: ['startsOn'],
-  })
-  .refine(
-    (value) =>
-      value.rule.endMinute - value.rule.startMinute >=
-      value.slotDurationMinutes,
-    {
-      error:
-        'The daily window is shorter than a single booking — lengthen the window or shorten the booking.',
-      path: ['slotDurationMinutes'],
-    }
-  )
-  .refine((value) => countGeneratedSlots(value) <= MAX_GENERATED_SLOTS, {
-    error: `That pattern would open more than ${MAX_GENERATED_SLOTS} windows — shorten the horizon or lengthen each booking.`,
-    path: ['horizonWeeks'],
-  })
-  .refine(
-    (value) =>
-      value.skipDates.every(
-        (date) => date.getTime() >= value.startsOn.getTime()
-      ),
-    {
-      error:
-        'Every date you skip must fall on or after the day generation begins.',
-      path: ['skipDates'],
-    }
+  .check(
+    crossField(
+      {
+        deps: ['startsOn'],
+        as: 'date',
+        error:
+          'The diary opens from today onward — please choose a start date that is not in the past.',
+        path: ['startsOn'],
+      },
+      ({ startsOn }) => startsOn.getTime() >= Date.now() - MS_PER_DAY
+    ),
+    /**
+     * `rule` is declared `'present'` rather than left undeclared: the old
+     * `.refine()` read `value.rule.endMinute` off whatever the caller sent, so
+     * `{ rule: null }` threw. Declaring it also means a `rule` that failed its
+     * own schema suppresses this rule instead of reporting a second, derived
+     * complaint about a window nobody successfully described.
+     */
+    crossFieldMixed(
+      {
+        deps: { rule: 'present', slotDurationMinutes: 'number' },
+        error:
+          'The daily window is shorter than a single booking — lengthen the window or shorten the booking.',
+        path: ['slotDurationMinutes'],
+      },
+      ({ rule, slotDurationMinutes }) =>
+        rule.endMinute - rule.startMinute >= slotDurationMinutes
+    ),
+    crossFieldMixed(
+      {
+        deps: {
+          rule: 'present',
+          slotDurationMinutes: 'number',
+          gapMinutes: 'number',
+          horizonWeeks: 'number',
+        },
+        error: `That pattern would open more than ${MAX_GENERATED_SLOTS} windows — shorten the horizon or lengthen each booking.`,
+        path: ['horizonWeeks'],
+      },
+      (values) => countGeneratedSlots(values) <= MAX_GENERATED_SLOTS
+    ),
+    crossFieldMixed(
+      {
+        deps: { skipDates: 'array', startsOn: 'date' },
+        error:
+          'Every date you skip must fall on or after the day generation begins.',
+        path: ['skipDates'],
+      },
+      ({ skipDates, startsOn }) =>
+        skipDates.every((date) => date.getTime() >= startsOn.getTime())
+    )
   )
 export type RecurringSlotGenerationInput = z.infer<
   typeof recurringSlotGenerationSchema
@@ -961,34 +1166,77 @@ export const appointmentCreateSchema = z
     ...appointmentMutableShape,
   })
   .strict()
-  .refine(windowEndsAfterItBegins, {
-    error: WINDOW_ORDER_ERROR,
-    path: ['endsAt'],
-  })
-  .refine(windowIsLongEnough, {
-    error: WINDOW_TOO_SHORT_ERROR,
-    path: ['endsAt'],
-  })
-  .refine(windowFitsInOneDay, {
-    error: WINDOW_TOO_LONG_ERROR,
-    path: ['endsAt'],
-  })
-  .refine((value) => value.startsAt.getTime() > Date.now(), {
-    error: 'An engagement must be booked for a moment still ahead of us.',
-    path: ['startsAt'],
-  })
-  .refine(preparationPrecedesService, {
-    error: PREP_ORDER_ERROR,
-    path: ['prepStartsAt'],
-  })
-  .refine(preparationIsNotTooEarly, {
-    error: PREP_LEAD_ERROR,
-    path: ['prepStartsAt'],
-  })
-  .refine(depositFitsWithinTotal, {
-    error: DEPOSIT_ERROR,
-    path: ['depositCents'],
-  })
+  .check(
+    crossField(
+      {
+        deps: ['startsAt', 'endsAt'],
+        as: 'date',
+        error: WINDOW_ORDER_ERROR,
+        path: ['endsAt'],
+      },
+      (values) => windowEndsAfterItBegins(values)
+    ),
+    crossField(
+      {
+        deps: ['startsAt', 'endsAt'],
+        as: 'date',
+        error: WINDOW_TOO_SHORT_ERROR,
+        path: ['endsAt'],
+      },
+      (values) => windowIsLongEnough(values)
+    ),
+    crossField(
+      {
+        deps: ['startsAt', 'endsAt'],
+        as: 'date',
+        error: WINDOW_TOO_LONG_ERROR,
+        path: ['endsAt'],
+      },
+      (values) => windowFitsInOneDay(values)
+    ),
+    crossField(
+      {
+        deps: ['startsAt'],
+        as: 'date',
+        error: 'An engagement must be booked for a moment still ahead of us.',
+        path: ['startsAt'],
+      },
+      ({ startsAt }) => startsAt.getTime() > Date.now()
+    ),
+    crossField(
+      {
+        deps: ['startsAt', 'prepStartsAt'],
+        as: 'date',
+        error: PREP_ORDER_ERROR,
+        path: ['prepStartsAt'],
+      },
+      (values) => preparationPrecedesService(values)
+    ),
+    crossField(
+      {
+        deps: ['startsAt', 'prepStartsAt'],
+        as: 'date',
+        error: PREP_LEAD_ERROR,
+        path: ['prepStartsAt'],
+      },
+      (values) => preparationIsNotTooEarly(values)
+    ),
+    crossField(
+      {
+        deps: ['totalCents', 'depositCents'],
+        as: 'number',
+        error: DEPOSIT_ERROR,
+        path: ['depositCents'],
+      },
+      (values) => depositFitsWithinTotal(values)
+    )
+  )
+  /**
+   * Left as a plain `.refine()`: `Array.prototype.includes` cannot throw on an
+   * unexpected value and `address` is only tested for presence, so there is
+   * nothing here to narrow and nothing that could reach a property of a field
+   * that failed to parse.
+   */
   .refine(
     (value) =>
       !ON_SITE_SERVICE_TYPES.includes(value.serviceType) ||
@@ -1027,31 +1275,62 @@ export type AppointmentCreateRawInput = z.input<typeof appointmentCreateSchema>
 export const appointmentUpdateSchema = buildUpdateSchema(
   appointmentMutableShape,
   { requireKeys: { appointmentId: cuidSchema } }
+).check(
+  crossField(
+    {
+      deps: ['startsAt', 'endsAt'],
+      as: 'date',
+      error: WINDOW_ORDER_ERROR,
+      path: ['endsAt'],
+    },
+    (values) => windowEndsAfterItBegins(values)
+  ),
+  crossField(
+    {
+      deps: ['startsAt', 'endsAt'],
+      as: 'date',
+      error: WINDOW_TOO_SHORT_ERROR,
+      path: ['endsAt'],
+    },
+    (values) => windowIsLongEnough(values)
+  ),
+  crossField(
+    {
+      deps: ['startsAt', 'endsAt'],
+      as: 'date',
+      error: WINDOW_TOO_LONG_ERROR,
+      path: ['endsAt'],
+    },
+    (values) => windowFitsInOneDay(values)
+  ),
+  crossField(
+    {
+      deps: ['startsAt', 'prepStartsAt'],
+      as: 'date',
+      error: PREP_ORDER_ERROR,
+      path: ['prepStartsAt'],
+    },
+    (values) => preparationPrecedesService(values)
+  ),
+  crossField(
+    {
+      deps: ['startsAt', 'prepStartsAt'],
+      as: 'date',
+      error: PREP_LEAD_ERROR,
+      path: ['prepStartsAt'],
+    },
+    (values) => preparationIsNotTooEarly(values)
+  ),
+  crossField(
+    {
+      deps: ['totalCents', 'depositCents'],
+      as: 'number',
+      error: DEPOSIT_ERROR,
+      path: ['depositCents'],
+    },
+    (values) => depositFitsWithinTotal(values)
+  )
 )
-  .refine(windowEndsAfterItBegins, {
-    error: WINDOW_ORDER_ERROR,
-    path: ['endsAt'],
-  })
-  .refine(windowIsLongEnough, {
-    error: WINDOW_TOO_SHORT_ERROR,
-    path: ['endsAt'],
-  })
-  .refine(windowFitsInOneDay, {
-    error: WINDOW_TOO_LONG_ERROR,
-    path: ['endsAt'],
-  })
-  .refine(preparationPrecedesService, {
-    error: PREP_ORDER_ERROR,
-    path: ['prepStartsAt'],
-  })
-  .refine(preparationIsNotTooEarly, {
-    error: PREP_LEAD_ERROR,
-    path: ['prepStartsAt'],
-  })
-  .refine(depositFitsWithinTotal, {
-    error: DEPOSIT_ERROR,
-    path: ['depositCents'],
-  })
 export type AppointmentUpdateInput = z.infer<typeof appointmentUpdateSchema>
 export type AppointmentUpdateRawInput = z.input<typeof appointmentUpdateSchema>
 
@@ -1145,24 +1424,47 @@ export const appointmentStatusTransitionSchema = z
     cancelledById: cuidSchema.optional(),
   })
   .strict()
+  /** Presence-and-equality only; nothing to dereference, nothing to narrow. */
   .refine((value) => value.from !== value.to, {
     error: 'This engagement is already in that state.',
     path: ['to'],
   })
-  .refine((value) => canTransition(value.from, value.to), {
-    error:
-      'An engagement cannot make that move — a completed, cancelled, or missed engagement is final, and one is confirmed before it begins.',
-    path: ['to'],
-  })
-  .refine(
-    (value) =>
-      value.to !== 'CANCELLED' ||
-      (value.reason !== undefined && value.reason.length > 0),
-    {
-      error: 'Please record why the engagement was cancelled.',
-      path: ['reason'],
-    }
+  .check(
+    /**
+     * `canTransition` indexes `APPOINTMENT_TRANSITIONS` by `from` and calls
+     * `.includes` on the result. A `from` the enum rejected — `'foo'`, or a
+     * missing field — used to make that lookup `undefined` and the call a
+     * `TypeError`. Declaring both statuses as dependencies means the rule is
+     * skipped whenever either one failed to parse.
+     */
+    crossField(
+      {
+        deps: ['from', 'to'],
+        as: 'string',
+        error:
+          'An engagement cannot make that move — a completed, cancelled, or missed engagement is final, and one is confirmed before it begins.',
+        path: ['to'],
+      },
+      ({ from, to }) => canTransition(from, to)
+    ),
+    /**
+     * `reason` stays undeclared because the rule has to fire when it is absent;
+     * the `typeof` test reproduces the old `!== undefined && .length > 0`
+     * exactly while refusing to read `.length` off `null`.
+     */
+    crossField(
+      {
+        deps: ['to'],
+        as: 'string',
+        error: 'Please record why the engagement was cancelled.',
+        path: ['reason'],
+      },
+      ({ to }, raw) =>
+        to !== 'CANCELLED' ||
+        (typeof raw.reason === 'string' && raw.reason.length > 0)
+    )
   )
+  /** Presence only. */
   .refine(
     (value) => value.to === 'CANCELLED' || value.cancelledById === undefined,
     {
@@ -1170,15 +1472,17 @@ export const appointmentStatusTransitionSchema = z
       path: ['cancelledById'],
     }
   )
-  .refine(
-    (value) =>
-      value.occurredAt === undefined ||
-      value.occurredAt.getTime() <= Date.now(),
-    {
-      error:
-        'A change of status cannot be recorded for a moment still to come.',
-      path: ['occurredAt'],
-    }
+  .check(
+    crossField(
+      {
+        deps: ['occurredAt'],
+        as: 'date',
+        error:
+          'A change of status cannot be recorded for a moment still to come.',
+        path: ['occurredAt'],
+      },
+      ({ occurredAt }) => occurredAt.getTime() <= Date.now()
+    )
   )
 export type AppointmentStatusTransitionInput = z.infer<
   typeof appointmentStatusTransitionSchema
@@ -1234,14 +1538,26 @@ export const appointmentConflictCheckSchema = z
       .default(true),
   })
   .strict()
-  .refine(windowEndsAfterItBegins, {
-    error: WINDOW_ORDER_ERROR,
-    path: ['endsAt'],
-  })
-  .refine(windowFitsInOneDay, {
-    error: WINDOW_TOO_LONG_ERROR,
-    path: ['endsAt'],
-  })
+  .check(
+    crossField(
+      {
+        deps: ['startsAt', 'endsAt'],
+        as: 'date',
+        error: WINDOW_ORDER_ERROR,
+        path: ['endsAt'],
+      },
+      (values) => windowEndsAfterItBegins(values)
+    ),
+    crossField(
+      {
+        deps: ['startsAt', 'endsAt'],
+        as: 'date',
+        error: WINDOW_TOO_LONG_ERROR,
+        path: ['endsAt'],
+      },
+      (values) => windowFitsInOneDay(values)
+    )
+  )
 export type AppointmentConflictCheckInput = z.infer<
   typeof appointmentConflictCheckSchema
 >
@@ -1265,15 +1581,17 @@ export const appointmentFilterSchema = paginationSchema
     startsFrom: withTemporalCoercion(isoDateTimeSchema.optional()),
     startsUntil: withTemporalCoercion(isoDateTimeSchema.optional()),
   })
-  .refine(
-    (value) =>
-      value.startsFrom === undefined ||
-      value.startsUntil === undefined ||
-      value.startsUntil.getTime() > value.startsFrom.getTime(),
-    {
-      error: 'The end of the range must fall after its start.',
-      path: ['startsUntil'],
-    }
+  .check(
+    crossField(
+      {
+        deps: ['startsFrom', 'startsUntil'],
+        as: 'date',
+        error: 'The end of the range must fall after its start.',
+        path: ['startsUntil'],
+      },
+      ({ startsFrom, startsUntil }) =>
+        startsUntil.getTime() > startsFrom.getTime()
+    )
   )
 export type AppointmentFilter = z.infer<typeof appointmentFilterSchema>
 export type AppointmentFilterInput = z.input<typeof appointmentFilterSchema>

@@ -7,7 +7,9 @@
     ".": "./src/index.ts"
   },
   "scripts": {
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "verify:fuzz": "node --experimental-strip-types --disable-warning=ExperimentalWarning --import ./scripts/register.mjs ./scripts/fuzz-schemas.ts",
+    "verify": "pnpm run verify:fuzz"
   },
   "dependencies": {
     "zod": "^4.0.0"

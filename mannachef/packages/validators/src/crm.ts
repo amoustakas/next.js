@@ -29,6 +29,15 @@
  *     goes through the coercion helpers in `./common`. The create, update and
  *     transition schemas stay strict, as does `clientLtvBucketingSchema` — see
  *     the note above it for why that one is a request body rather than a filter.
+ *  6. Every cross-field rule that reads a field's *value* goes through
+ *     `crossField` / `crossFieldMixed` from `./common` and attaches with
+ *     `.check(...)`, not `.refine(...)` (MCV-009). An object-level `.refine()`
+ *     runs even when a nested field has already failed, and it is handed the
+ *     raw, un-narrowed value — so `{ occurredFrom: 'foo', occurredTo: 'bar' }`
+ *     used to throw a `TypeError` out of `safeParse` rather than return
+ *     `{ success: false }`. The rules that only compare fields — `from !== to`,
+ *     `subject != null || body != null` — stay as plain refinements: they
+ *     dereference nothing and cannot throw.
  */
 
 import { z } from 'zod'
@@ -37,6 +46,7 @@ import {
   MAX_SEARCH_LENGTH,
   MS_PER_DAY,
   buildUpdateSchema,
+  crossField,
   cuidSchema,
   durationMinutesSchema,
   hasUniqueValues,
@@ -296,14 +306,25 @@ export const interactionLogCreateSchema = z
       .default(true),
   })
   .strict()
-  .refine(
-    ({ occurredAt }) =>
-      occurredAt === undefined || isNotInTheFuture(occurredAt),
-    {
-      error:
-        'An exchange cannot be logged for a moment still to come. Schedule a follow-up instead.',
-      path: ['occurredAt'],
-    }
+  /**
+   * `occurredAt` is an `isoDateTimeSchema`, which is a `z.ZodPipe` — a field
+   * that fails does not abort the parent object, so the plain `.refine()` this
+   * replaced reached `isNotInTheFuture('foo')` and threw a `TypeError` instead
+   * of returning `{ success: false }`. `crossField` runs the rule only once
+   * `occurredAt` has parsed to a real `Date`; an absent one skips it, exactly
+   * as the `=== undefined` clause used to. See MCV-008 in `./common`.
+   */
+  .check(
+    crossField(
+      {
+        deps: ['occurredAt'],
+        as: 'date',
+        error:
+          'An exchange cannot be logged for a moment still to come. Schedule a follow-up instead.',
+        path: ['occurredAt'],
+      },
+      ({ occurredAt }) => isNotInTheFuture(occurredAt)
+    )
   )
   .refine(
     ({ channel, durationMinutes }) =>
@@ -356,15 +377,23 @@ export const interactionLogFilterSchema = paginationSchema
     occurredFrom: withTemporalCoercion(isoDateTimeSchema.optional()),
     occurredTo: withTemporalCoercion(isoDateTimeSchema.optional()),
   })
-  .refine(
-    ({ occurredFrom, occurredTo }) =>
-      occurredFrom === undefined ||
-      occurredTo === undefined ||
-      occurredFrom.getTime() <= occurredTo.getTime(),
-    {
-      error: 'The earlier date must fall on or before the later one.',
-      path: ['occurredTo'],
-    }
+  /**
+   * Both bounds are pipes, so `?occurredFrom=foo&occurredTo=bar` left the old
+   * `.refine()` calling `.getTime()` on the string `'foo'` — an unhandled
+   * `TypeError`, and a 500 on a `GET` route rather than a 400. The rule now runs
+   * only when both bounds are real `Date`s.
+   */
+  .check(
+    crossField(
+      {
+        deps: ['occurredFrom', 'occurredTo'],
+        as: 'date',
+        error: 'The earlier date must fall on or before the later one.',
+        path: ['occurredTo'],
+      },
+      ({ occurredFrom, occurredTo }) =>
+        occurredFrom.getTime() <= occurredTo.getTime()
+    )
   )
 export type InteractionLogFilterInput = z.infer<
   typeof interactionLogFilterSchema
@@ -450,32 +479,72 @@ export const clientStatusTransitionSchema = z
     error: 'This client is already at that stage.',
     path: ['to'],
   })
-  .refine(({ from, to }) => canTransitionClientStatus(from, to), {
-    error:
-      'A client cannot make that move — a prospect is qualified before they subscribe, and a subscriber rests before they leave.',
-    path: ['to'],
-  })
-  .refine(
-    ({ to, reason }) =>
-      to !== 'CHURNED' || (reason !== undefined && reason.length > 0),
-    {
-      error:
-        'Please record why this client is leaving. Nothing teaches us more than this field.',
-      path: ['reason'],
-    }
+  /**
+   * `CLIENT_STATUS_TRANSITIONS[from]` is an unguarded index, and `.includes` on
+   * the `undefined` it returns for a value that is not a status would throw.
+   * The lookup is widened to admit `undefined` and a miss is read as "not our
+   * business" — `from` has already reported its own issue.
+   */
+  .check(
+    crossField(
+      {
+        deps: ['from', 'to'],
+        as: 'string',
+        error:
+          'A client cannot make that move — a prospect is qualified before they subscribe, and a subscriber rests before they leave.',
+        path: ['to'],
+      },
+      ({ from, to }) => {
+        const allowed: readonly ClientStatus[] | undefined =
+          CLIENT_STATUS_TRANSITIONS[from]
+
+        return allowed === undefined || canTransitionClientStatus(from, to)
+      }
+    )
   )
-  .refine(
-    ({ occurredAt }) =>
-      occurredAt === undefined || isNotInTheFuture(occurredAt),
-    {
-      error: 'A change of stage cannot be recorded for a moment still to come.',
-      path: ['occurredAt'],
-    }
+  /**
+   * A conditionally *required* field cannot be a dependency: declaring `reason`
+   * would skip the rule in the one case it exists for, an absent reason on a
+   * churn. Only `to` is declared, and `reason` is read from the raw payload
+   * behind an explicit `typeof` guard.
+   */
+  .check(
+    crossField(
+      {
+        deps: ['to'],
+        as: 'string',
+        error:
+          'Please record why this client is leaving. Nothing teaches us more than this field.',
+        path: ['reason'],
+      },
+      ({ to }, raw) =>
+        to !== 'CHURNED' ||
+        (typeof raw.reason === 'string' && raw.reason.length > 0)
+    )
   )
-  .refine(({ followUpAt }) => followUpAt == null || isInTheFuture(followUpAt), {
-    error: 'Please choose a follow-up date in the future.',
-    path: ['followUpAt'],
-  })
+  .check(
+    crossField(
+      {
+        deps: ['occurredAt'],
+        as: 'date',
+        error:
+          'A change of stage cannot be recorded for a moment still to come.',
+        path: ['occurredAt'],
+      },
+      ({ occurredAt }) => isNotInTheFuture(occurredAt)
+    )
+  )
+  .check(
+    crossField(
+      {
+        deps: ['followUpAt'],
+        as: 'date',
+        error: 'Please choose a follow-up date in the future.',
+        path: ['followUpAt'],
+      },
+      ({ followUpAt }) => isInTheFuture(followUpAt)
+    )
+  )
 export type ClientStatusTransitionInput = z.infer<
   typeof clientStatusTransitionSchema
 >
@@ -525,21 +594,32 @@ export const clientFollowUpSchema = z
       .default(false),
   })
   .strict()
-  .refine(
-    ({ followUpAt }) => followUpAt === null || isInTheFuture(followUpAt),
-    {
-      error: 'Please choose a follow-up date in the future.',
-      path: ['followUpAt'],
-    }
-  )
-  .refine(
-    ({ followUpAt }) =>
-      followUpAt === null ||
-      followUpAt.getTime() - Date.now() <= MAX_FOLLOW_UP_DAYS * MS_PER_DAY,
-    {
-      error: 'Please choose a follow-up within the next two years.',
-      path: ['followUpAt'],
-    }
+  /**
+   * `followUpAt` is required here, so `{ clientProfileId: 'x' }` used to reach
+   * `isInTheFuture(undefined)` and throw. Both bounds now run only on a real
+   * `Date`: `null` (clearing the flag) and a value that failed to parse both
+   * skip, which is what the `=== null` clause was reaching for.
+   */
+  .check(
+    crossField(
+      {
+        deps: ['followUpAt'],
+        as: 'date',
+        error: 'Please choose a follow-up date in the future.',
+        path: ['followUpAt'],
+      },
+      ({ followUpAt }) => isInTheFuture(followUpAt)
+    ),
+    crossField(
+      {
+        deps: ['followUpAt'],
+        as: 'date',
+        error: 'Please choose a follow-up within the next two years.',
+        path: ['followUpAt'],
+      },
+      ({ followUpAt }) =>
+        followUpAt.getTime() - Date.now() <= MAX_FOLLOW_UP_DAYS * MS_PER_DAY
+    )
   )
   .refine(({ followUpAt, note }) => followUpAt !== null || note == null, {
     error:
@@ -653,25 +733,34 @@ export const clientPipelineFilterSchema = paginationSchema
     createdTo: withTemporalCoercion(isoDateTimeSchema.optional()),
     sortBy: clientPipelineSortBySchema,
   })
-  .refine(
-    ({ minLifetimeValueCents, maxLifetimeValueCents }) =>
-      minLifetimeValueCents === undefined ||
-      maxLifetimeValueCents === undefined ||
-      minLifetimeValueCents <= maxLifetimeValueCents,
-    {
-      error: 'The lower figure must not exceed the higher one.',
-      path: ['maxLifetimeValueCents'],
-    }
-  )
-  .refine(
-    ({ createdFrom, createdTo }) =>
-      createdFrom === undefined ||
-      createdTo === undefined ||
-      createdFrom.getTime() <= createdTo.getTime(),
-    {
-      error: 'The earlier date must fall on or before the later one.',
-      path: ['createdTo'],
-    }
+  /**
+   * Every bound on this schema is a `z.preprocess` pipe, and a pipe that fails
+   * does not abort the object. `?minLifetimeValueCents=foo` therefore left the
+   * old numeric `.refine()` comparing two strings — quiet nonsense — and
+   * `?createdFrom=foo` left the temporal one calling `.getTime()` on a string,
+   * which threw. Both now run only on well-typed values.
+   */
+  .check(
+    crossField(
+      {
+        deps: ['minLifetimeValueCents', 'maxLifetimeValueCents'],
+        as: 'number',
+        error: 'The lower figure must not exceed the higher one.',
+        path: ['maxLifetimeValueCents'],
+      },
+      ({ minLifetimeValueCents, maxLifetimeValueCents }) =>
+        minLifetimeValueCents <= maxLifetimeValueCents
+    ),
+    crossField(
+      {
+        deps: ['createdFrom', 'createdTo'],
+        as: 'date',
+        error: 'The earlier date must fall on or before the later one.',
+        path: ['createdTo'],
+      },
+      ({ createdFrom, createdTo }) =>
+        createdFrom.getTime() <= createdTo.getTime()
+    )
   )
   .refine(
     ({ neverContacted, lastContactedBefore }) =>
@@ -759,20 +848,33 @@ export const clientLtvBucketingSchema = z
     createdTo: isoDateTimeSchema.optional(),
   })
   .strict()
-  .refine(({ boundariesCents }) => isStrictlyAscending(boundariesCents), {
-    error:
-      'Please list the boundaries from lowest to highest, without repeats.',
-    path: ['boundariesCents'],
-  })
-  .refine(
-    ({ createdFrom, createdTo }) =>
-      createdFrom === undefined ||
-      createdTo === undefined ||
-      createdFrom.getTime() <= createdTo.getTime(),
-    {
-      error: 'The earlier date must fall on or before the later one.',
-      path: ['createdTo'],
-    }
+  /**
+   * The ordering rule walks the list, and the range rule reads two `Date`s off
+   * a pair of `isoDateTimeSchema` pipes — which do not abort the object when
+   * they fail, so `{ createdFrom: 'foo', createdTo: 'bar' }` used to throw a
+   * `TypeError` out of `safeParse`. Both dependencies are now guarded.
+   */
+  .check(
+    crossField(
+      {
+        deps: ['boundariesCents'],
+        as: 'array',
+        error:
+          'Please list the boundaries from lowest to highest, without repeats.',
+        path: ['boundariesCents'],
+      },
+      ({ boundariesCents }) => isStrictlyAscending(boundariesCents)
+    ),
+    crossField(
+      {
+        deps: ['createdFrom', 'createdTo'],
+        as: 'date',
+        error: 'The earlier date must fall on or before the later one.',
+        path: ['createdTo'],
+      },
+      ({ createdFrom, createdTo }) =>
+        createdFrom.getTime() <= createdTo.getTime()
+    )
   )
 export type ClientLtvBucketingInput = z.infer<typeof clientLtvBucketingSchema>
 export type ClientLtvBucketingRawInput = z.input<

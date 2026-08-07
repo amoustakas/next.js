@@ -23,13 +23,23 @@
  *  4. Filter bounds are read from a query string. Every numeric and temporal
  *     bound in `mediaAssetFilterSchema` therefore goes through the coercion
  *     helpers in `./common`; the request-body schemas stay strict.
+ *  5. Every cross-field rule that reads a field's *value* goes through
+ *     `crossField` / `crossFieldMixed` from `./common` and attaches with
+ *     `.check(...)`, not `.refine(...)` (MCV-009). An object-level `.refine()`
+ *     runs even when a nested field has already failed, and it is handed the
+ *     raw, un-narrowed value — so `?createdFrom=foo&createdTo=bar` threw a
+ *     `TypeError` out of `safeParse` rather than returning
+ *     `{ success: false }`.
  */
 
 import { z } from 'zod'
 
 import {
+  MAX_FILTER_TAGS,
   MAX_SEARCH_LENGTH,
   NOTHING_TO_SAVE_MESSAGE,
+  crossField,
+  crossFieldMixed,
   cuidSchema,
   hasSomethingToSave,
   hasUniqueValues,
@@ -85,8 +95,11 @@ export const MAX_BULK_MEDIA_ASSETS = 200
 /** How many tags may be applied in a single bulk operation. */
 export const MAX_BULK_MEDIA_TAGS = 24
 
-/** How many tag handles a single filter may combine. */
-const MAX_FILTER_TAGS = 20
+/**
+ * `MAX_FILTER_TAGS` used to be declared here as well as in `menu.ts`. The two
+ * were the same number for the same reason — both filter over the same `Tag`
+ * table — so MCV-010 moved the single declaration to `./common`.
+ */
 
 /** A MIME type, with any parameters already stripped: `image/avif`. */
 const MIME_TYPE_PATTERN =
@@ -262,11 +275,25 @@ export const mediaAssetUpdateSchema = z
     error: NOTHING_TO_SAVE_MESSAGE,
     path: ['id'],
   })
-  .refine((value) => value.alt === undefined || value.alt.length > 0, {
-    error:
-      'Please describe this image — the description is read aloud to guests using a screen reader.',
-    path: ['alt'],
-  })
+  /**
+   * Reads `alt.length`, so `alt` is declared as a dependency rather than
+   * hand-guarded: an omitted description skips the rule, exactly as the
+   * `=== undefined` clause used to, and a description that arrived as something
+   * other than a string skips it too instead of dereferencing whatever was
+   * sent. See MCV-008 in `./common`.
+   */
+  .check(
+    crossField(
+      {
+        deps: ['alt'],
+        as: 'string',
+        error:
+          'Please describe this image — the description is read aloud to guests using a screen reader.',
+        path: ['alt'],
+      },
+      ({ alt }) => alt.length > 0
+    )
+  )
 export type MediaAssetUpdateInput = z.infer<typeof mediaAssetUpdateSchema>
 export type MediaAssetUpdateRawInput = z.input<typeof mediaAssetUpdateSchema>
 
@@ -351,15 +378,23 @@ export const mediaAssetFilterSchema = paginationSchema
     createdTo: withTemporalCoercion(isoDateTimeSchema.optional()),
     sortBy: mediaAssetSortBySchema,
   })
-  .refine(
-    ({ createdFrom, createdTo }) =>
-      createdFrom === undefined ||
-      createdTo === undefined ||
-      createdFrom.getTime() <= createdTo.getTime(),
-    {
-      error: 'The earlier date must fall on or before the later one.',
-      path: ['createdTo'],
-    }
+  /**
+   * Both bounds are pipes, and a failing pipe does not abort the object around
+   * it — so `?createdFrom=foo&createdTo=bar` sailed past the `=== undefined`
+   * clauses and called `.getTime()` on the string `'foo'`, throwing a
+   * `TypeError` out of `safeParse` instead of returning `{ success: false }`.
+   */
+  .check(
+    crossField(
+      {
+        deps: ['createdFrom', 'createdTo'],
+        as: 'date',
+        error: 'The earlier date must fall on or before the later one.',
+        path: ['createdTo'],
+      },
+      ({ createdFrom, createdTo }) =>
+        createdFrom.getTime() <= createdTo.getTime()
+    )
   )
 export type MediaAssetFilterInput = z.infer<typeof mediaAssetFilterSchema>
 export type MediaAssetFilterRawInput = z.input<typeof mediaAssetFilterSchema>
@@ -527,9 +562,20 @@ export const mediaBulkTagSchema = z
     mode: mediaBulkTagModeSchema.default('ADD'),
   })
   .strict()
-  .refine(({ mode, tagIds }) => mode === 'REPLACE' || tagIds.length > 0, {
-    error: 'Choose at least one tag first.',
-    path: ['tagIds'],
-  })
+  /**
+   * Reads `tagIds.length`, so the list is declared as a dependency: a `tagIds`
+   * that is not an array skips the rule rather than being dereferenced, and the
+   * array has already reported its own issue.
+   */
+  .check(
+    crossFieldMixed(
+      {
+        deps: { mode: 'string', tagIds: 'array' },
+        error: 'Choose at least one tag first.',
+        path: ['tagIds'],
+      },
+      ({ mode, tagIds }) => mode === 'REPLACE' || tagIds.length > 0
+    )
+  )
 export type MediaBulkTagInput = z.infer<typeof mediaBulkTagSchema>
 export type MediaBulkTagRawInput = z.input<typeof mediaBulkTagSchema>

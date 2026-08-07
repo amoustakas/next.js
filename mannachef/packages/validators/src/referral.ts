@@ -33,8 +33,11 @@
 import { z } from 'zod'
 
 import {
+  MAX_NOTE_LENGTH,
   MAX_SEARCH_LENGTH,
   buildUpdateSchema,
+  crossField,
+  crossFieldMixed,
   cuidSchema,
   currencySchema,
   hasUniqueValues,
@@ -73,8 +76,12 @@ export const DEFAULT_REFERRAL_CODE_LENGTH = 8
 /** Matches `ReferralCode.label` — `@db.VarChar(160)`. */
 const MAX_LABEL_LENGTH = 160
 
-/** Generous ceiling for a `@db.Text` note or reason. */
-const MAX_NOTE_LENGTH = 2_000
+/**
+ * `MAX_NOTE_LENGTH` was declared here as a local shadow of the constant
+ * `booking.ts` exported under the same name and with the same value. MCV-010
+ * moved the one declaration to `./common`; the import at the head of this file
+ * is that declaration, so the shadow is gone rather than merely renamed.
+ */
 
 /** $10,000.00 — the ceiling on a single reward or adjustment. */
 export const MAX_REWARD_CENTS = 1_000_000
@@ -249,10 +256,55 @@ const referralCodeCommonShape = {
 const EXPIRY_IN_PAST_MESSAGE =
   'Please choose an expiry in the future, or leave the code open-ended.'
 
-function expiryIsAhead(value: {
-  expiresAt?: Date | null | undefined
+/**
+ * The expiry rule, shared by the four create branches and the update schema.
+ *
+ * Attached with `.check(crossField(...))` rather than `.refine(...)` because
+ * `expiresAt` is an `isoDateTimeSchema`, which is a `z.ZodPipe`: a field of that
+ * kind failing does **not** abort the object's own checks, so the plain
+ * refinement this replaced reached `isInTheFuture('foo')` and threw a
+ * `TypeError` out of `safeParse`. The guard makes the check total — an
+ * `expiresAt` that is absent, `null`, or not a valid `Date` skips it, exactly as
+ * the old `value.expiresAt == null ||` clause intended for the first two cases
+ * and failed to cover for the third. See the cross-field section of `./common`.
+ */
+const EXPIRY_AHEAD_CONFIG = {
+  deps: ['expiresAt'],
+  as: 'date',
+  error: EXPIRY_IN_PAST_MESSAGE,
+  path: ['expiresAt'],
+} as const
+
+/** The predicate half of {@link EXPIRY_AHEAD_CONFIG}. Never sees a non-`Date`. */
+function expiryIsAhead(value: { expiresAt: Date }): boolean {
+  return isInTheFuture(value.expiresAt)
+}
+
+/**
+ * The `createdFrom` / `createdTo` window, shared by all three filter schemas in
+ * this file.
+ *
+ * Same reasoning as {@link EXPIRY_AHEAD_CONFIG}: both bounds are
+ * `withTemporalCoercion(isoDateTimeSchema.optional())`, so a `?createdFrom=foo`
+ * in a query string leaves the raw string on the object while the object's own
+ * checks still run. The `=== undefined ||` chain this replaced guarded against
+ * an *absent* bound and not against a *malformed* one, and
+ * `referralCodeFilterSchema.safeParse({ createdFrom: 'foo', createdTo: 'bar' })`
+ * threw rather than returning `{ success: false }`.
+ */
+const CREATED_WINDOW_CONFIG = {
+  deps: ['createdFrom', 'createdTo'],
+  as: 'date',
+  error: 'The earlier date must fall on or before the later one.',
+  path: ['createdTo'],
+} as const
+
+/** The predicate half of {@link CREATED_WINDOW_CONFIG}. */
+function createdWindowIsOrdered(value: {
+  createdFrom: Date
+  createdTo: Date
 }): boolean {
-  return value.expiresAt == null || isInTheFuture(value.expiresAt)
+  return value.createdFrom.getTime() <= value.createdTo.getTime()
 }
 
 // =============================================================================
@@ -278,10 +330,7 @@ export const referralCodeCreateSchema = z.discriminatedUnion(
         ...referralCodeCommonShape,
       })
       .strict()
-      .refine(expiryIsAhead, {
-        error: EXPIRY_IN_PAST_MESSAGE,
-        path: ['expiresAt'],
-      }),
+      .check(crossField(EXPIRY_AHEAD_CONFIG, (value) => expiryIsAhead(value))),
     z
       .object({
         rewardType: z.literal('PERCENT_DISCOUNT'),
@@ -290,10 +339,7 @@ export const referralCodeCreateSchema = z.discriminatedUnion(
         ...referralCodeCommonShape,
       })
       .strict()
-      .refine(expiryIsAhead, {
-        error: EXPIRY_IN_PAST_MESSAGE,
-        path: ['expiresAt'],
-      }),
+      .check(crossField(EXPIRY_AHEAD_CONFIG, (value) => expiryIsAhead(value))),
     z
       .object({
         rewardType: z.literal('FREE_MEAL'),
@@ -302,10 +348,7 @@ export const referralCodeCreateSchema = z.discriminatedUnion(
         ...referralCodeCommonShape,
       })
       .strict()
-      .refine(expiryIsAhead, {
-        error: EXPIRY_IN_PAST_MESSAGE,
-        path: ['expiresAt'],
-      }),
+      .check(crossField(EXPIRY_AHEAD_CONFIG, (value) => expiryIsAhead(value))),
     z
       .object({
         rewardType: z.literal('FREE_DELIVERY'),
@@ -314,10 +357,7 @@ export const referralCodeCreateSchema = z.discriminatedUnion(
         ...referralCodeCommonShape,
       })
       .strict()
-      .refine(expiryIsAhead, {
-        error: EXPIRY_IN_PAST_MESSAGE,
-        path: ['expiresAt'],
-      }),
+      .check(crossField(EXPIRY_AHEAD_CONFIG, (value) => expiryIsAhead(value))),
   ],
   { error: 'Please choose the reward this code should grant.' }
 )
@@ -381,16 +421,24 @@ const referralCodeUpdatableShape = {
  * The builder now performs the strip for every field at once, before
  * `.partial()`, and supplies the "nothing to save" guard as
  * `hasSomethingToSaveBeyond(1)` — the generalised form of `hasSomethingToSave`.
- * Both refinements that follow are unchanged.
+ *
+ * ## The two checks that follow
+ *
+ * The expiry rule is {@link EXPIRY_AHEAD_CONFIG}, attached with `.check()` so a
+ * malformed `expiresAt` skips it rather than throwing out of `safeParse`.
+ *
+ * The pairing rule stays a `superRefine`, and deliberately so: it raises up to
+ * two issues at two different paths, which no single-message cross-field check
+ * can express. It is safe as written — every field it touches is compared, none
+ * is dereferenced — and zod's default abort already keeps it from running when
+ * `rewardType`, `rewardValueCents` or `rewardValuePercent` failed its own
+ * parse.
  */
 export const referralCodeUpdateSchema = buildUpdateSchema(
   referralCodeUpdatableShape,
   { requireKeys: { id: cuidSchema } }
 )
-  .refine(expiryIsAhead, {
-    error: EXPIRY_IN_PAST_MESSAGE,
-    path: ['expiresAt'],
-  })
+  .check(crossField(EXPIRY_AHEAD_CONFIG, (value) => expiryIsAhead(value)))
   .superRefine((value, ctx) => {
     if (value.rewardType === undefined) {
       /**
@@ -511,15 +559,8 @@ export const referralCodeFilterSchema = paginationSchema
     createdTo: withTemporalCoercion(isoDateTimeSchema.optional()),
     sortBy: referralCodeSortBySchema,
   })
-  .refine(
-    ({ createdFrom, createdTo }) =>
-      createdFrom === undefined ||
-      createdTo === undefined ||
-      createdFrom.getTime() <= createdTo.getTime(),
-    {
-      error: 'The earlier date must fall on or before the later one.',
-      path: ['createdTo'],
-    }
+  .check(
+    crossField(CREATED_WINDOW_CONFIG, (value) => createdWindowIsOrdered(value))
   )
 export type ReferralCodeFilterInput = z.infer<typeof referralCodeFilterSchema>
 export type ReferralCodeFilterRawInput = z.input<
@@ -574,14 +615,17 @@ export const referralRedemptionStatusUpdateSchema = z.discriminatedUnion(
         qualifiedAt: isoDateTimeSchema.optional(),
       })
       .strict()
-      .refine(
-        ({ qualifiedAt }) =>
-          qualifiedAt === undefined || isNotInTheFuture(qualifiedAt),
-        {
-          error:
-            'A qualification cannot be recorded for a moment still to come.',
-          path: ['qualifiedAt'],
-        }
+      .check(
+        crossField(
+          {
+            deps: ['qualifiedAt'],
+            as: 'date',
+            error:
+              'A qualification cannot be recorded for a moment still to come.',
+            path: ['qualifiedAt'],
+          },
+          ({ qualifiedAt }) => isNotInTheFuture(qualifiedAt)
+        )
       ),
     z
       .object({
@@ -595,13 +639,16 @@ export const referralRedemptionStatusUpdateSchema = z.discriminatedUnion(
         rewardedAt: isoDateTimeSchema.optional(),
       })
       .strict()
-      .refine(
-        ({ rewardedAt }) =>
-          rewardedAt === undefined || isNotInTheFuture(rewardedAt),
-        {
-          error: 'A reward cannot be recorded for a moment still to come.',
-          path: ['rewardedAt'],
-        }
+      .check(
+        crossField(
+          {
+            deps: ['rewardedAt'],
+            as: 'date',
+            error: 'A reward cannot be recorded for a moment still to come.',
+            path: ['rewardedAt'],
+          },
+          ({ rewardedAt }) => isNotInTheFuture(rewardedAt)
+        )
       ),
     z
       .object({
@@ -629,22 +676,55 @@ export const referralRedemptionStatusUpdateSchema = z.discriminatedUnion(
         /**
          * Whether a compensating `REVERSAL` entry should be written against the
          * balance. Only meaningful once the reward has actually been paid.
+         *
+         * ## Required, not defaulted (MCV-010)
+         *
+         * This carried `.default(true)`. That was the last default injection in
+         * the package: a four-key `{ action, redemptionId, revokedReason }`
+         * payload parsed to five keys, and the fifth was one the caller never
+         * wrote.
+         *
+         * It was the *mildest* instance, and the reason is worth recording so
+         * nobody re-adds the default thinking it was harmless. This is a command
+         * union rather than an `{ id, patch }` update schema, and
+         * `reverseLedgerEntry` is not a column on `ReferralRedemption` — it is
+         * an instruction to the action about whether to write a *second* row, in
+         * `RewardLedgerEntry`. A fabricated value therefore could not reach
+         * `prisma.update` as a phantom field write, which is what made the same
+         * pattern dangerous everywhere else it was found.
+         *
+         * It is required anyway, because "harmless" is the wrong bar for this
+         * particular flag. `true` means claw back credit the guest has already
+         * been paid, which is the more destructive of the two readings and the
+         * one that touches money. A default that silently picks the destructive
+         * branch is a default that is doing the deciding, and the deciding
+         * belongs to the administrator filling in the revocation form — who is
+         * already being made to type a reason for exactly this sort of reason.
+         *
+         * Making it required is also a change zod enforces at the boundary
+         * rather than a convention: an existing caller that omitted the key now
+         * fails to parse with the message below, instead of quietly getting the
+         * behaviour it used to get by accident. The admin UI renders it as a
+         * checkbox that starts checked — a *presentation* default, which is
+         * where a default of this kind belongs.
          */
-        reverseLedgerEntry: z
-          .boolean({
-            error:
-              'Please say whether the credit already paid should be taken back.',
-          })
-          .default(true),
+        reverseLedgerEntry: z.boolean({
+          error:
+            'Please say whether the credit already paid should be taken back.',
+        }),
       })
       .strict()
-      .refine(
-        ({ revokedAt }) =>
-          revokedAt === undefined || isNotInTheFuture(revokedAt),
-        {
-          error: 'A withdrawal cannot be recorded for a moment still to come.',
-          path: ['revokedAt'],
-        }
+      .check(
+        crossField(
+          {
+            deps: ['revokedAt'],
+            as: 'date',
+            error:
+              'A withdrawal cannot be recorded for a moment still to come.',
+            path: ['revokedAt'],
+          },
+          ({ revokedAt }) => isNotInTheFuture(revokedAt)
+        )
       ),
   ],
   { error: 'Please choose what should happen to this redemption.' }
@@ -686,15 +766,8 @@ export const referralRedemptionFilterSchema = paginationSchema
     createdFrom: withTemporalCoercion(isoDateTimeSchema.optional()),
     createdTo: withTemporalCoercion(isoDateTimeSchema.optional()),
   })
-  .refine(
-    ({ createdFrom, createdTo }) =>
-      createdFrom === undefined ||
-      createdTo === undefined ||
-      createdFrom.getTime() <= createdTo.getTime(),
-    {
-      error: 'The earlier date must fall on or before the later one.',
-      path: ['createdTo'],
-    }
+  .check(
+    crossField(CREATED_WINDOW_CONFIG, (value) => createdWindowIsOrdered(value))
   )
 export type ReferralRedemptionFilterInput = z.infer<
   typeof referralRedemptionFilterSchema
@@ -785,46 +858,61 @@ export const rewardAdjustmentSchema = z
       }),
   })
   .strict()
-  .refine(
-    (value) => value.reason !== 'INVOICE_REDEMPTION' || value.invoiceId != null,
-    {
-      error: 'Please say which invoice this credit was spent against.',
-      path: ['invoiceId'],
-    }
-  )
-  .refine(
-    (value) =>
-      value.reason !== 'INVOICE_REDEMPTION' || value.direction === 'DEBIT',
-    {
-      error:
-        'Credit spent against an invoice leaves the balance — record it as a debit.',
-      path: ['direction'],
-    }
-  )
-  .refine(
-    (value) => value.reason !== 'EXPIRATION' || value.direction === 'DEBIT',
-    {
-      error:
-        'Credit that has expired leaves the balance — record it as a debit.',
-      path: ['direction'],
-    }
-  )
-  .refine(
-    (value) =>
-      value.reason !== 'PROMOTIONAL_GRANT' || value.direction === 'CREDIT',
-    {
-      error:
-        'A gesture of goodwill adds to the balance — record it as a credit.',
-      path: ['direction'],
-    }
-  )
-  .refine(
-    (value) =>
-      value.reason !== 'REVERSAL' || value.referralRedemptionId != null,
-    {
-      error: 'Please say which redemption is being reversed.',
-      path: ['referralRedemptionId'],
-    }
+  .check(
+    // Five rules, all keyed on `reason`, so all five declare it as a
+    // dependency: a `reason` the enum rejected produces its own precise issue
+    // and must not also produce four contradictory ones about the direction.
+    // `invoiceId` and `referralRedemptionId` are read from the raw object
+    // rather than declared, because their *absence* is the thing being caught
+    // and a declared dependency that is absent skips the check.
+    crossFieldMixed(
+      {
+        deps: { reason: 'present' },
+        error: 'Please say which invoice this credit was spent against.',
+        path: ['invoiceId'],
+      },
+      ({ reason }, raw) =>
+        reason !== 'INVOICE_REDEMPTION' || raw.invoiceId != null
+    ),
+    crossFieldMixed(
+      {
+        deps: { reason: 'present', direction: 'present' },
+        error:
+          'Credit spent against an invoice leaves the balance — record it as a debit.',
+        path: ['direction'],
+      },
+      ({ reason, direction }) =>
+        reason !== 'INVOICE_REDEMPTION' || direction === 'DEBIT'
+    ),
+    crossFieldMixed(
+      {
+        deps: { reason: 'present', direction: 'present' },
+        error:
+          'Credit that has expired leaves the balance — record it as a debit.',
+        path: ['direction'],
+      },
+      ({ reason, direction }) =>
+        reason !== 'EXPIRATION' || direction === 'DEBIT'
+    ),
+    crossFieldMixed(
+      {
+        deps: { reason: 'present', direction: 'present' },
+        error:
+          'A gesture of goodwill adds to the balance — record it as a credit.',
+        path: ['direction'],
+      },
+      ({ reason, direction }) =>
+        reason !== 'PROMOTIONAL_GRANT' || direction === 'CREDIT'
+    ),
+    crossFieldMixed(
+      {
+        deps: { reason: 'present' },
+        error: 'Please say which redemption is being reversed.',
+        path: ['referralRedemptionId'],
+      },
+      ({ reason }, raw) =>
+        reason !== 'REVERSAL' || raw.referralRedemptionId != null
+    )
   )
 export type RewardAdjustmentInput = z.infer<typeof rewardAdjustmentSchema>
 export type RewardAdjustmentRawInput = z.input<typeof rewardAdjustmentSchema>
@@ -881,25 +969,19 @@ export const rewardLedgerFilterSchema = paginationSchema
     createdFrom: withTemporalCoercion(isoDateTimeSchema.optional()),
     createdTo: withTemporalCoercion(isoDateTimeSchema.optional()),
   })
-  .refine(
-    ({ minAmountCents, maxAmountCents }) =>
-      minAmountCents === undefined ||
-      maxAmountCents === undefined ||
-      minAmountCents <= maxAmountCents,
-    {
-      error: 'The lower amount must not exceed the higher one.',
-      path: ['maxAmountCents'],
-    }
+  .check(
+    crossField(
+      {
+        deps: ['minAmountCents', 'maxAmountCents'],
+        as: 'number',
+        error: 'The lower amount must not exceed the higher one.',
+        path: ['maxAmountCents'],
+      },
+      ({ minAmountCents, maxAmountCents }) => minAmountCents <= maxAmountCents
+    )
   )
-  .refine(
-    ({ createdFrom, createdTo }) =>
-      createdFrom === undefined ||
-      createdTo === undefined ||
-      createdFrom.getTime() <= createdTo.getTime(),
-    {
-      error: 'The earlier date must fall on or before the later one.',
-      path: ['createdTo'],
-    }
+  .check(
+    crossField(CREATED_WINDOW_CONFIG, (value) => createdWindowIsOrdered(value))
   )
 export type RewardLedgerFilterInput = z.infer<typeof rewardLedgerFilterSchema>
 export type RewardLedgerFilterRawInput = z.input<

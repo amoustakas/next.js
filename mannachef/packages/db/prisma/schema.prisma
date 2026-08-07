@@ -1328,7 +1328,11 @@ model ChefAvailability {
   /// Null for RECURRING_WEEKLY rules.
   specificDate DateTime? @db.Date
 
-  /// Minutes from local midnight, 0–1440.
+  /// Minutes from local midnight. `startMinute` is 0–1439 — 0 is midnight at the
+  /// start of the day, and 1440 is only ever an end boundary. `endMinute` is
+  /// 1–1440 — 1440 is midnight at the end of the day, and a window cannot end at
+  /// the start of one. `endMinute` must be strictly greater than `startMinute`.
+  /// All three rules are enforced by CHECK constraints in `0000_init`.
   startMinute Int
   endMinute   Int
   timeZone    String @default("America/Toronto") @db.VarChar(64)

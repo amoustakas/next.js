@@ -28,8 +28,46 @@
  * a filter that silently loses `tagSlugs` on the way through would still be a
  * 200, and would still show the guest the wrong dishes.
  *
+ * ## The second half: the malformed path
+ *
+ * Everything above feeds the contract **valid** inputs. That is a real
+ * guarantee and it is only half of one, because a public endpoint is reached by
+ * strangers and most of what a stranger sends is not valid. The hole this left
+ * was not theoretical:
+ *
+ * ```text
+ *   GET /api/availability?startsFrom=foo&startsUntil=bar
+ *   → TypeError: value.startsUntil.getTime is not a function
+ *   → HTTP 500, unauthenticated, on a PUBLIC route
+ * ```
+ *
+ * Every fixture in `CASES` is a payload we would be happy to accept, so no
+ * arrangement of them could ever have caught that. The second section therefore
+ * drives each GET entry down the path a route handler actually takes when the
+ * query string is hostile —
+ *
+ * ```ts
+ * entry.input.safeParse(fromSearchParams(malformedQueryString, entry.input))
+ * ```
+ *
+ * — and asserts the two things that separate a 400 from a 500: nothing throws,
+ * and the result is a clean `{ success: false }` carrying issues.
+ *
+ * The auditor's literal repro is included by name, and every GET route is swept
+ * with generated hostile query strings: every key at once, each key alone, and
+ * every unordered pair of keys. The pair sweep is exhaustive rather than aimed
+ * at the declared cross-field rules for the reason set out at the head of
+ * `packages/validators/scripts/fuzz-schemas.ts` — a harness aimed by the
+ * mechanism under test cannot see that mechanism being removed.
+ *
+ * This file covers the transport. `pnpm --filter=@mannachef/validators
+ * verify:fuzz` covers the same invariant across every schema in the package,
+ * including the ones no route reaches.
+ *
  * Run: `pnpm --filter=@mannachef/api-contract verify:round-trip`
  */
+
+import { crossFieldDependencyKeys } from '@mannachef/validators'
 
 import {
   ApiContract,
@@ -570,6 +608,422 @@ function checkRoute(routeKey: ApiRouteKey): void {
 }
 
 // =============================================================================
+// The malformed path
+//
+// What a route handler does with a query string it did not expect. Reflection
+// over the input schema is done locally and defensively — zod publishes no
+// stable visitor, and a harness that throws while looking for things that throw
+// would be a poor joke.
+// =============================================================================
+
+/** The subset of a zod definition node this section reads. */
+interface MalformedDefNode {
+  readonly type: string
+  readonly shape?: Readonly<Record<string, unknown>>
+  readonly catchall?: unknown
+  readonly checks?: readonly unknown[]
+}
+
+/** The definition node behind a schema, or `undefined` for anything else. */
+function defNodeOf(value: unknown): MalformedDefNode | undefined {
+  if (typeof value !== 'object' || value === null) {
+    return undefined
+  }
+
+  const internals = (value as { readonly _zod?: unknown })._zod
+
+  if (typeof internals !== 'object' || internals === null) {
+    return undefined
+  }
+
+  const def = (internals as { readonly def?: unknown }).def
+
+  if (typeof def !== 'object' || def === null) {
+    return undefined
+  }
+
+  const { type } = def as { readonly type?: unknown }
+
+  return typeof type === 'string' ? (def as MalformedDefNode) : undefined
+}
+
+/** A field schema, reduced to the one method this section calls on it. */
+interface FieldSchema {
+  safeParse(input: unknown): { readonly success: boolean }
+}
+
+/** True for a value that can be parsed with. */
+function isFieldSchema(value: unknown): value is FieldSchema {
+  if (defNodeOf(value) === undefined) {
+    return false
+  }
+
+  return (
+    typeof (value as { readonly safeParse?: unknown }).safeParse === 'function'
+  )
+}
+
+/**
+ * Values a query string can actually deliver — all strings, because that is all
+ * a URL carries. `'foo'` leads because it is the auditor's own value.
+ */
+const HOSTILE_QUERY_VALUES: readonly string[] = [
+  'foo',
+  'bar',
+  '§ not-a-valid-value §',
+  '-1e999',
+  '99999999999999999999',
+  'x'.repeat(2_048),
+]
+
+/**
+ * Raw query strings that are malformed as *transport* rather than as values:
+ * bad percent-encoding, empty pairs, a repeated scalar, and the two keys that
+ * reach for `Object.prototype`.
+ *
+ * None of these carries an asserted rejection. A filter schema is entitled to
+ * read `?page=&pageSize=` as "no filter" and succeed — that is what
+ * `withNumericCoercion` is for. The claim being made about them is the
+ * unconditional one: `fromSearchParams` and `safeParse` both return.
+ */
+const MALFORMED_TRANSPORT: readonly (readonly [
+  label: string,
+  query: string,
+])[] = [
+  ['empty', ''],
+  ['separators only', '&&&'],
+  ['bare equals', '='],
+  ['leading question mark', '?page=1'],
+  ['bare key, no equals', 'page'],
+  ['empty values', 'page=&pageSize=&search='],
+  ['invalid percent-encoding', '%zz=%E0%A4%A&%=%'],
+  ['repeated scalar key', 'page=1&page=2&page=3'],
+  ['prototype key', '__proto__=foo'],
+  ['prototype key, repeated', '__proto__=foo&__proto__=bar'],
+  ['constructor key', 'constructor=foo&toString=bar'],
+  ['bracket notation', 'a[]=1&a[]=2&a[0][b]=3'],
+  ['very long value', `search=${'y'.repeat(8_192)}`],
+  ['newline injection', 'search=a%0D%0AX-Injected:%20yes'],
+  ['nul byte', 'search=a%00b'],
+]
+
+/**
+ * The routes the audit found answering a two-character query string with an
+ * HTTP 500.
+ *
+ * Every one of them carries a cross-field rule over a pair of `Date` fields,
+ * which is the crash: comparing two `Date`s means calling `.getTime()`, and an
+ * object-level refinement in zod 4 still runs after a `ZodPipe` field has
+ * failed, so it was handed the raw string. The routes whose cross-field rules
+ * compare *numbers* — `menu.list` and `staff.directory` — were never in this
+ * list, because `'foo' > 'bar'` merely evaluates to `false`. They are swept
+ * anyway; every GET entry in the contract is.
+ *
+ * The list is asserted against the contract below, and each entry is required
+ * to have taken at least one malformed case whose rejection was asserted. A
+ * route dropping off the contract, or losing the field pair the case names, is
+ * a failure here rather than a silently narrower sweep.
+ */
+const PREVIOUSLY_500ING: readonly ApiRouteKey[] = [
+  'availability.query',
+  'appointment.list',
+  'invoice.list',
+  'payment.history',
+  'onboarding.read',
+  'referral.read',
+  'subscription.read',
+]
+
+/**
+ * The auditor's repro, verbatim.
+ *
+ * Named rather than generated so it survives any future change to the hostile
+ * ladder, and so a failure quotes the string from the ticket. It is driven at
+ * *every* GET route: on the two that declare `startsFrom`/`startsUntil` it is
+ * the original crash, and on the rest it is a pair of keys the schema does not
+ * know, which must still be answered rather than thrown at.
+ */
+const AUDITOR_REPRO = 'startsFrom=foo&startsUntil=bar'
+
+let malformedCases = 0
+let malformedThrows = 0
+let malformedRejectionsAsserted = 0
+
+/** Which routes took at least one malformed case with an asserted rejection. */
+const provenRejecting = new Set<ApiRouteKey>()
+
+/** Truncates a query string for a report line. */
+function showQuery(query: string): string {
+  return query.length > 160 ? `${query.slice(0, 160)}…` : query
+}
+
+/**
+ * One malformed request, driven exactly as a route handler drives it.
+ *
+ * `mustReject` is asserted only where the schema's own field schema is known to
+ * refuse the value — see the falsifiability note in
+ * `packages/validators/scripts/fuzz-schemas.ts`. A filter that legitimately
+ * accepts a string is not a bug, and asserting otherwise would make a green run
+ * meaningless.
+ */
+function driveMalformed(
+  routeKey: ApiRouteKey,
+  entry: AnyApiRoute,
+  label: string,
+  query: string,
+  mustReject: boolean
+): void {
+  malformedCases += 1
+
+  let bag: Record<string, string | readonly string[]>
+
+  try {
+    bag = fromSearchParams(query, entry.input)
+  } catch (error) {
+    malformedThrows += 1
+    failures.push({
+      route: routeKey,
+      label: `malformed / ${label}`,
+      detail: `fromSearchParams threw on ?${showQuery(query)}\n      ${error instanceof Error ? (error.stack ?? error.message) : String(error)}`,
+    })
+
+    return
+  }
+
+  let result: ReturnType<AnyApiRoute['input']['safeParse']>
+
+  try {
+    result = entry.input.safeParse(bag)
+  } catch (error) {
+    malformedThrows += 1
+    failures.push({
+      route: routeKey,
+      label: `malformed / ${label}`,
+      detail: `safeParse THREW on ?${showQuery(query)} — this is the HTTP 500.\n      A route handler has no way to turn this into a 400; the throw escapes before it can.\n      ${error instanceof Error ? (error.stack ?? error.message) : String(error)}`,
+    })
+
+    return
+  }
+
+  if (!result.success && result.error.issues.length === 0) {
+    failures.push({
+      route: routeKey,
+      label: `malformed / ${label}`,
+      detail: `safeParse failed with no issues on ?${showQuery(query)} — a handler has nothing to put in fieldErrors.`,
+    })
+
+    return
+  }
+
+  if (!mustReject) {
+    return
+  }
+
+  malformedRejectionsAsserted += 1
+  provenRejecting.add(routeKey)
+
+  if (result.success) {
+    failures.push({
+      route: routeKey,
+      label: `malformed / ${label}`,
+      detail: `safeParse ACCEPTED ?${showQuery(query)}, every named key of which its own field schema rejects.\n      parsed → ${show(result.data)}`,
+    })
+  }
+}
+
+/**
+ * A query-string value the field's own schema refuses, when one exists.
+ *
+ * `isArrayKey` is not a detail. `fromSearchParams` reads a key listed by
+ * `queryArrayKeys` as a list even when it appears once, so `?tagSlugs=foo`
+ * reaches the schema as `['foo']` — which `z.array(slugSchema)` is perfectly
+ * happy with. Probing such a field with the bare string `'foo'` gets a
+ * rejection for the wrong reason (an array schema refusing a string) and makes
+ * the harness assert that the *route* must reject a query string it should
+ * accept. The first draft did exactly that and reported four phantom failures
+ * against `menu.list` and `staff.directory`.
+ *
+ * The probe therefore models the transport: it asks the field the same question
+ * `fromSearchParams` will hand it.
+ */
+function hostileValueFor(
+  field: unknown,
+  isArrayKey: boolean
+): string | undefined {
+  if (!isFieldSchema(field)) {
+    return undefined
+  }
+
+  for (const candidate of HOSTILE_QUERY_VALUES) {
+    const asDelivered: unknown = isArrayKey ? [candidate] : candidate
+    let rejected: boolean
+
+    try {
+      rejected = !field.safeParse(asDelivered).success
+    } catch {
+      // A field schema that throws on a bare string is itself the defect, and
+      // the whole-route cases below will surface it with a stack. Treat the
+      // candidate as unusable here rather than reporting it twice.
+      continue
+    }
+
+    if (rejected) {
+      return candidate
+    }
+  }
+
+  return undefined
+}
+
+/** `key=value`, encoded the way a browser encodes it. */
+function pair(key: string, value: string): string {
+  const search = new URLSearchParams()
+
+  search.append(key, value)
+
+  return search.toString()
+}
+
+/** Every unordered pair of the given keys, each pair listed once. */
+function keyPairs(
+  keys: readonly string[]
+): readonly (readonly [string, string])[] {
+  const pairs: (readonly [string, string])[] = []
+
+  for (let i = 0; i < keys.length; i += 1) {
+    for (let j = i + 1; j < keys.length; j += 1) {
+      const left = keys[i]
+      const right = keys[j]
+
+      if (left !== undefined && right !== undefined) {
+        pairs.push([left, right])
+      }
+    }
+  }
+
+  return pairs
+}
+
+/** The field pairs a `crossField` check on this schema declares it reads. */
+function declaredPairsFor(entry: AnyApiRoute): readonly string[] {
+  const def = defNodeOf(entry.input)
+  const labels: string[] = []
+
+  for (const check of def?.checks ?? []) {
+    const deps = crossFieldDependencyKeys(check)
+
+    if (deps !== undefined && deps.length > 1) {
+      labels.push(deps.join('+'))
+    }
+  }
+
+  return labels
+}
+
+/** The whole malformed sweep for one GET route. */
+function checkMalformedRoute(routeKey: ApiRouteKey): void {
+  const entry: AnyApiRoute = ApiContract[routeKey]
+  const shape = defNodeOf(entry.input)?.shape ?? {}
+  const keys = Object.keys(shape)
+
+  // The contract's own answer to "which keys arrive as lists", so the probes
+  // below ask each field the question `fromSearchParams` will actually ask it.
+  const arrayKeys = queryArrayKeys(entry.input)
+
+  // --- the named regression, on every route --------------------------------
+
+  const reproKeys = ['startsFrom', 'startsUntil'].filter((key) => key in shape)
+
+  driveMalformed(
+    routeKey,
+    entry,
+    `AUDITOR REPRO ?${AUDITOR_REPRO}`,
+    AUDITOR_REPRO,
+    reproKeys.length > 0 &&
+      reproKeys.every(
+        (key) => hostileValueFor(shape[key], arrayKeys.has(key)) !== undefined
+      )
+  )
+
+  // --- transport-level junk ------------------------------------------------
+
+  for (const [label, query] of MALFORMED_TRANSPORT) {
+    driveMalformed(routeKey, entry, label, query, false)
+  }
+
+  // --- one hostile value per key, chosen by probing the field itself -------
+
+  const hostile = new Map<string, string>()
+
+  for (const key of keys) {
+    const value = hostileValueFor(shape[key], arrayKeys.has(key))
+
+    if (value !== undefined) {
+      hostile.set(key, value)
+    }
+  }
+
+  // Keys the field schema accepts anything for still get sent — the no-throw
+  // claim is unconditional — they just carry no rejection assertion.
+  const everyKey = keys
+    .map((key) => pair(key, hostile.get(key) ?? 'foo'))
+    .join('&')
+
+  if (everyKey.length > 0) {
+    driveMalformed(
+      routeKey,
+      entry,
+      'every key hostile',
+      everyKey,
+      hostile.size > 0
+    )
+  }
+
+  for (const key of keys) {
+    const value = hostile.get(key)
+
+    driveMalformed(
+      routeKey,
+      entry,
+      `one key hostile: ${key}`,
+      pair(key, value ?? 'foo'),
+      value !== undefined
+    )
+  }
+
+  // --- every unordered pair of keys ----------------------------------------
+
+  for (const [left, right] of keyPairs(keys)) {
+    const leftValue = hostile.get(left)
+    const rightValue = hostile.get(right)
+
+    driveMalformed(
+      routeKey,
+      entry,
+      `hostile pair: ${left}+${right}`,
+      `${pair(left, leftValue ?? 'foo')}&${pair(right, rightValue ?? 'bar')}`,
+      leftValue !== undefined && rightValue !== undefined
+    )
+
+    // The auditor's literal spelling on top of the ladder's choice, so the
+    // shape of the reported repro does not depend on which rung was picked.
+    driveMalformed(
+      routeKey,
+      entry,
+      `hostile pair, literal: ${left}=foo&${right}=bar`,
+      `${pair(left, 'foo')}&${pair(right, 'bar')}`,
+      false
+    )
+  }
+
+  const declared = declaredPairsFor(entry)
+
+  console.log(
+    `\n  ${routeKey}  (${String(keys.length)} keys, ${String(keyPairs(keys).length)} pairs, declared cross-field: ${declared.length > 0 ? declared.join(', ') : 'none'})`
+  )
+}
+
+// =============================================================================
 // Run
 // =============================================================================
 
@@ -587,7 +1041,56 @@ for (const routeKey of getRoutes) {
 }
 
 console.log(
-  `\n${'-'.repeat(72)}\nroutes: ${getRoutes.length}   cases: ${casesRun}   assertions: ${assertions}   failures: ${failures.length}`
+  `\n${'-'.repeat(72)}\nround trip — routes: ${getRoutes.length}   cases: ${casesRun}   assertions: ${assertions}`
+)
+
+// --- the malformed half ------------------------------------------------------
+
+console.log(
+  '\nMalformed GET: fromSearchParams(hostile query, entry.input) → entry.input.safeParse'
+)
+console.log(
+  `${getRoutes.length} GET routes, ${PREVIOUSLY_500ING.length} of them named in the MCV-011 audit as answering a two-character query string with a 500`
+)
+
+for (const routeKey of getRoutes) {
+  checkMalformedRoute(routeKey)
+}
+
+// Every route the audit named must still be a GET entry in the contract, and
+// must have taken at least one malformed case whose rejection was asserted.
+// Without this, a route losing the field pair its repro names would quietly
+// reduce to a no-throw check and the regression would have somewhere to hide.
+for (const routeKey of PREVIOUSLY_500ING) {
+  if (ApiContract[routeKey].method !== 'GET') {
+    failures.push({
+      route: routeKey,
+      label: 'coverage',
+      detail:
+        'listed in PREVIOUSLY_500ING but is no longer a GET route. Either the audit list is stale or the route moved; decide which, do not delete the line.',
+    })
+
+    continue
+  }
+
+  if (!provenRejecting.has(routeKey)) {
+    failures.push({
+      route: routeKey,
+      label: 'coverage',
+      detail:
+        'took no malformed case with an asserted rejection. Every field of its filter now accepts every hostile value the ladder offers, which means this route is being swept but not actually checked.',
+    })
+  }
+}
+
+console.log(
+  `\n${'-'.repeat(72)}\nmalformed — routes: ${getRoutes.length}   cases: ${malformedCases}   rejections asserted: ${malformedRejectionsAsserted}   throws: ${malformedThrows}`
+)
+console.log(
+  `audit routes proven to reject: ${PREVIOUSLY_500ING.filter((key) => provenRejecting.has(key)).length}/${PREVIOUSLY_500ING.length}`
+)
+console.log(
+  `\ntotal cases: ${casesRun + malformedCases}   failures: ${failures.length}`
 )
 
 if (failures.length > 0) {
@@ -602,4 +1105,6 @@ if (failures.length > 0) {
   process.exit(1)
 }
 
-console.log('\nPASS — every GET route round-trips through its own serialiser.')
+console.log(
+  '\nPASS — every GET route round-trips through its own serialiser, and answers a hostile query string with a clean { success: false }.'
+)

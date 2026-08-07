@@ -39,6 +39,8 @@ import { amountCentsSchema, chargeableAmountCentsSchema } from './billing'
 import {
   MAX_SEARCH_LENGTH,
   buildUpdateSchema,
+  crossField,
+  crossFieldMixed,
   cuidSchema,
   currencySchema,
   hasUniqueValues,
@@ -47,6 +49,7 @@ import {
   optionalProse,
   paginationSchema,
   queryFlag,
+  stripeIdSchema,
   urlSchema,
   withNumericCoercion,
   withTemporalCoercion,
@@ -60,9 +63,6 @@ import {
 // =============================================================================
 // Limits & patterns
 // =============================================================================
-
-/** Matches every Stripe identifier column on this table — `@db.VarChar(255)`. */
-const MAX_STRIPE_ID_LENGTH = 255
 
 /** Matches `PaymentHistory.cardBrand` — `@db.VarChar(40)`. */
 const MAX_CARD_BRAND_LENGTH = 40
@@ -126,24 +126,20 @@ export function isTerminalPaymentStatus(status: PaymentStatus): boolean {
 // Field schemas
 // =============================================================================
 
-/** A Stripe identifier of a known shape, bounded by the column width. */
-function stripeReferenceSchema(
-  pattern: RegExp,
-  missingMessage: string,
-  shapeMessage: string
-) {
-  return z
-    .string({ error: missingMessage })
-    .trim()
-    .min(1, { error: missingMessage })
-    .max(MAX_STRIPE_ID_LENGTH, {
-      error: 'That Stripe reference is longer than our records allow.',
-    })
-    .refine((value) => pattern.test(value), { error: shapeMessage })
-}
+/**
+ * The local `stripeReferenceSchema` is gone. It was byte-identical to
+ * `billing.ts`'s `stripeIdSchema` — same trim, same blank check, same
+ * `VarChar(255)` bound, same over-long message, same `.refine` — so MCV-010
+ * hoisted the single definition into `./common` under the `stripeIdSchema`
+ * name and both modules now import it. `MAX_STRIPE_ID_LENGTH` moved with it,
+ * since bounding that helper was its only use here.
+ *
+ * The `pi_` and `ch_`/`py_` patterns above stay: they are facts about
+ * `PaymentHistory`, not shared vocabulary.
+ */
 
 /** `PaymentHistory.stripePaymentIntentId` — `@unique`, so idempotency hangs on it. */
-export const stripePaymentIntentIdSchema = stripeReferenceSchema(
+export const stripePaymentIntentIdSchema = stripeIdSchema(
   STRIPE_PAYMENT_INTENT_ID_PATTERN,
   'Please provide the Stripe payment reference.',
   'A Stripe payment reference begins with pi_ — copy it from the Stripe dashboard.'
@@ -151,7 +147,7 @@ export const stripePaymentIntentIdSchema = stripeReferenceSchema(
 export type StripePaymentIntentId = z.infer<typeof stripePaymentIntentIdSchema>
 
 /** `PaymentHistory.stripeChargeId`. */
-export const stripeChargeIdSchema = stripeReferenceSchema(
+export const stripeChargeIdSchema = stripeIdSchema(
   STRIPE_CHARGE_ID_PATTERN,
   'Please provide the Stripe charge reference.',
   'A Stripe charge reference begins with ch_ or py_.'
@@ -268,27 +264,44 @@ export const paymentRecordSchema = z
     ...paymentAmendableShape,
   })
   .strict()
-  .refine(
-    (value) =>
-      value.method === 'CARD' ||
-      (value.cardBrand == null && value.cardLast4 == null),
-    {
-      error: 'Card details belong only on a payment that was made by card.',
-      path: ['cardLast4'],
-    }
+  .check(
+    // All three go through `crossFieldMixed` rather than `.refine()`. Two of
+    // them read `processedAt`, which is a `settledAtSchema` — an
+    // `isoDateTimeSchema`, and therefore a `z.ZodPipe`, whose failure does not
+    // abort the object's own checks. Declaring the discriminating field as a
+    // dependency also stops a rejected `method` or `status` from producing a
+    // second, contradictory issue on top of its own.
+    //
+    // `cardBrand`, `cardLast4` and `processedAt` are read from the raw object
+    // instead of being declared, because it is precisely their absence each
+    // rule turns on, and a declared dependency that is absent skips the check.
+    crossFieldMixed(
+      {
+        deps: { method: 'present' },
+        error: 'Card details belong only on a payment that was made by card.',
+        path: ['cardLast4'],
+      },
+      ({ method }, raw) =>
+        method === 'CARD' || (raw.cardBrand == null && raw.cardLast4 == null)
+    ),
+    crossFieldMixed(
+      {
+        deps: { status: 'present' },
+        error: 'A payment that succeeded must say when it settled.',
+        path: ['processedAt'],
+      },
+      ({ status }, raw) => status !== 'SUCCEEDED' || raw.processedAt != null
+    ),
+    crossFieldMixed(
+      {
+        deps: { status: 'present' },
+        error:
+          'Record a failed payment with its reason, so the client can be told why.',
+        path: ['status'],
+      },
+      ({ status }) => status !== 'FAILED'
+    )
   )
-  .refine(
-    (value) => value.status !== 'SUCCEEDED' || value.processedAt != null,
-    {
-      error: 'A payment that succeeded must say when it settled.',
-      path: ['processedAt'],
-    }
-  )
-  .refine((value) => value.status !== 'FAILED', {
-    error:
-      'Record a failed payment with its reason, so the client can be told why.',
-    path: ['status'],
-  })
 export type PaymentRecordInput = z.infer<typeof paymentRecordSchema>
 export type PaymentRecordRawInput = z.input<typeof paymentRecordSchema>
 
@@ -342,10 +355,17 @@ export const paymentRefundSchema = z
       .optional(),
   })
   .strict()
-  .refine((value) => value.refundedCents <= value.amountCents, {
-    error: 'A refund cannot exceed the amount that was paid.',
-    path: ['refundedCents'],
-  })
+  .check(
+    crossField(
+      {
+        deps: ['refundedCents', 'amountCents'],
+        as: 'number',
+        error: 'A refund cannot exceed the amount that was paid.',
+        path: ['refundedCents'],
+      },
+      ({ refundedCents, amountCents }) => refundedCents <= amountCents
+    )
+  )
 export type PaymentRefundInput = z.infer<typeof paymentRefundSchema>
 export type PaymentRefundRawInput = z.input<typeof paymentRefundSchema>
 
@@ -486,39 +506,52 @@ export const paymentFilterSchema = paginationSchema
     processedTo: withTemporalCoercion(isoDateTimeSchema.optional()),
     sortBy: paymentSortBySchema,
   })
-  .refine(
-    ({ minAmountCents, maxAmountCents }) =>
-      minAmountCents === undefined ||
-      maxAmountCents === undefined ||
-      minAmountCents <= maxAmountCents,
-    {
-      error: 'The smallest amount must not exceed the largest one.',
-      path: ['maxAmountCents'],
-    }
+  .check(
+    // Every bound here is optional and every one of them arrives from a query
+    // string, so `?minAmountCents=foo&maxAmountCents=bar` used to reach the
+    // comparison with two raw strings, and `?createdFrom=foo` used to reach
+    // `.getTime()` on one. The guards make all four rules total: a bound that
+    // is absent, or that failed its own parse, skips the check instead of
+    // crashing it or contradicting it.
+    crossField(
+      {
+        deps: ['minAmountCents', 'maxAmountCents'],
+        as: 'number',
+        error: 'The smallest amount must not exceed the largest one.',
+        path: ['maxAmountCents'],
+      },
+      ({ minAmountCents, maxAmountCents }) => minAmountCents <= maxAmountCents
+    ),
+    crossField(
+      {
+        deps: ['createdFrom', 'createdTo'],
+        as: 'date',
+        error: 'The earlier date must fall on or before the later one.',
+        path: ['createdTo'],
+      },
+      ({ createdFrom, createdTo }) =>
+        createdFrom.getTime() <= createdTo.getTime()
+    ),
+    crossField(
+      {
+        deps: ['processedFrom', 'processedTo'],
+        as: 'date',
+        error: 'The earlier date must fall on or before the later one.',
+        path: ['processedTo'],
+      },
+      ({ processedFrom, processedTo }) =>
+        processedFrom.getTime() <= processedTo.getTime()
+    ),
+    crossField(
+      {
+        deps: ['refundedOnly', 'failedOnly'],
+        as: 'boolean',
+        error:
+          'A payment that failed was never taken, so it cannot be refunded.',
+        path: ['failedOnly'],
+      },
+      ({ refundedOnly, failedOnly }) => !(refundedOnly && failedOnly)
+    )
   )
-  .refine(
-    ({ createdFrom, createdTo }) =>
-      createdFrom === undefined ||
-      createdTo === undefined ||
-      createdFrom.getTime() <= createdTo.getTime(),
-    {
-      error: 'The earlier date must fall on or before the later one.',
-      path: ['createdTo'],
-    }
-  )
-  .refine(
-    ({ processedFrom, processedTo }) =>
-      processedFrom === undefined ||
-      processedTo === undefined ||
-      processedFrom.getTime() <= processedTo.getTime(),
-    {
-      error: 'The earlier date must fall on or before the later one.',
-      path: ['processedTo'],
-    }
-  )
-  .refine(({ refundedOnly, failedOnly }) => !(refundedOnly && failedOnly), {
-    error: 'A payment that failed was never taken, so it cannot be refunded.',
-    path: ['failedOnly'],
-  })
 export type PaymentFilterInput = z.infer<typeof paymentFilterSchema>
 export type PaymentFilterRawInput = z.input<typeof paymentFilterSchema>

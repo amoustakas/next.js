@@ -24,6 +24,10 @@
       "dependsOn": ["^build"],
       "outputs": []
     },
+    "verify": {
+      "dependsOn": ["^build"],
+      "outputs": []
+    },
     "db:generate": {
       "cache": false
     },

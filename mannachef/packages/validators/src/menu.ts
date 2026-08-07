@@ -30,8 +30,11 @@
 import { z } from 'zod'
 
 import {
+  MAX_FILTER_TAGS,
   MAX_SEARCH_LENGTH,
+  MAX_SORT_ORDER,
   NOTHING_TO_SAVE_MESSAGE,
+  crossField,
   cuidSchema,
   currencySchema,
   durationMinutesSchema,
@@ -72,9 +75,6 @@ const MAX_SHORT_PROSE_LENGTH = 2_000
 /** Ceiling for the long-form narrative fields on a dish. */
 const MAX_LONG_PROSE_LENGTH = 8_000
 
-/** Highest manual sort position we accept. Comfortably beyond any real menu. */
-const MAX_SORT_ORDER = 10_000
-
 /** $250,000.00 — a guard rail against a mistyped price, not a business rule. */
 export const MAX_MENU_PRICE_CENTS = 25_000_000
 
@@ -96,8 +96,12 @@ export const MAX_MENU_ITEM_TAGS = 24
 /** How many dishes one bulk action may touch. */
 export const MAX_BULK_MENU_ITEMS = 100
 
-/** How many tag handles a single filter may combine. */
-const MAX_FILTER_TAGS = 20
+/**
+ * `MAX_SORT_ORDER` and `MAX_FILTER_TAGS` used to be declared here. Both were
+ * duplicated verbatim elsewhere — the sort ceiling in `billing.ts`, the tag
+ * ceiling in `media.ts` — so MCV-010 moved them to `./common`, which is where
+ * the two imports at the head of this file now come from.
+ */
 
 /**
  * The MannaChef palette, per `mannachef/CONTRACT.md` §3.
@@ -202,6 +206,27 @@ const SEASON_INCOMPLETE_MESSAGE =
 
 const SEASON_INCONSISTENT_MESSAGE =
   'Either mark this dish as seasonal, or clear its months from the calendar.'
+
+/**
+ * ## Which rules in this file use `.check(crossField(…))`, and which do not
+ *
+ * A zod 4 object-level `.refine()` runs even when one of the object's own
+ * fields has already failed, and receives that field's *raw* value — so any
+ * rule that reaches into a field can turn a bad payload into a `TypeError`
+ * (an HTTP 500) rather than a validation error. `crossField` (see `common.ts`)
+ * declares which fields a rule reads, suppresses it when one of them already
+ * produced an issue, and guarantees the predicate sees values of the declared
+ * runtime type.
+ *
+ * Every rule below that *reads a value* — the price band on
+ * `menuItemFilterSchema`, the recipe and gallery rules that call `.map`,
+ * `.filter` and `.length` on an array — goes through it.
+ *
+ * The two seasonality rules and `hasSomethingToSave` deliberately do not. They
+ * test only which keys are present, never what is in them: `seasonStart != null`
+ * cannot throw whatever the caller sent, and both rules exist precisely to fire
+ * when a field is *missing*, which is the one case a declared dependency skips.
+ */
 
 // =============================================================================
 // Shared field schemas
@@ -586,15 +611,25 @@ export const menuItemFilterSchema = paginationSchema
     ),
     sortBy: menuItemSortBySchema,
   })
-  .refine(
-    ({ priceCentsMin, priceCentsMax }) =>
-      priceCentsMin === undefined ||
-      priceCentsMax === undefined ||
-      priceCentsMin <= priceCentsMax,
-    {
-      error: 'The lowest price must sit at or below the highest.',
-      path: ['priceCentsMax'],
-    }
+  /**
+   * Both bounds arrive from a query string through `withNumericCoercion`, which
+   * makes each one a `z.ZodPipe` — and a failing pipe does not abort its parent
+   * object in zod 4. The old `.refine()` therefore compared whatever the caller
+   * sent: `?priceCentsMin=foo&priceCentsMax=bar` reached `'foo' <= 'bar'`, a
+   * string comparison that happens to be `true` and quietly said nothing. Worse
+   * orderings said the wrong thing. Declaring both as `'number'` dependencies
+   * means the band is only judged once both bounds really are numbers.
+   */
+  .check(
+    crossField(
+      {
+        deps: ['priceCentsMin', 'priceCentsMax'],
+        as: 'number',
+        error: 'The lowest price must sit at or below the highest.',
+        path: ['priceCentsMax'],
+      },
+      ({ priceCentsMin, priceCentsMax }) => priceCentsMin <= priceCentsMax
+    )
   )
 export type MenuItemFilterInput = z.infer<typeof menuItemFilterSchema>
 export type MenuItemFilterRawInput = z.input<typeof menuItemFilterSchema>
@@ -924,14 +959,18 @@ export const menuItemIngredientSetSchema = z
       }),
   })
   .strict()
-  .refine(
-    ({ ingredients }) =>
-      hasUniqueValues(ingredients.map((entry) => entry.ingredientId)),
-    {
-      error:
-        'That ingredient is already in this recipe — adjust its quantity instead of listing it twice.',
-      path: ['ingredients'],
-    }
+  .check(
+    crossField(
+      {
+        deps: ['ingredients'],
+        as: 'array',
+        error:
+          'That ingredient is already in this recipe — adjust its quantity instead of listing it twice.',
+        path: ['ingredients'],
+      },
+      ({ ingredients }) =>
+        hasUniqueValues(ingredients.map((entry) => entry.ingredientId))
+    )
   )
   .transform(({ menuItemId, ingredients }) => ({
     menuItemId,
@@ -994,32 +1033,40 @@ export const menuItemMediaAssociationSchema = z
       }),
   })
   .strict()
-  .refine(
-    ({ media }) => hasUniqueValues(media.map((entry) => entry.mediaAssetId)),
-    {
-      error: 'That photograph already appears in this gallery.',
-      path: ['media'],
-    }
-  )
-  .refine(
-    ({ media }) => media.filter((entry) => entry.isPrimary).length === 1,
-    {
-      error:
-        'Choose exactly one lead photograph — it is the image the dish is remembered by.',
-      path: ['media'],
-    }
-  )
-  .refine(
-    ({ media }) => {
-      const declared = media
-        .map((entry) => entry.sortOrder)
-        .filter((value): value is number => value !== undefined)
-      return hasUniqueValues(declared)
-    },
-    {
-      error: 'Two photographs cannot share the same position in the gallery.',
-      path: ['media'],
-    }
+  .check(
+    crossField(
+      {
+        deps: ['media'],
+        as: 'array',
+        error: 'That photograph already appears in this gallery.',
+        path: ['media'],
+      },
+      ({ media }) => hasUniqueValues(media.map((entry) => entry.mediaAssetId))
+    ),
+    crossField(
+      {
+        deps: ['media'],
+        as: 'array',
+        error:
+          'Choose exactly one lead photograph — it is the image the dish is remembered by.',
+        path: ['media'],
+      },
+      ({ media }) => media.filter((entry) => entry.isPrimary).length === 1
+    ),
+    crossField(
+      {
+        deps: ['media'],
+        as: 'array',
+        error: 'Two photographs cannot share the same position in the gallery.',
+        path: ['media'],
+      },
+      ({ media }) => {
+        const declared = media
+          .map((entry) => entry.sortOrder)
+          .filter((value): value is number => value !== undefined)
+        return hasUniqueValues(declared)
+      }
+    )
   )
   .transform(({ menuItemId, media }) => ({
     menuItemId,
