@@ -47,10 +47,9 @@ export const clientSourceSchema = z.enum(
 )
 export type ClientSource = z.infer<typeof clientSourceSchema>
 
-export const contactMethodSchema = z.enum(
-  ['EMAIL', 'PHONE', 'SMS', 'IN_APP'],
-  { error: 'Please choose how you would prefer to be reached.' }
-)
+export const contactMethodSchema = z.enum(['EMAIL', 'PHONE', 'SMS', 'IN_APP'], {
+  error: 'Please choose how you would prefer to be reached.',
+})
 export type ContactMethod = z.infer<typeof contactMethodSchema>
 
 // =============================================================================
@@ -101,10 +100,9 @@ export const mediaProviderSchema = z.enum(
 )
 export type MediaProvider = z.infer<typeof mediaProviderSchema>
 
-export const mediaKindSchema = z.enum(
-  ['IMAGE', 'VIDEO', 'DOCUMENT', 'AUDIO'],
-  { error: 'Please choose the kind of media you are adding.' }
-)
+export const mediaKindSchema = z.enum(['IMAGE', 'VIDEO', 'DOCUMENT', 'AUDIO'], {
+  error: 'Please choose the kind of media you are adding.',
+})
 export type MediaKind = z.infer<typeof mediaKindSchema>
 
 // =============================================================================
@@ -291,7 +289,9 @@ export type ConsultationOutcome = z.infer<typeof consultationOutcomeSchema>
 
 export const availabilityRuleKindSchema = z.enum(
   ['RECURRING_WEEKLY', 'DATE_OVERRIDE'],
-  { error: 'Please choose whether this rule repeats weekly or covers one date.' }
+  {
+    error: 'Please choose whether this rule repeats weekly or covers one date.',
+  }
 )
 export type AvailabilityRuleKind = z.infer<typeof availabilityRuleKindSchema>
 
@@ -317,7 +317,14 @@ export const serviceTypeSchema = z.enum(
 export type ServiceType = z.infer<typeof serviceTypeSchema>
 
 export const appointmentStatusSchema = z.enum(
-  ['REQUESTED', 'CONFIRMED', 'IN_PROGRESS', 'COMPLETED', 'CANCELLED', 'NO_SHOW'],
+  [
+    'REQUESTED',
+    'CONFIRMED',
+    'IN_PROGRESS',
+    'COMPLETED',
+    'CANCELLED',
+    'NO_SHOW',
+  ],
   { error: 'Please choose a valid status for this engagement.' }
 )
 export type AppointmentStatus = z.infer<typeof appointmentStatusSchema>

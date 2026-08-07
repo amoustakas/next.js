@@ -2,8 +2,11 @@
   "extends": "../../tsconfig.base.json",
   "compilerOptions": {
     "outDir": "dist",
-    "rootDir": "src"
+    "rootDir": ".",
+    // The verification scripts import `../src/index.ts` by its real path so
+    // `node --experimental-strip-types` can run them without a build step.
+    "allowImportingTsExtensions": true
   },
-  "include": ["src"],
+  "include": ["src", "scripts"],
   "exclude": ["node_modules", "dist"]
 }

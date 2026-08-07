@@ -19,15 +19,20 @@ import { z } from 'zod'
 
 import {
   addressSchema,
+  buildUpdateSchema,
   cuidSchema,
   currencySchema,
   durationMinutesSchema,
   endMinutesFromMidnightSchema,
+  hasUniqueValues,
   isoDateTimeSchema,
   MAX_DURATION_MINUTES,
   minutesFromMidnightSchema,
   moneyCentsSchema,
+  MS_PER_DAY,
   paginationSchema,
+  queryFlag,
+  withTemporalCoercion,
 } from './common'
 import {
   appointmentStatusSchema,
@@ -44,11 +49,13 @@ import type {
 // Limits
 // =============================================================================
 
-/** Milliseconds in one minute — every duration comparison below runs through it. */
+/**
+ * Milliseconds in one minute — every duration comparison below runs through it.
+ *
+ * Its daily counterpart is `MS_PER_DAY`, which lives in `common.ts` because the
+ * billing and CRM modules need it too.
+ */
 const MS_PER_MINUTE = 60_000
-
-/** Milliseconds in one day. */
-const MS_PER_DAY = 86_400_000
 
 /** Nothing on the calendar is shorter than a quarter of an hour. */
 export const MIN_APPOINTMENT_MINUTES = 15
@@ -238,8 +245,15 @@ const EFFECTIVE_RANGE_ERROR =
 // 1. Chef availability
 // =============================================================================
 
-const availabilityBaseShape = {
-  staffProfileId: cuidSchema,
+/**
+ * Everything about an availability rule that may be edited after it is written.
+ *
+ * Split out from `availabilityBaseShape` so `chefAvailabilityUpdateSchema` can be
+ * built from a shape rather than by carving `staffProfileId` back off an
+ * assembled object — `buildUpdateSchema` needs the raw shape in order to strip
+ * the `.default(...)`s before making the fields optional.
+ */
+const availabilityWindowShape = {
   /** Minutes from local midnight. `540` is 09:00. */
   startMinute: minutesFromMidnightSchema,
   /** Minutes from local midnight; `1440` closes the window at midnight. */
@@ -267,6 +281,12 @@ const availabilityBaseShape = {
       error: `Please keep the note to ${MAX_NOTE_LENGTH} characters or fewer.`,
     })
     .optional(),
+} as const
+
+/** The window, plus the chef it belongs to. Only a create payload names the chef. */
+const availabilityBaseShape = {
+  staffProfileId: cuidSchema,
+  ...availabilityWindowShape,
 } as const
 
 function blackoutCarriesAReason(value: {
@@ -394,17 +414,29 @@ export type ChefAvailabilityRuleRawInput = z.input<
  * Editing an existing rule. The chef it belongs to is not editable — moving a
  * window between chefs is a delete and a create, so nothing is silently
  * reassigned.
+ *
+ * ## Why this goes through `buildUpdateSchema` (MCV-005)
+ *
+ * This schema used to be `z.object(availabilityBaseShape).omit(…).partial()`,
+ * and `.partial()` does not stop a `.default(...)` from firing. Sending
+ * `{ availabilityId, note: 'moved' }` therefore parsed to a payload that also
+ * carried `isBlackout: false` and `timeZone: 'America/Toronto'`. Handed to
+ * `prisma.update`, that turns a blackout into a bookable window — a chef who
+ * closed their diary for a funeral would be offered to guests again because
+ * somebody tidied up the note. `buildUpdateSchema` strips every default *before*
+ * `.partial()`, so an untouched field stays untouched.
+ *
+ * `dayOfWeek` and `specificDate` are handed in as part of the shape rather than
+ * bolted on afterwards, so `.partial()` makes them optional alongside the rest.
  */
-export const chefAvailabilityUpdateSchema = z
-  .object(availabilityBaseShape)
-  .omit({ staffProfileId: true })
-  .partial()
-  .extend({
-    availabilityId: cuidSchema,
-    dayOfWeek: dayOfWeekSchema.optional(),
-    specificDate: isoDateTimeSchema.optional(),
-  })
-  .strict()
+export const chefAvailabilityUpdateSchema = buildUpdateSchema(
+  {
+    ...availabilityWindowShape,
+    dayOfWeek: dayOfWeekSchema,
+    specificDate: isoDateTimeSchema,
+  },
+  { requireKeys: { availabilityId: cuidSchema } }
+)
   .refine(minuteWindowClosesAfterItOpens, {
     error: MINUTE_WINDOW_ORDER_ERROR,
     path: ['endMinute'],
@@ -521,12 +553,22 @@ export const bookingSlotCreateSchema = z
 export type BookingSlotCreateInput = z.infer<typeof bookingSlotCreateSchema>
 export type BookingSlotCreateRawInput = z.input<typeof bookingSlotCreateSchema>
 
-/** Editing a window that already exists. The chef it belongs to is fixed. */
-export const bookingSlotUpdateSchema = z
-  .object(bookingSlotMutableShape)
-  .partial()
-  .extend({ bookingSlotId: cuidSchema })
-  .strict()
+/**
+ * Editing a window that already exists. The chef it belongs to is fixed.
+ *
+ * ## Why this goes through `buildUpdateSchema` (MCV-005)
+ *
+ * `.partial()` alone left `status: 'OPEN'`, `capacity: 1`, and
+ * `currency: 'CAD'` in the parsed payload of every edit, because a zod default
+ * still fires underneath an optional. Correcting the note on a window that was
+ * `BOOKED` or `FULL` reopened it at capacity one — a double-booking handed to
+ * the next guest who loaded the availability board. Stripping the defaults first
+ * means an edit touches exactly the fields the caller named.
+ */
+export const bookingSlotUpdateSchema = buildUpdateSchema(
+  bookingSlotMutableShape,
+  { requireKeys: { bookingSlotId: cuidSchema } }
+)
   .refine(windowEndsAfterItBegins, {
     error: WINDOW_ORDER_ERROR,
     path: ['endsAt'],
@@ -550,17 +592,26 @@ export const bookingSlotUpdateSchema = z
 export type BookingSlotUpdateInput = z.infer<typeof bookingSlotUpdateSchema>
 export type BookingSlotUpdateRawInput = z.input<typeof bookingSlotUpdateSchema>
 
-/** Filter for the availability board in the admin OS. */
+/**
+ * Filter for the availability board in the admin OS.
+ *
+ * Every bound here has to survive a `URLSearchParams` round trip, because the
+ * board reads its state out of the query string. The dates go through
+ * `withTemporalCoercion` and the flag through `queryFlag`; the coercion sits
+ * *inside* the `.optional()` so a rendered-but-empty `?startsFrom=` reads as
+ * "no bound" rather than as an invalid date.
+ */
 export const bookingSlotFilterSchema = paginationSchema
   .extend({
     staffProfileId: cuidSchema.optional(),
     status: bookingSlotStatusSchema.optional(),
     serviceType: serviceTypeSchema.optional(),
-    startsFrom: isoDateTimeSchema.optional(),
-    startsUntil: isoDateTimeSchema.optional(),
-    onlyBookable: z
-      .boolean({ error: 'Please choose whether to show only open windows.' })
-      .optional(),
+    startsFrom: withTemporalCoercion(isoDateTimeSchema.optional()),
+    startsUntil: withTemporalCoercion(isoDateTimeSchema.optional()),
+    onlyBookable: queryFlag(
+      false,
+      'Please choose whether to show only open windows.'
+    ),
   })
   .refine(
     (value) =>
@@ -593,7 +644,7 @@ export const weeklyRecurrenceRuleSchema = z
         error: 'Please choose at least one day of the week to repeat on.',
       })
       .max(7, { error: 'There are only seven days in the week.' })
-      .refine((days) => new Set(days).size === days.length, {
+      .refine(hasUniqueValues, {
         error: 'Each day may only be chosen once.',
       }),
     startMinute: minutesFromMidnightSchema,
@@ -838,15 +889,21 @@ const appointmentMutableShape = {
     .max(MAX_APPOINTMENT_MENU_ITEMS, {
       error: `A single menu runs to ${MAX_APPOINTMENT_MENU_ITEMS} dishes — the chef will help you choose.`,
     })
-    .default([])
-    .refine(
-      (items) =>
-        new Set(items.map((item) => item.menuItemId)).size === items.length,
-      {
-        error:
-          'Each dish may appear on the menu only once — raise the number of portions instead.',
-      }
-    ),
+    /**
+     * The uniqueness rule is attached *before* `.default([])`, not after.
+     *
+     * A check added after a default lands on the `z.ZodDefault` wrapper, and
+     * `withoutDefaults` strips that wrapper by calling `.unwrap()` — which would
+     * take the rule with it and leave the update schema accepting the same dish
+     * twice. With the order below the rule lives on the array, `.unwrap()`
+     * returns the array still carrying it, and the empty default needs no
+     * checking anyway.
+     */
+    .refine((items) => hasUniqueValues(items.map((item) => item.menuItemId)), {
+      error:
+        'Each dish may appear on the menu only once — raise the number of portions instead.',
+    })
+    .default([]),
 } as const
 
 function preparationPrecedesService(value: {
@@ -951,12 +1008,26 @@ export type AppointmentCreateRawInput = z.input<typeof appointmentCreateSchema>
  * of reach — those are separate, audited moves. The address rule cannot be
  * checked on a partial payload, so the action re-applies it after merging the
  * change onto the stored row.
+ *
+ * ## Why this goes through `buildUpdateSchema` (MCV-005)
+ *
+ * This was the worst of the five. `z.object(appointmentMutableShape).partial()`
+ * still fired every default underneath the optionals, so
+ * `{ appointmentId, chefNotes: 'allergic to shellfish' }` parsed to a payload
+ * that additionally carried `totalCents: 0`, `depositCents: 0`,
+ * `gratuityCents: 0`, `guestCount: 2`, `menuItems: []`,
+ * `serviceType: 'IN_HOME_DINNER'`, `travelBufferBeforeMinutes: 0`,
+ * `travelBufferAfterMinutes: 0`, and `currency: 'CAD'`.
+ *
+ * Adding a note to a four-thousand-dollar engagement zeroed its price, wiped its
+ * deposit, emptied its booked menu, and reset the party to two. `buildUpdateSchema`
+ * removes every default before `.partial()` runs and refuses a payload that is
+ * nothing but an identifier.
  */
-export const appointmentUpdateSchema = z
-  .object(appointmentMutableShape)
-  .partial()
-  .extend({ appointmentId: cuidSchema })
-  .strict()
+export const appointmentUpdateSchema = buildUpdateSchema(
+  appointmentMutableShape,
+  { requireKeys: { appointmentId: cuidSchema } }
+)
   .refine(windowEndsAfterItBegins, {
     error: WINDOW_ORDER_ERROR,
     path: ['endsAt'],
@@ -1152,10 +1223,11 @@ export const appointmentConflictCheckSchema = z
         error: 'Please choose at least one status that counts as occupied.',
       })
       .max(6, { error: 'There are only six statuses to choose from.' })
-      .default([...DEFAULT_BLOCKING_APPOINTMENT_STATUSES])
-      .refine((statuses) => new Set(statuses).size === statuses.length, {
+      /** Before the default, for the reason spelled out on `menuItems` above. */
+      .refine(hasUniqueValues, {
         error: 'Each status may only be chosen once.',
-      }),
+      })
+      .default([...DEFAULT_BLOCKING_APPOINTMENT_STATUSES]),
     /** Whether blackout availability rules also count as a conflict. */
     includeBlackouts: z
       .boolean({ error: 'Please choose whether blackouts count as conflicts.' })
@@ -1177,7 +1249,12 @@ export type AppointmentConflictCheckRawInput = z.input<
   typeof appointmentConflictCheckSchema
 >
 
-/** Filter for the engagements table and the chef's day view. */
+/**
+ * Filter for the engagements table and the chef's day view.
+ *
+ * Reachable over GET, so both date bounds coerce — see the note on
+ * `bookingSlotFilterSchema`.
+ */
 export const appointmentFilterSchema = paginationSchema
   .extend({
     clientProfileId: cuidSchema.optional(),
@@ -1185,8 +1262,8 @@ export const appointmentFilterSchema = paginationSchema
     bookingSlotId: cuidSchema.optional(),
     status: appointmentStatusSchema.optional(),
     serviceType: serviceTypeSchema.optional(),
-    startsFrom: isoDateTimeSchema.optional(),
-    startsUntil: isoDateTimeSchema.optional(),
+    startsFrom: withTemporalCoercion(isoDateTimeSchema.optional()),
+    startsUntil: withTemporalCoercion(isoDateTimeSchema.optional()),
   })
   .refine(
     (value) =>

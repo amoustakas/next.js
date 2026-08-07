@@ -12,18 +12,35 @@
  *  1. No runtime dependency on `@prisma/client` — enum values arrive from
  *     `./enums`, which re-declares them as Zod enums.
  *  2. Shared primitives come from `./common`; nothing is re-implemented here.
+ *     `hasUniqueValues`, `withoutDefaults`, `hasSomethingToSave`,
+ *     `NOTHING_TO_SAVE_MESSAGE`, `queryFlag`, `optionalProse` and
+ *     `MAX_SEARCH_LENGTH` were all declared locally here — and in five sibling
+ *     modules — until MCV-004 gave each of them a single home. Nothing about
+ *     the asset library is special enough to justify a second reading of any of
+ *     them, so this file now has no local helpers at all.
  *  3. `alt` is never optional. An image without a description is an image a
  *     screen-reader guest cannot see, and the message says so plainly.
+ *  4. Filter bounds are read from a query string. Every numeric and temporal
+ *     bound in `mediaAssetFilterSchema` therefore goes through the coercion
+ *     helpers in `./common`; the request-body schemas stay strict.
  */
 
 import { z } from 'zod'
 
 import {
+  MAX_SEARCH_LENGTH,
+  NOTHING_TO_SAVE_MESSAGE,
   cuidSchema,
+  hasSomethingToSave,
+  hasUniqueValues,
   isoDateTimeSchema,
+  optionalProse,
   paginationSchema,
+  queryFlag,
   slugSchema,
   urlSchema,
+  withTemporalCoercion,
+  withoutDefaults,
 } from './common'
 import { mediaKindSchema, mediaProviderSchema, type MediaKind } from './enums'
 import { tagMatchModeSchema } from './menu'
@@ -71,9 +88,6 @@ export const MAX_BULK_MEDIA_TAGS = 24
 /** How many tag handles a single filter may combine. */
 const MAX_FILTER_TAGS = 20
 
-/** Longest accepted free-text search phrase. */
-const MAX_SEARCH_LENGTH = 120
-
 /** A MIME type, with any parameters already stripped: `image/avif`. */
 const MIME_TYPE_PATTERN =
   /^[a-z0-9][a-z0-9!#$&^_+.-]*\/[a-z0-9][a-z0-9!#$&^_+.-]*$/
@@ -83,62 +97,6 @@ const MIME_TYPE_PREFIX_PATTERN = /^[a-z0-9][a-z0-9!#$&^_+.-]*\/?$/
 
 /** Lowercase hexadecimal digest — MD5 (32) through SHA-512 (128). */
 const CHECKSUM_PATTERN = /^[0-9a-f]{32,128}$/
-
-// =============================================================================
-// Local helpers
-// =============================================================================
-
-/** True when no value in the list repeats. */
-function hasUniqueValues(values: readonly unknown[]): boolean {
-  return new Set(values).size === values.length
-}
-
-type WithoutDefaults<T extends z.ZodRawShape> = {
-  [K in keyof T]: T[K] extends z.ZodDefault<infer Inner> ? Inner : T[K]
-}
-
-/**
- * Strips `.default(...)` from every field of a shape.
- *
- * A default belongs on a create form, where an omitted field honestly means
- * "use the house setting". On a partial update it is actively harmful: Zod still
- * applies a default underneath `.partial()`, so a payload that only corrected a
- * caption would quietly refile the asset as an image hosted on UploadThing.
- * Update schemas are therefore built from the defaults-free shape.
- */
-function withoutDefaults<T extends z.ZodRawShape>(
-  shape: T
-): WithoutDefaults<T> {
-  const stripped: Record<string, unknown> = {}
-
-  for (const [key, schema] of Object.entries(shape)) {
-    stripped[key] = schema instanceof z.ZodDefault ? schema.unwrap() : schema
-  }
-
-  return stripped as unknown as WithoutDefaults<T>
-}
-
-/**
- * A boolean that survives the trip through a URL search-parameter object, where
- * `true` arrives as the string `"true"`. A transport concern of list filters
- * rather than a domain primitive, which is why it is not in `./common`.
- */
-function queryFlag(defaultValue: boolean, error: string) {
-  return z
-    .union([z.boolean({ error }), z.stringbool({ error })], { error })
-    .default(defaultValue)
-}
-
-/** `@db.Text` prose that may be cleared by sending `null`. */
-function optionalProse(maxLength: number, tooLongMessage: string) {
-  return z
-    .string({ error: 'Please provide text, or leave the field empty.' })
-    .trim()
-    .max(maxLength, { error: tooLongMessage })
-    .transform((value) => (value.length > 0 ? value : null))
-    .nullable()
-    .optional()
-}
 
 // =============================================================================
 // Field schemas
@@ -300,8 +258,8 @@ export const mediaAssetUpdateSchema = z
   .partial()
   .extend({ id: cuidSchema })
   .strict()
-  .refine((value) => Object.keys(value).length > 1, {
-    error: 'Nothing has changed yet — adjust a field before saving.',
+  .refine(hasSomethingToSave, {
+    error: NOTHING_TO_SAVE_MESSAGE,
     path: ['id'],
   })
   .refine((value) => value.alt === undefined || value.alt.length > 0, {
@@ -377,8 +335,20 @@ export const mediaAssetFilterSchema = paginationSchema
       false,
       'Please say whether to show only assets that are not yet in use.'
     ),
-    createdFrom: isoDateTimeSchema.optional(),
-    createdTo: isoDateTimeSchema.optional(),
+    /**
+     * GET filter bounds, so both are wrapped in the temporal coercion from
+     * `./common`. `isoDateTimeSchema` alone accepts an ISO 8601 string, which
+     * covers `?createdFrom=2026-02-14`, but not the two other spellings a real
+     * round trip produces: an epoch-millisecond stamp, and the
+     * `Date.prototype.toString()` output `new URLSearchParams({ createdFrom:
+     * someDate })` actually writes. A blank `?createdFrom=` now reads as "no
+     * filter" rather than as an invalid date.
+     *
+     * As with the price bounds, the `.optional()` belongs inside the coercion —
+     * emptiness is something the coercion decides, not something it inherits.
+     */
+    createdFrom: withTemporalCoercion(isoDateTimeSchema.optional()),
+    createdTo: withTemporalCoercion(isoDateTimeSchema.optional()),
     sortBy: mediaAssetSortBySchema,
   })
   .refine(

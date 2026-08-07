@@ -12,23 +12,42 @@
  *  1. No runtime dependency on `@prisma/client` — enum values arrive from
  *     `./enums`, which re-declares them as Zod enums.
  *  2. Shared primitives come from `./common`; nothing is re-implemented here.
+ *     `hasUniqueValues`, `hasSomethingToSave`, `NOTHING_TO_SAVE_MESSAGE`,
+ *     `queryFlag`, `optionalProse`, `isInTheFuture`, `isNotInTheFuture` and
+ *     `MAX_SEARCH_LENGTH` were all declared locally here — and in as many as
+ *     five sibling modules — until MCV-004 gave each of them a single home.
  *  3. The reward a code grants is a discriminated union, not a bag of nullable
  *     columns: a percentage code cannot carry a cash value and a credit code
  *     cannot carry a percentage. The database allows both to be null; this layer
  *     is where the pairing is actually enforced.
  *  4. `redemptionCount`, `balanceAfterCents` and `balanceId` are computed inside
  *     the transaction that writes them and are never accepted from a caller.
+ *  5. `referral.codes` is a `GET` route in `@mannachef/api-contract`, and the
+ *     redemption and ledger lists are read the same way, so every numeric and
+ *     temporal bound in an `xFilterSchema` goes through the coercion helpers in
+ *     `./common`. The create, update, redemption and ledger-write schemas stay
+ *     strict: a string where a number belongs in a request body is a bug in the
+ *     caller rather than an artefact of the transport.
  */
 
 import { z } from 'zod'
 
 import {
+  MAX_SEARCH_LENGTH,
+  buildUpdateSchema,
   cuidSchema,
   currencySchema,
+  hasUniqueValues,
+  isInTheFuture,
+  isNotInTheFuture,
   isoDateTimeSchema,
   moneyCentsSchema,
+  optionalProse,
   paginationSchema,
   percentSchema,
+  queryFlag,
+  withNumericCoercion,
+  withTemporalCoercion,
 } from './common'
 import {
   referralRedemptionStatusSchema,
@@ -63,9 +82,6 @@ export const MAX_REWARD_CENTS = 1_000_000
 /** A code that can be redeemed more times than this is a public promotion. */
 export const MAX_REDEMPTIONS = 10_000
 
-/** Longest accepted free-text search phrase. */
-const MAX_SEARCH_LENGTH = 120
-
 /** The shape a stored code takes: capitals and numerals only. */
 const REFERRAL_CODE_PATTERN = new RegExp(
   `^[A-Z0-9]{${MIN_REFERRAL_CODE_LENGTH},${MAX_REFERRAL_CODE_LENGTH}}$`
@@ -80,55 +96,6 @@ const REFERRAL_CODE_PATTERN = new RegExp(
  * alphanumeric range — this alphabet governs generation, not validation.
  */
 export const REFERRAL_CODE_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'
-
-// =============================================================================
-// Local helpers
-// =============================================================================
-
-/** True when no value in the list repeats. */
-function hasUniqueValues(values: readonly unknown[]): boolean {
-  return new Set(values).size === values.length
-}
-
-/** Every update schema rejects a payload that carries an id and nothing else. */
-const NOTHING_TO_SAVE_MESSAGE =
-  'Nothing has changed yet — adjust a field before saving.'
-
-function hasSomethingToSave(value: Record<string, unknown>): boolean {
-  return Object.keys(value).length > 1
-}
-
-/**
- * A boolean that survives the trip through a URL search-parameter object, where
- * `true` arrives as the string `"true"`. A transport concern of list filters
- * rather than a domain primitive, which is why it is not in `./common`.
- */
-function queryFlag(defaultValue: boolean, error: string) {
-  return z
-    .union([z.boolean({ error }), z.stringbool({ error })], { error })
-    .default(defaultValue)
-}
-
-/** `@db.Text` prose that may be cleared by sending `null`. */
-function optionalProse(maxLength: number, tooLongMessage: string) {
-  return z
-    .string({ error: 'Please provide text, or leave the field empty.' })
-    .trim()
-    .max(maxLength, { error: tooLongMessage })
-    .transform((value) => (value.length > 0 ? value : null))
-    .nullable()
-    .optional()
-}
-
-/** True when the moment is still ahead of us. */
-function isInTheFuture(value: Date): boolean {
-  return value.getTime() > Date.now()
-}
-
-/** True when the moment has already passed (or is this very instant). */
-function isNotInTheFuture(value: Date): boolean {
-  return value.getTime() <= Date.now()
-}
 
 // =============================================================================
 // The code itself
@@ -360,49 +327,66 @@ export type ReferralCodeCreateRawInput = z.input<
 >
 
 /**
+ * Everything about a code in circulation that may still be changed, before
+ * `buildUpdateSchema` makes it optional.
+ *
+ * Six of the nine fields are taken straight from `referralCodeCommonShape` so
+ * the create path and the amend path cannot drift: same ceilings, same wording,
+ * one definition. `code` and `ownerId` are the two members of that shape which
+ * are deliberately *not* here — an invitation already printed on a card is not
+ * rewritten, and a code does not change hands.
+ *
+ * `currency` and `isActive` arrive carrying their `.default(...)`, which is
+ * exactly right: `withoutDefaults` strips them on the way into `.partial()`,
+ * and the create schema keeps them.
+ */
+const referralCodeUpdatableShape = {
+  label: referralCodeCommonShape.label,
+  currency: referralCodeCommonShape.currency,
+  refereeRewardCents: referralCodeCommonShape.refereeRewardCents,
+  maxRedemptions: referralCodeCommonShape.maxRedemptions,
+  expiresAt: referralCodeCommonShape.expiresAt,
+  isActive: referralCodeCommonShape.isActive,
+  /** Flat, not discriminated — see the note on the schema below. */
+  rewardType: rewardTypeSchema,
+  rewardValueCents: rewardCentsSchema.nullable(),
+  rewardValuePercent: rewardPercentSchema.nullable(),
+} as const
+
+/**
  * Amending a code already in circulation.
  *
  * Not a discriminated union, because a partial update may leave `rewardType`
  * untouched while changing only a label or an expiry. The pairing rule is
  * therefore enforced in a `superRefine`, which can raise one message about the
  * measure that is missing and another about the one that does not belong.
+ * `referralCodeCreateSchema` keeps its union — a code being minted always states
+ * what it rewards — and nothing about that behaviour changes here.
  *
  * `code` is absent on purpose: an invitation already printed on a card is not
  * rewritten. Withdraw it with `isActive: false` and issue another.
+ *
+ * ## Why this goes through `buildUpdateSchema` (MCV-005)
+ *
+ * This schema was already stripping one default, by hand and in a way that
+ * hid what it was doing: `currency: currencySchema.unwrap().optional()`. That
+ * `.unwrap()` is `withoutDefaults` performed manually on a single field, and it
+ * only worked because whoever wrote it happened to know `currencySchema` ends in
+ * `.default('CAD')`. `isActive` got no such treatment, because it was re-declared
+ * from scratch rather than reused — which is precisely the drift the shared
+ * builder exists to stop. Had either been reused with its default intact under a
+ * plain `.partial()`, correcting a code's label would have re-activated a
+ * withdrawn invitation and reset a US-dollar code to CAD.
+ *
+ * The builder now performs the strip for every field at once, before
+ * `.partial()`, and supplies the "nothing to save" guard as
+ * `hasSomethingToSaveBeyond(1)` — the generalised form of `hasSomethingToSave`.
+ * Both refinements that follow are unchanged.
  */
-export const referralCodeUpdateSchema = z
-  .object({
-    id: cuidSchema,
-    label: optionalProse(
-      MAX_LABEL_LENGTH,
-      'Please keep the label to 160 characters or fewer.'
-    ),
-    rewardType: rewardTypeSchema.optional(),
-    rewardValueCents: rewardCentsSchema.nullable().optional(),
-    rewardValuePercent: rewardPercentSchema.nullable().optional(),
-    currency: currencySchema.unwrap().optional(),
-    refereeRewardCents: rewardCentsSchema.nullable().optional(),
-    maxRedemptions: z
-      .int({ error: 'Please give the redemption limit as a whole number.' })
-      .min(1, {
-        error: 'A code that cannot be redeemed once is no code at all.',
-      })
-      .max(MAX_REDEMPTIONS, {
-        error:
-          'Beyond ten thousand redemptions, please run this as a campaign.',
-      })
-      .nullable()
-      .optional(),
-    expiresAt: isoDateTimeSchema.nullable().optional(),
-    isActive: z
-      .boolean({ error: 'Please say whether this code may be redeemed.' })
-      .optional(),
-  })
-  .strict()
-  .refine(hasSomethingToSave, {
-    error: NOTHING_TO_SAVE_MESSAGE,
-    path: ['id'],
-  })
+export const referralCodeUpdateSchema = buildUpdateSchema(
+  referralCodeUpdatableShape,
+  { requireKeys: { id: cuidSchema } }
+)
   .refine(expiryIsAhead, {
     error: EXPIRY_IN_PAST_MESSAGE,
     path: ['expiresAt'],
@@ -513,8 +497,18 @@ export const referralCodeFilterSchema = paginationSchema
       false,
       'Please say whether to show only codes that have been fully redeemed.'
     ),
-    createdFrom: isoDateTimeSchema.optional(),
-    createdTo: isoDateTimeSchema.optional(),
+    /**
+     * `referral.codes` is a `GET` route in `@mannachef/api-contract`, so both
+     * bounds coerce. Beyond the epoch-millisecond form, this is what absorbs
+     * `Date.prototype.toString()` output — which is what
+     * `new URLSearchParams({ createdFrom: someDate })` actually writes, and
+     * which the strict `isoDateTimeSchema` rightly refuses.
+     *
+     * The `.optional()` sits inside the coercion so a rendered-but-empty
+     * `?createdFrom=` reads as "no filter" rather than as a malformed date.
+     */
+    createdFrom: withTemporalCoercion(isoDateTimeSchema.optional()),
+    createdTo: withTemporalCoercion(isoDateTimeSchema.optional()),
     sortBy: referralCodeSortBySchema,
   })
   .refine(
@@ -688,8 +682,9 @@ export const referralRedemptionFilterSchema = paginationSchema
         error: 'That status is already part of your search.',
       })
       .default([]),
-    createdFrom: isoDateTimeSchema.optional(),
-    createdTo: isoDateTimeSchema.optional(),
+    /** Read from a query string on the same admin surface, so both coerce. */
+    createdFrom: withTemporalCoercion(isoDateTimeSchema.optional()),
+    createdTo: withTemporalCoercion(isoDateTimeSchema.optional()),
   })
   .refine(
     ({ createdFrom, createdTo }) =>
@@ -872,10 +867,19 @@ export const rewardLedgerFilterSchema = paginationSchema
         error: 'That reason is already part of your search.',
       })
       .default([]),
-    minAmountCents: moneyCentsSchema.optional(),
-    maxAmountCents: moneyCentsSchema.optional(),
-    createdFrom: isoDateTimeSchema.optional(),
-    createdTo: isoDateTimeSchema.optional(),
+    /**
+     * The same defect as `invoiceFilterSchema.minAmountDueCents`, found by the
+     * MCV-005 sweep rather than reported: the ledger's amount filter is rendered
+     * into the query string, comes back as `"2500"`, and `moneyCentsSchema` is
+     * `z.int()`, which does not coerce. The bounds and the messages are
+     * untouched — `withNumericCoercion` wraps the schema, it does not restate
+     * it — and the `.optional()` sits inside so an empty `?minAmountCents=`
+     * reads as "no filter".
+     */
+    minAmountCents: withNumericCoercion(moneyCentsSchema.optional()),
+    maxAmountCents: withNumericCoercion(moneyCentsSchema.optional()),
+    createdFrom: withTemporalCoercion(isoDateTimeSchema.optional()),
+    createdTo: withTemporalCoercion(isoDateTimeSchema.optional()),
   })
   .refine(
     ({ minAmountCents, maxAmountCents }) =>

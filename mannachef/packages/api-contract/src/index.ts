@@ -69,8 +69,14 @@ import {
   mediaKindSchema,
   menuItemFilterSchema,
   moneyCentsSchema,
+  onboardingFlowFilterSchema,
+  onboardingStageAdvanceSchema,
   onboardingStageSchema,
+  paymentFilterSchema,
+  paymentMethodTypeSchema,
+  paymentStatusSchema,
   percentSchema,
+  queryFlag,
   ratingSchema,
   referralCodeFilterSchema,
   reviewStatusSchema,
@@ -81,6 +87,7 @@ import {
   serviceTypeSchema,
   slugSchema,
   spiceLevelSchema,
+  staffDirectoryFilterSchema,
   subscriptionChangeSchema,
   subscriptionStatusSchema,
   tagKindSchema,
@@ -210,7 +217,53 @@ export function paginated<TItem extends z.ZodType>(
 // handed a raw Prisma row, and nothing here exposes a column a guest may not
 // see (`chefNotes`, `moderationNote`, `stripeCustomerId`, …) unless the route's
 // `auth` requirement puts it behind staff.
+//
+// ## Why a response schema never carries a default
+//
+// A `.default(...)` is an *input* affordance: it lets a client omit a field and
+// have the server fill it in. On an output schema it inverts into a hazard,
+// because the direction of trust is reversed. Here the payload is the thing
+// being checked and the client is the thing being protected, so a default stops
+// the schema from reporting a malformed response and instead **fabricates** the
+// missing field, handing the caller a value the server never sent.
+//
+// Two schemas in `@mannachef/validators` are defaulted, and both were reachable
+// from this section:
+//
+//  - `currencySchema` defaults to `'CAD'`. A response that lost its `currency`
+//    column would render as Canadian dollars — the failure mode being a guest
+//    in another market shown a price in the wrong currency, silently and with
+//    no error anywhere.
+//  - `timeZoneSchema` defaults to `'America/Toronto'` *and* carries a runtime
+//    `Intl.DateTimeFormat` probe. A session missing `timeZone` would be handed
+//    a plausible zone, and every appointment time the client rendered from it
+//    would be wrong by whatever the offset happens to be.
+//
+// Both are unwrapped once, here, and it is the unwrapped twin that every read
+// model below uses. `.unwrap()` is the current spelling of what used to be
+// `.removeDefault()`, which zod 4.4 deprecates; it strips the `ZodDefault`
+// wrapper and leaves every other rule — the three-letter check, the length
+// bound, the `Intl` probe — exactly as it was. The result is a schema that
+// accepts precisely what the server is contracted to send and rejects an
+// incomplete payload loudly.
+//
+// The same reasoning is already applied on the request side in
+// `payment.ts`, where `paymentFilterSchema.currency` unwraps rather than
+// defaults so an unfiltered ledger is not narrowed to one currency.
 // =============================================================================
+
+/**
+ * ISO 4217, with no fallback. Required in every response that quotes an amount.
+ */
+export const responseCurrencySchema = currencySchema.unwrap()
+export type ResponseCurrency = z.infer<typeof responseCurrencySchema>
+
+/**
+ * An IANA time zone identifier, with no fallback. Required wherever a response
+ * states the zone a wall-clock time should be read in.
+ */
+export const responseTimeZoneSchema = timeZoneSchema.unwrap()
+export type ResponseTimeZone = z.infer<typeof responseTimeZoneSchema>
 
 /** A `Tag`, as attached to a dish. */
 export const tagSummarySchema = z
@@ -274,7 +327,7 @@ export const menuItemSummarySchema = z
     categoryName: z.string(),
     subcategorySlug: slugSchema.nullable(),
     basePriceCents: moneyCentsSchema,
-    currency: currencySchema,
+    currency: responseCurrencySchema,
     spiceLevel: spiceLevelSchema,
     isSeasonal: z.boolean(),
     seasonStart: z.int().min(1).max(12).nullable(),
@@ -321,7 +374,7 @@ export const sessionUserSchema = z
     email: emailSchema.nullable(),
     image: urlSchema.nullable(),
     role: roleSchema,
-    timeZone: timeZoneSchema,
+    timeZone: responseTimeZoneSchema,
     locale: z.string(),
     isActive: z.boolean(),
   })
@@ -377,7 +430,7 @@ export const bookingSlotSchema = z
     status: bookingSlotStatusSchema,
     serviceType: serviceTypeSchema.nullable(),
     priceCents: moneyCentsSchema.nullable(),
-    currency: currencySchema,
+    currency: responseCurrencySchema,
     holdsUntil: isoDateTimeSchema.nullable(),
     note: z.string().nullable(),
     /** `status === 'OPEN' && bookedCount < capacity`, computed server-side. */
@@ -397,7 +450,7 @@ export const appointmentMenuItemSchema = z
     courseOrder: z.int().min(0),
     notes: z.string().nullable(),
     priceCentsAtBooking: moneyCentsSchema.nullable(),
-    currency: currencySchema,
+    currency: responseCurrencySchema,
   })
   .strict()
 export type AppointmentMenuItemView = z.infer<typeof appointmentMenuItemSchema>
@@ -439,7 +492,7 @@ export const appointmentSchema = z
     totalCents: moneyCentsSchema,
     depositCents: moneyCentsSchema,
     gratuityCents: moneyCentsSchema,
-    currency: currencySchema,
+    currency: responseCurrencySchema,
     clientNotes: z.string().nullable(),
     /** Staff-only. `null` for a `CLIENT` caller. */
     chefNotes: z.string().nullable(),
@@ -465,7 +518,7 @@ export const subscriptionPlanSummarySchema = z
     interval: billingIntervalSchema,
     intervalCount: z.int().min(1),
     priceCents: moneyCentsSchema,
-    currency: currencySchema,
+    currency: responseCurrencySchema,
     setupFeeCents: moneyCentsSchema.nullable(),
     trialDays: z.int().min(0).nullable(),
     mealsPerWeek: z.int().min(1),
@@ -494,7 +547,7 @@ export const subscriptionSchema = z
     stripeSubscriptionId: z.string(),
     status: subscriptionStatusSchema,
     quantity: z.int().min(1),
-    currency: currencySchema,
+    currency: responseCurrencySchema,
     currentPeriodStart: isoDateTimeSchema,
     currentPeriodEnd: isoDateTimeSchema,
     cancelAtPeriodEnd: z.boolean(),
@@ -519,7 +572,7 @@ export const invoiceLineItemSchema = z
     unitAmountCents: moneyCentsSchema,
     amountCents: moneyCentsSchema,
     taxCents: moneyCentsSchema,
-    currency: currencySchema,
+    currency: responseCurrencySchema,
     sortOrder: z.int().min(0),
   })
   .strict()
@@ -540,7 +593,7 @@ export const invoiceSchema = z
     subtotalCents: moneyCentsSchema,
     taxCents: moneyCentsSchema,
     discountCents: moneyCentsSchema,
-    currency: currencySchema,
+    currency: responseCurrencySchema,
     hostedInvoiceUrl: urlSchema.nullable(),
     pdfUrl: urlSchema.nullable(),
     description: z.string().nullable(),
@@ -587,7 +640,7 @@ export const referralCodeSummarySchema = z
     rewardValueCents: moneyCentsSchema.nullable(),
     rewardValuePercent: percentSchema.nullable(),
     refereeRewardCents: moneyCentsSchema.nullable(),
-    currency: currencySchema,
+    currency: responseCurrencySchema,
     maxRedemptions: z.int().min(1).nullable(),
     redemptionCount: z.int().min(0),
     expiresAt: isoDateTimeSchema.nullable(),
@@ -605,7 +658,7 @@ export const rewardBalanceSchema = z
     balanceCents: moneyCentsSchema,
     lifetimeEarnedCents: moneyCentsSchema,
     lifetimeRedeemedCents: moneyCentsSchema,
-    currency: currencySchema,
+    currency: responseCurrencySchema,
     lastEarnedAt: isoDateTimeSchema.nullable(),
     lastRedeemedAt: isoDateTimeSchema.nullable(),
   })
@@ -623,6 +676,129 @@ export const referralOverviewSchema = z
   .strict()
 export type ReferralOverview = z.infer<typeof referralOverviewSchema>
 
+/**
+ * A `StaffProfile` — a chef, as the public directory card and the admin roster
+ * row both render them.
+ *
+ * One schema for both audiences, because the two differ in *which rows* they
+ * may see rather than in which columns: the directory action pins
+ * `isPubliclyListed` to `true` and the roster action does not. Both columns are
+ * returned either way so the roster can show an administrator the state they
+ * are about to change, and neither is a secret — a chef who is listed is, by
+ * definition, listed publicly.
+ */
+export const staffProfileSummarySchema = z
+  .object({
+    id: cuidSchema,
+    userId: cuidSchema,
+    /** From the joined `User`. `null` when the account has no name set. */
+    name: z.string().nullable(),
+    title: z.string().nullable(),
+    bio: z.string().nullable(),
+    specialties: z.array(z.string()),
+    languages: z.array(z.string()),
+    hourlyRateCents: moneyCentsSchema,
+    currency: responseCurrencySchema,
+    serviceRadiusKm: z.int().min(0),
+    /** `null` means we have not recorded it, which is not the same as zero. */
+    yearsExperience: z.int().min(0).nullable(),
+    baseCity: z.string().nullable(),
+    baseRegion: z.string().nullable(),
+    baseCountry: z.string().nullable(),
+    calendarTimeZone: responseTimeZoneSchema,
+    isAcceptingClients: z.boolean(),
+    maxConcurrentEvents: z.int().min(1),
+    isPubliclyListed: z.boolean(),
+    sortOrder: z.int().min(0),
+    avatarMedia: mediaSummarySchema.nullable(),
+    /** Mean of approved chef reviews, to one decimal. `null` until the first. */
+    averageRating: z.number().min(1).max(5).nullable(),
+    reviewCount: z.int().min(0),
+    createdAt: isoDateTimeSchema,
+  })
+  .strict()
+export type StaffProfileSummary = z.infer<typeof staffProfileSummarySchema>
+
+/**
+ * A `PaymentHistory` row — money that actually moved, as opposed to money we
+ * asked for.
+ *
+ * `stripePaymentIntentId` and `stripeChargeId` are exposed because a client
+ * quoting a reference is the fastest route through a support conversation, and
+ * neither addresses anything beyond the single charge it names. Nothing on this
+ * row carries card data beyond the brand and the last four, per
+ * `mannachef/CONTRACT.md` §5.
+ */
+export const paymentSchema = z
+  .object({
+    id: cuidSchema,
+    userId: cuidSchema,
+    invoiceId: cuidSchema.nullable(),
+    subscriptionId: cuidSchema.nullable(),
+    stripePaymentIntentId: z.string().nullable(),
+    stripeChargeId: z.string().nullable(),
+    amountCents: moneyCentsSchema,
+    /** Cumulative, not the last increment. `0` when nothing went back. */
+    refundedCents: moneyCentsSchema,
+    /** Stripe's cut, when the webhook told us. `null` when it did not. */
+    feeCents: moneyCentsSchema.nullable(),
+    currency: responseCurrencySchema,
+    status: paymentStatusSchema,
+    method: paymentMethodTypeSchema,
+    cardBrand: z.string().nullable(),
+    /** Four digits, as a string — leading zeros are significant. */
+    cardLast4: z.string().nullable(),
+    failureCode: z.string().nullable(),
+    failureReason: z.string().nullable(),
+    receiptUrl: urlSchema.nullable(),
+    processedAt: isoDateTimeSchema.nullable(),
+    refundedAt: isoDateTimeSchema.nullable(),
+    /** `isRefundablePaymentStatus(status)`, computed server-side. */
+    isRefundable: z.boolean(),
+    createdAt: isoDateTimeSchema,
+  })
+  .strict()
+export type PaymentView = z.infer<typeof paymentSchema>
+
+/** An `OnboardingStepCompletion` — one rung of the ladder, once it was reached. */
+export const onboardingStepSchema = z
+  .object({
+    id: cuidSchema,
+    stage: onboardingStageSchema,
+    completedAt: isoDateTimeSchema,
+    note: z.string().nullable(),
+  })
+  .strict()
+export type OnboardingStepView = z.infer<typeof onboardingStepSchema>
+
+/**
+ * An `OnboardingFlow` — where a household stands on the journey.
+ *
+ * `allowedNextStages` is `allowedOnboardingStages(currentStage)` evaluated on
+ * the server. It is returned rather than recomputed on the client so a stage
+ * picker cannot drift from the ladder the server will actually enforce; the
+ * handler still re-checks the move against `onboardingStageAdvanceSchema` when
+ * one is submitted, because a list in a response is a convenience and not a
+ * permission (`mannachef/CONTRACT.md` §5).
+ */
+export const onboardingFlowSchema = z
+  .object({
+    id: cuidSchema,
+    clientProfileId: cuidSchema,
+    currentStage: onboardingStageSchema,
+    progressPercent: percentSchema,
+    startedAt: isoDateTimeSchema,
+    completedAt: isoDateTimeSchema.nullable(),
+    abandonedAt: isoDateTimeSchema.nullable(),
+    abandonedReason: z.string().nullable(),
+    lastAdvancedAt: isoDateTimeSchema.nullable(),
+    allowedNextStages: z.array(onboardingStageSchema),
+    steps: z.array(onboardingStepSchema),
+    createdAt: isoDateTimeSchema,
+  })
+  .strict()
+export type OnboardingFlowView = z.infer<typeof onboardingFlowSchema>
+
 // =============================================================================
 // 3. Inputs that have no domain schema of their own
 //
@@ -639,6 +815,15 @@ export type EmptyInput = z.infer<typeof emptyInputSchema>
 /**
  * Reading one dish. The slug is duplicated into the body/query so a client can
  * validate it before it ever reaches {@link buildUrl}.
+ *
+ * `includeInactive` uses the shared `queryFlag`, as every sibling filter does.
+ * A bare `z.boolean()` here was a transport defect rather than a style
+ * inconsistency: `menu.detail` is a `GET`, so the flag reaches the handler as
+ * the *string* `'false'`, which `z.boolean()` rejects. The round trip that
+ * `buildQueryUrl` performs on this very schema therefore produced a 400 for the
+ * one caller who was explicit about not wanting inactive dishes, while the
+ * caller who omitted the flag entirely succeeded. `queryFlag` accepts a real
+ * boolean or its string spelling and keeps the same `false` default.
  */
 export const menuDetailInputSchema = z
   .object({
@@ -648,7 +833,10 @@ export const menuDetailInputSchema = z
      * before honouring it — a guest may never see a dish taken off the menu.
      * See `mannachef/CONTRACT.md` §5.
      */
-    includeInactive: z.boolean().default(false),
+    includeInactive: queryFlag(
+      false,
+      'Please say whether a dish that is off the menu should be shown.'
+    ),
   })
   .strict()
 export type MenuDetailInput = z.infer<typeof menuDetailInputSchema>
@@ -852,6 +1040,52 @@ export const ApiContract = {
     summary:
       "The caller's invitation codes, reward balance, and pending redemptions. `ownerId` is forced to the session user unless the caller is staff.",
   },
+
+  // --- Staff ---------------------------------------------------------------
+
+  'staff.directory': {
+    method: 'GET',
+    path: (): string => '/api/staff',
+    input: staffDirectoryFilterSchema,
+    output: paginated(staffProfileSummarySchema),
+    auth: 'PUBLIC',
+    summary:
+      'Browse the chefs. The filter has no key for `isPubliclyListed` by design — the handler pins that column to `true`, so no arrangement of query parameters can surface a chef we have hidden.',
+  },
+
+  // --- Payments ------------------------------------------------------------
+
+  'payment.history': {
+    method: 'GET',
+    path: (): string => '/api/payments',
+    input: paymentFilterSchema,
+    output: paginated(paymentSchema),
+    auth: 'OWNER',
+    summary:
+      "The caller's payment ledger — what cleared, what failed, and what went back. `userId` is forced to the session user unless the caller is staff.",
+  },
+
+  // --- Onboarding ----------------------------------------------------------
+
+  'onboarding.read': {
+    method: 'GET',
+    path: (): string => '/api/onboarding',
+    input: onboardingFlowFilterSchema,
+    output: paginated(onboardingFlowSchema),
+    auth: 'OWNER',
+    summary:
+      "Where a household stands on the journey, with the rungs it has already reached. `clientProfileId` is forced to the caller's own profile unless the caller is staff.",
+  },
+
+  'onboarding.advance': {
+    method: 'POST',
+    path: (): string => '/api/onboarding/advance',
+    input: onboardingStageAdvanceSchema,
+    output: onboardingFlowSchema,
+    auth: 'STAFF',
+    summary:
+      'Move a household along the journey. `from` is the stage the caller believes it is standing at; the handler re-reads `currentStage` and answers a mismatch with a 409 rather than letting two administrators both succeed.',
+  },
 } satisfies Record<string, AnyApiRoute>
 
 /** The type of the contract itself. */
@@ -860,8 +1094,61 @@ export type ApiContract = typeof ApiContract
 /** Every route key: `'auth.session' | 'menu.list' | …`. */
 export type ApiRouteKey = keyof ApiContract
 
-/** The route keys at runtime, in declaration order. */
-export const API_ROUTE_KEYS = Object.keys(ApiContract) as readonly ApiRouteKey[]
+/**
+ * The route keys at runtime, in declaration order.
+ *
+ * Written out rather than taken from `Object.keys(ApiContract)`. `Object.keys`
+ * is declared to return `string[]` and cannot be otherwise: an object type in
+ * TypeScript is not exact, so a value assignable to `ApiContract` may carry
+ * extra properties at runtime and a narrower return type would be unsound. The
+ * `as readonly ApiRouteKey[]` that used to sit here was therefore not a
+ * harmless annotation — it was an assertion the compiler had no way to check,
+ * and it would have gone on asserting after a key was renamed.
+ *
+ * The literal array is checked in both directions instead, with no cast:
+ *
+ *  - `satisfies readonly ApiRouteKey[]` rejects a typo or a key that no longer
+ *    exists, while `as const` keeps the individual literal types;
+ *  - {@link _EveryRouteKeyIsListed} rejects an *omission*, which the `satisfies`
+ *    clause on its own would not notice.
+ *
+ * Adding a route therefore fails to compile until it is listed here, which is
+ * the only moment anybody will think about whether the new endpoint belongs in
+ * the generated client.
+ */
+export const API_ROUTE_KEYS = [
+  'auth.session',
+  'menu.list',
+  'menu.detail',
+  'intake.submit',
+  'availability.query',
+  'appointment.create',
+  'appointment.list',
+  'appointment.cancel',
+  'subscription.read',
+  'subscription.change',
+  'invoice.list',
+  'review.submit',
+  'referral.read',
+  'staff.directory',
+  'payment.history',
+  'onboarding.read',
+  'onboarding.advance',
+] as const satisfies readonly ApiRouteKey[]
+
+/** Fails to instantiate unless `T` is exactly `true`. */
+type Assert<T extends true> = T
+
+/**
+ * Every key of {@link ApiContract} appears in {@link API_ROUTE_KEYS}.
+ *
+ * The tuple is wrapped so the conditional is not distributed over the union —
+ * a naked `ApiRouteKey extends …` would test each member separately and pass
+ * as soon as *one* of them was listed.
+ */
+export type _EveryRouteKeyIsListed = Assert<
+  [ApiRouteKey] extends [(typeof API_ROUTE_KEYS)[number]] ? true : false
+>
 
 // =============================================================================
 // 6. End-to-end inference
@@ -1018,4 +1305,198 @@ export function buildQueryUrl<TParams extends PathParams = NoPathParams>(
   const search = toSearchParams(query).toString()
 
   return search.length > 0 ? `${url}?${search}` : url
+}
+
+// =============================================================================
+// 8. Reading a query string back
+//
+// `toSearchParams` had no inverse, which is why nothing could check that a GET
+// route's own serialisation survives its own input schema. The two halves are
+// declared together from here on, and `scripts/verify-round-trip.ts` asserts
+// that composing them is the identity for every GET entry in the contract.
+// =============================================================================
+
+/**
+ * The subset of a zod definition this module reads.
+ *
+ * Zod does not publish a stable visitor, so the wrappers are walked by hand.
+ * Only these four members are touched, and every one of them is optional, so a
+ * node shape this does not recognise degrades to "not an array" rather than
+ * throwing.
+ */
+interface SchemaDefNode {
+  readonly type: string
+  readonly shape?: Readonly<Record<string, unknown>>
+  readonly innerType?: unknown
+  readonly in?: unknown
+  readonly out?: unknown
+}
+
+/** How many wrappers deep to walk before giving up. Nothing here nests past 4. */
+const MAX_SCHEMA_DEPTH = 8
+
+/** The definition node of a zod schema, or `undefined` for anything else. */
+function schemaDef(schema: unknown): SchemaDefNode | undefined {
+  if (typeof schema !== 'object' || schema === null) {
+    return undefined
+  }
+
+  const internals = (schema as { readonly _zod?: unknown })._zod
+
+  if (typeof internals !== 'object' || internals === null) {
+    return undefined
+  }
+
+  const def = (internals as { readonly def?: unknown }).def
+
+  if (typeof def !== 'object' || def === null) {
+    return undefined
+  }
+
+  const { type } = def as { readonly type?: unknown }
+
+  return typeof type === 'string' ? (def as SchemaDefNode) : undefined
+}
+
+/**
+ * True when a field ultimately holds an array, whatever it is wrapped in.
+ *
+ * The wrappers that actually occur on these filters are
+ * `ZodDefault<ZodArray>` (`tagSlugs`, `statuses`, `stages`) and
+ * `ZodDefault<ZodPipe<ZodArray, ZodTransform>>` — the shape `freeTextList`
+ * produces, where the de-duplicating `.transform()` sits between the default
+ * and the array. Both sides of a pipe are examined, because the array may be
+ * either the input of a transform or the output of a coercion.
+ */
+function isArrayField(schema: unknown, depth: number = 0): boolean {
+  if (depth > MAX_SCHEMA_DEPTH) {
+    return false
+  }
+
+  const def = schemaDef(schema)
+
+  if (def === undefined) {
+    return false
+  }
+
+  if (def.type === 'array') {
+    return true
+  }
+
+  if (def.innerType !== undefined) {
+    return isArrayField(def.innerType, depth + 1)
+  }
+
+  return isArrayField(def.in, depth + 1) || isArrayField(def.out, depth + 1)
+}
+
+/** The object shape underneath any wrappers, or `undefined` if there is none. */
+function objectShape(
+  schema: unknown,
+  depth: number = 0
+): Readonly<Record<string, unknown>> | undefined {
+  if (depth > MAX_SCHEMA_DEPTH) {
+    return undefined
+  }
+
+  const def = schemaDef(schema)
+
+  if (def === undefined) {
+    return undefined
+  }
+
+  if (def.shape !== undefined) {
+    return def.shape
+  }
+
+  if (def.innerType !== undefined) {
+    return objectShape(def.innerType, depth + 1)
+  }
+
+  return objectShape(def.in, depth + 1)
+}
+
+/** Derived once per schema; the contract's schemas are module-level singletons. */
+const arrayKeyCache = new WeakMap<object, ReadonlySet<string>>()
+
+/**
+ * The keys of a request schema that hold arrays.
+ *
+ * This is the one thing a query string cannot tell you about itself.
+ * `?tagSlugs=vegan&tagSlugs=nut-free` is unambiguously a list, but
+ * `?tagSlugs=vegan` is indistinguishable from a scalar, and reading it as one
+ * hands `z.array(...)` a bare string — a 400 on the single-element case only,
+ * which is exactly the sort of defect that survives a hand-written test suite.
+ *
+ * The schema already knows the answer, so it is asked rather than a second list
+ * of array keys being kept in step by hand.
+ */
+export function queryArrayKeys(schema: z.ZodType): ReadonlySet<string> {
+  const cached = arrayKeyCache.get(schema)
+
+  if (cached !== undefined) {
+    return cached
+  }
+
+  const shape = objectShape(schema)
+  const keys = new Set<string>()
+
+  if (shape !== undefined) {
+    for (const [key, field] of Object.entries(shape)) {
+      if (isArrayField(field)) {
+        keys.add(key)
+      }
+    }
+  }
+
+  arrayKeyCache.set(schema, keys)
+
+  return keys
+}
+
+/**
+ * The inverse of {@link toSearchParams}: a query string, read back into the bag
+ * a route's input schema expects.
+ *
+ * ```ts
+ * const entry = ApiContract['menu.list']
+ * const parsed = entry.input.safeParse(fromSearchParams(url.search, entry.input))
+ * ```
+ *
+ * A key listed by {@link queryArrayKeys} always yields an array, even with one
+ * value or none; every other key yields the string it carried, and a key that
+ * repeats anyway yields an array so the schema reports the mistake rather than
+ * this function silently discarding a value.
+ *
+ * `null` does not survive the round trip, and should not: `toSearchParams`
+ * writes it as an empty value, so it returns as `''`. That is precisely what a
+ * browser sends for a control that was rendered and left blank, and the filter
+ * schemas already read `''` as "no filter" through `withNumericCoercion` and
+ * the trimming `.transform()`s on their search fields.
+ */
+export function fromSearchParams(
+  search: URLSearchParams | string,
+  schema: z.ZodType
+): Record<string, string | readonly string[]> {
+  const params =
+    typeof search === 'string' ? new URLSearchParams(search) : search
+  const arrayKeys = queryArrayKeys(schema)
+  const result: Record<string, string | readonly string[]> = {}
+
+  for (const key of new Set(params.keys())) {
+    const values = params.getAll(key)
+
+    if (arrayKeys.has(key) || values.length > 1) {
+      result[key] = values
+      continue
+    }
+
+    const [only] = values
+
+    if (only !== undefined) {
+      result[key] = only
+    }
+  }
+
+  return result
 }

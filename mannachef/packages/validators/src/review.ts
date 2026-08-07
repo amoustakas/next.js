@@ -11,6 +11,10 @@
  *  1. No runtime dependency on `@prisma/client` — enum values arrive from
  *     `./enums`, which re-declares them as Zod enums.
  *  2. Shared primitives come from `./common`; nothing is re-implemented here.
+ *     `hasUniqueValues`, `hasSomethingToSave`, `NOTHING_TO_SAVE_MESSAGE`,
+ *     `queryFlag` and `MAX_SEARCH_LENGTH` were all declared locally here — and
+ *     in as many as five sibling modules — until MCV-004 gave each of them a
+ *     single home.
  *  3. `Review` carries three nullable subject columns and only one of them is
  *     ever meant to be set. The schema is therefore a discriminated union over
  *     `subject`, so a review of a dish cannot arrive carrying a chef, and a
@@ -18,15 +22,26 @@
  *  4. `authorId`, `moderatedById`, `moderatedAt`, `isVerified` and `status` are
  *     decided by the server. A guest states an opinion; the house decides whose
  *     it is, whether it is verified, and whether it is published.
+ *  5. The review list is read from a query string, so every numeric and temporal
+ *     bound in `reviewFilterSchema` goes through the coercion helpers in
+ *     `./common`. The submission, update and moderation schemas stay strict —
+ *     they are request bodies, where a string in place of a number is a bug in
+ *     the caller rather than an artefact of the transport.
  */
 
 import { z } from 'zod'
 
 import {
+  MAX_SEARCH_LENGTH,
+  buildUpdateSchema,
   cuidSchema,
+  hasUniqueValues,
   isoDateTimeSchema,
   paginationSchema,
+  queryFlag,
   ratingSchema,
+  withNumericCoercion,
+  withTemporalCoercion,
 } from './common'
 import { reviewStatusSchema, reviewSubjectSchema } from './enums'
 
@@ -55,39 +70,8 @@ const MIN_MODERATION_NOTE_LENGTH = 4
 /** How many reviews may sit in the featured carousel. */
 export const MAX_FEATURED_ORDER = 100
 
-/** Longest accepted free-text search phrase. */
-const MAX_SEARCH_LENGTH = 120
-
 /** How many reviews one moderation queue action may touch. */
 export const MAX_BULK_REVIEWS = 100
-
-// =============================================================================
-// Local helpers
-// =============================================================================
-
-/** True when no value in the list repeats. */
-function hasUniqueValues(values: readonly unknown[]): boolean {
-  return new Set(values).size === values.length
-}
-
-/** Every update schema rejects a payload that carries an id and nothing else. */
-const NOTHING_TO_SAVE_MESSAGE =
-  'Nothing has changed yet — adjust a field before saving.'
-
-function hasSomethingToSave(value: Record<string, unknown>): boolean {
-  return Object.keys(value).length > 1
-}
-
-/**
- * A boolean that survives the trip through a URL search-parameter object, where
- * `true` arrives as the string `"true"`. A transport concern of list filters
- * rather than a domain primitive, which is why it is not in `./common`.
- */
-function queryFlag(defaultValue: boolean, error: string) {
-  return z
-    .union([z.boolean({ error }), z.stringbool({ error })], { error })
-    .default(defaultValue)
-}
 
 // =============================================================================
 // Shared field schemas
@@ -204,25 +188,42 @@ export type ReviewSubmissionInput = z.infer<typeof reviewSubmissionSchema>
 export type ReviewSubmissionRawInput = z.input<typeof reviewSubmissionSchema>
 
 /**
+ * The three fields a guest may revise, before `buildUpdateSchema` makes them
+ * optional. `title` is nullable here rather than optional: sending `null`
+ * removes the headline, whereas omitting the key leaves it alone.
+ */
+const reviewAmendableShape = {
+  rating: ratingSchema,
+  /** `null` removes the headline. */
+  title: reviewTitleSchema.nullable(),
+  body: reviewBodySchema,
+} as const
+
+/**
  * A guest amending their own review.
  *
  * The subject is not editable: a review of one dish does not become a review of
  * another. The action re-checks authorship, and returns the review to `PENDING`
  * so an edited review is read again before it is published.
+ *
+ * ## Why this goes through `buildUpdateSchema` (MCV-005)
+ *
+ * None of the three fields carries a `.default(...)` today, so this schema was
+ * never exposed to the injection bug that `withoutDefaults` exists to prevent.
+ * It is routed through the shared builder anyway, because the safety here was
+ * incidental rather than designed: the day somebody gives `rating` a house
+ * default, a hand-rolled `.partial()` would silently re-score every review that
+ * was edited for a typo. Going through the builder means the strip happens
+ * before the `.partial()` whether or not anyone remembers it needs to.
+ *
+ * The "nothing to save" guard comes from the builder as
+ * `hasSomethingToSaveBeyond(1)` — the generalised form of `hasSomethingToSave`,
+ * with the threshold computed from the single key kept required — so a bare
+ * `{ id }` is still refused, on the `id` path, with the same message.
  */
-export const reviewUpdateSchema = z
-  .object({
-    id: cuidSchema,
-    rating: ratingSchema.optional(),
-    /** `null` removes the headline. */
-    title: reviewTitleSchema.nullable().optional(),
-    body: reviewBodySchema.optional(),
-  })
-  .strict()
-  .refine(hasSomethingToSave, {
-    error: NOTHING_TO_SAVE_MESSAGE,
-    path: ['id'],
-  })
+export const reviewUpdateSchema = buildUpdateSchema(reviewAmendableShape, {
+  requireKeys: { id: cuidSchema },
+})
 export type ReviewUpdateInput = z.infer<typeof reviewUpdateSchema>
 export type ReviewUpdateRawInput = z.input<typeof reviewUpdateSchema>
 
@@ -477,8 +478,23 @@ export const reviewFilterSchema = paginationSchema
     /** Server actions confirm the caller may see another person's reviews. */
     authorId: cuidSchema.optional(),
     moderatedById: cuidSchema.optional(),
-    minRating: ratingSchema.optional(),
-    maxRating: ratingSchema.optional(),
+    /**
+     * The two bounds the MCV-005 audit proved broken.
+     *
+     * The star-rating control on the review list renders as a pair of query
+     * parameters, so `?minRating=4` arrives as the string `"4"`. `ratingSchema`
+     * is `z.int()` and does not coerce, which meant the one filter guests and
+     * moderators actually reach for rejected its own output with "Please choose
+     * a rating from one to five stars" — for the value `4`.
+     *
+     * `withNumericCoercion` wraps `ratingSchema` rather than restating it, so
+     * the one-to-five bounds and all three messages are unchanged, and a request
+     * body carrying a real `4` is validated by exactly the same schema. The
+     * `.optional()` sits inside the coercion so a rendered-but-empty
+     * `?minRating=` reads as "no filter" instead of failing on `''`.
+     */
+    minRating: withNumericCoercion(ratingSchema.optional()),
+    maxRating: withNumericCoercion(ratingSchema.optional()),
     /** Narrows to reviews tied to an engagement we know took place. */
     verifiedOnly: queryFlag(
       false,
@@ -494,8 +510,9 @@ export const reviewFilterSchema = paginationSchema
       false,
       'Please say whether to show only reviews awaiting moderation.'
     ),
-    createdFrom: isoDateTimeSchema.optional(),
-    createdTo: isoDateTimeSchema.optional(),
+    /** Reachable over GET on the same list, so both date bounds coerce too. */
+    createdFrom: withTemporalCoercion(isoDateTimeSchema.optional()),
+    createdTo: withTemporalCoercion(isoDateTimeSchema.optional()),
     sortBy: reviewSortBySchema,
   })
   .refine(

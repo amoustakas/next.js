@@ -13,20 +13,37 @@
  *  1. No runtime dependency on `@prisma/client` — enum values arrive from
  *     `./enums`, which re-declares them as Zod enums.
  *  2. Shared primitives come from `./common`; nothing is re-implemented here.
+ *     `hasUniqueValues`, `withoutDefaults`, `hasSomethingToSave`,
+ *     `NOTHING_TO_SAVE_MESSAGE`, `queryFlag`, `optionalProse` and
+ *     `MAX_SEARCH_LENGTH` were all declared locally here — and in five sibling
+ *     modules — until MCV-004 gave each of them a single home.
  *  3. Every constraint carries a human message. These strings are rendered
  *     verbatim beneath inputs in the admin OS and on the public menu — they must
  *     read like the brand wrote them.
+ *  4. Filter bounds are read from a query string. Every numeric and temporal
+ *     bound in an `xFilterSchema` therefore goes through the coercion helpers in
+ *     `./common`; the create and update schemas stay strict, because a string
+ *     where a number belongs in a request body is a bug in the caller rather
+ *     than an artefact of the transport.
  */
 
 import { z } from 'zod'
 
 import {
+  MAX_SEARCH_LENGTH,
+  NOTHING_TO_SAVE_MESSAGE,
   cuidSchema,
   currencySchema,
   durationMinutesSchema,
+  hasSomethingToSave,
+  hasUniqueValues,
   moneyCentsSchema,
+  optionalProse,
   paginationSchema,
+  queryFlag,
   slugSchema,
+  withNumericCoercion,
+  withoutDefaults,
 } from './common'
 import { measurementUnitSchema, spiceLevelSchema, tagKindSchema } from './enums'
 
@@ -82,9 +99,6 @@ export const MAX_BULK_MENU_ITEMS = 100
 /** How many tag handles a single filter may combine. */
 const MAX_FILTER_TAGS = 20
 
-/** Longest accepted free-text search phrase. */
-const MAX_SEARCH_LENGTH = 120
-
 /**
  * The MannaChef palette, per `mannachef/CONTRACT.md` §3.
  *
@@ -112,58 +126,11 @@ export type DesignColorToken = (typeof DESIGN_COLOR_TOKENS)[number]
 // Local helpers
 // =============================================================================
 
-/** True when no value in the list repeats. */
-function hasUniqueValues(values: readonly unknown[]): boolean {
-  return new Set(values).size === values.length
-}
-
-type WithoutDefaults<T extends z.ZodRawShape> = {
-  [K in keyof T]: T[K] extends z.ZodDefault<infer Inner> ? Inner : T[K]
-}
-
 /**
- * Strips `.default(...)` from every field of a shape.
- *
- * A default belongs on a create form, where an omitted field honestly means
- * "use the house setting". On a partial update it is actively harmful: Zod still
- * applies a default underneath `.partial()`, so a payload that only renamed a
- * dish would quietly reset its currency, its running order, and whether it is on
- * the menu at all. Update schemas are therefore built from the defaults-free
- * shape — a field the caller never mentioned is a field we leave alone.
+ * What follows is genuinely local to the menu: the seasonality rules, and the
+ * handful of field schemas no other domain has a use for. Everything that was
+ * merely copy-pasted now lives in `./common` (see the file docblock above).
  */
-function withoutDefaults<T extends z.ZodRawShape>(
-  shape: T
-): WithoutDefaults<T> {
-  const stripped: Record<string, unknown> = {}
-
-  for (const [key, schema] of Object.entries(shape)) {
-    stripped[key] = schema instanceof z.ZodDefault ? schema.unwrap() : schema
-  }
-
-  return stripped as unknown as WithoutDefaults<T>
-}
-
-/** Every update schema rejects a payload that carries an id and nothing else. */
-const NOTHING_TO_SAVE_MESSAGE =
-  'Nothing has changed yet — adjust a field before saving.'
-
-function hasSomethingToSave(value: Record<string, unknown>): boolean {
-  return Object.keys(value).length > 1
-}
-
-/**
- * A boolean that survives the trip through a URL search-parameter object.
- *
- * Filters are routinely built from `searchParams`, where `true` arrives as the
- * string `"true"`. This accepts a real boolean or its string spelling and is
- * deliberately not in `./common`: it is a transport concern of list filters, not
- * a domain primitive.
- */
-function queryFlag(defaultValue: boolean, error: string) {
-  return z
-    .union([z.boolean({ error }), z.stringbool({ error })], { error })
-    .default(defaultValue)
-}
 
 /** Free-text search across the menu. Blank input is treated as "no filter". */
 const menuSearchSchema = z
@@ -240,18 +207,13 @@ const SEASON_INCONSISTENT_MESSAGE =
 // Shared field schemas
 // =============================================================================
 
-/** `@db.Text` prose that may be cleared by sending `null`. */
-function optionalProse(maxLength: number, tooLongMessage: string) {
-  return z
-    .string({ error: 'Please provide text, or leave the field empty.' })
-    .trim()
-    .max(maxLength, { error: tooLongMessage })
-    .transform((value) => (value.length > 0 ? value : null))
-    .nullable()
-    .optional()
-}
-
-/** A short single-line field that may be cleared by sending `null`. */
+/**
+ * A short single-line field that may be cleared by sending `null`.
+ *
+ * The same construction as `optionalProse` from `./common`; the separate name
+ * records at the call site that the column behind it is a `VarChar`, not a
+ * `Text`.
+ */
 function optionalLine(maxLength: number, tooLongMessage: string) {
   return optionalProse(maxLength, tooLongMessage)
 }
@@ -580,16 +542,31 @@ export const menuItemFilterSchema = paginationSchema
       .default([]),
     /** Applies to `tagSlugs`: match every tag (`ALL`) or any of them (`ANY`). */
     tagMatchMode: tagMatchModeSchema,
-    priceCentsMin: moneyCentsSchema
-      .max(MAX_MENU_PRICE_CENTS, {
-        error: 'That lower price looks higher than intended.',
-      })
-      .optional(),
-    priceCentsMax: moneyCentsSchema
-      .max(MAX_MENU_PRICE_CENTS, {
-        error: 'That upper price looks higher than intended.',
-      })
-      .optional(),
+    /**
+     * A GET filter bound, so it is wrapped in the query-string coercion from
+     * `./common`: `?priceCentsMin=1500` arrives as the string `"1500"` and must
+     * parse, while a JSON body carrying a real `1500` is held to the very same
+     * bounds and reports the very same messages.
+     *
+     * The `.optional()` sits *inside* the coercion deliberately. Wrapped the
+     * other way round, a rendered-but-empty `?priceCentsMin=` is the string
+     * `''`, which sails past `z.ZodOptional` and is then rejected by the integer
+     * schema; inside, it is read as "no filter" and becomes `undefined`.
+     */
+    priceCentsMin: withNumericCoercion(
+      moneyCentsSchema
+        .max(MAX_MENU_PRICE_CENTS, {
+          error: 'That lower price looks higher than intended.',
+        })
+        .optional()
+    ),
+    priceCentsMax: withNumericCoercion(
+      moneyCentsSchema
+        .max(MAX_MENU_PRICE_CENTS, {
+          error: 'That upper price looks higher than intended.',
+        })
+        .optional()
+    ),
     seasonalOnly: queryFlag(
       false,
       'Please say whether to show only dishes in season.'

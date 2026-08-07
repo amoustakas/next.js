@@ -12,22 +12,42 @@
  *  1. No runtime dependency on `@prisma/client` — enum values arrive from
  *     `./enums`, which re-declares them as Zod enums.
  *  2. Shared primitives come from `./common`; nothing is re-implemented here.
+ *     `hasUniqueValues`, `hasSomethingToSave`, `NOTHING_TO_SAVE_MESSAGE`,
+ *     `queryFlag`, `isInTheFuture`, `isNotInTheFuture`, `MS_PER_DAY` and
+ *     `MAX_SEARCH_LENGTH` were all declared locally here — and in as many as
+ *     five sibling modules — until MCV-004 gave each of them a single home.
+ *     `isStrictlyAscending` stays: the LTV boundary list is the only place in
+ *     the package that needs it.
  *  3. `authorId` and `loggedById` are taken from the session inside the server
  *     action and are never accepted from the browser. Every schema here is
  *     scoped to a `clientProfileId`, and the action re-checks that the caller is
  *     entitled to that client before it writes (`mannachef/CONTRACT.md` §5).
  *  4. A note is written for colleagues. `visibility` decides who may read it,
  *     and `CLIENT_VISIBLE` is the only value the client portal ever queries.
+ *  5. The pipeline, the note list and the interaction log are all read from a
+ *     query string, so every numeric and temporal bound in an `xFilterSchema`
+ *     goes through the coercion helpers in `./common`. The create, update and
+ *     transition schemas stay strict, as does `clientLtvBucketingSchema` — see
+ *     the note above it for why that one is a request body rather than a filter.
  */
 
 import { z } from 'zod'
 
 import {
+  MAX_SEARCH_LENGTH,
+  MS_PER_DAY,
+  buildUpdateSchema,
   cuidSchema,
   durationMinutesSchema,
+  hasUniqueValues,
+  isInTheFuture,
+  isNotInTheFuture,
   isoDateTimeSchema,
   moneyCentsSchema,
   paginationSchema,
+  queryFlag,
+  withNumericCoercion,
+  withTemporalCoercion,
 } from './common'
 import {
   clientSourceSchema,
@@ -63,17 +83,11 @@ const MAX_REASON_LENGTH = 2_000
 /** A churn reason is always given, and this is the shortest we accept. */
 const MIN_REASON_LENGTH = 4
 
-/** Longest accepted free-text search phrase. */
-const MAX_SEARCH_LENGTH = 120
-
 /** $1,000,000.00 — the ceiling on a lifetime-value filter bound. */
 export const MAX_LIFETIME_VALUE_CENTS = 100_000_000
 
 /** How far ahead a follow-up may be scheduled: two years. */
 export const MAX_FOLLOW_UP_DAYS = 730
-
-/** Milliseconds in a day, used by the follow-up window refinement. */
-const MS_PER_DAY = 24 * 60 * 60 * 1000
 
 /**
  * The house lifetime-value tiers, in cents: $500, $1,500, $5,000 and $15,000.
@@ -93,10 +107,12 @@ export const MAX_LTV_BOUNDARIES = 8
 // Local helpers
 // =============================================================================
 
-/** True when no value in the list repeats. */
-function hasUniqueValues(values: readonly unknown[]): boolean {
-  return new Set(values).size === values.length
-}
+/**
+ * Only one helper is genuinely local to the CRM. Everything that used to sit
+ * here — `hasUniqueValues`, `hasSomethingToSave`, `NOTHING_TO_SAVE_MESSAGE`,
+ * `queryFlag`, `isInTheFuture` and `isNotInTheFuture` — now lives in `./common`
+ * and is imported at the head of this file.
+ */
 
 /** True when every value is strictly larger than the one before it. */
 function isStrictlyAscending(values: readonly number[]): boolean {
@@ -116,35 +132,6 @@ function isStrictlyAscending(values: readonly number[]): boolean {
   return true
 }
 
-/** Every update schema rejects a payload that carries an id and nothing else. */
-const NOTHING_TO_SAVE_MESSAGE =
-  'Nothing has changed yet — adjust a field before saving.'
-
-function hasSomethingToSave(value: Record<string, unknown>): boolean {
-  return Object.keys(value).length > 1
-}
-
-/**
- * A boolean that survives the trip through a URL search-parameter object, where
- * `true` arrives as the string `"true"`. A transport concern of list filters
- * rather than a domain primitive, which is why it is not in `./common`.
- */
-function queryFlag(defaultValue: boolean, error: string) {
-  return z
-    .union([z.boolean({ error }), z.stringbool({ error })], { error })
-    .default(defaultValue)
-}
-
-/** True when the moment is still ahead of us. */
-function isInTheFuture(value: Date): boolean {
-  return value.getTime() > Date.now()
-}
-
-/** True when the moment has already passed (or is this very instant). */
-function isNotInTheFuture(value: Date): boolean {
-  return value.getTime() <= Date.now()
-}
-
 // =============================================================================
 // 1. Client notes
 // =============================================================================
@@ -162,20 +149,34 @@ export const clientNoteBodySchema = z
 export type ClientNoteBody = z.infer<typeof clientNoteBodySchema>
 
 /**
+ * Everything about a note that may later be revised, stated once so the create
+ * schema and the update schema cannot drift apart. `clientProfileId` is not in
+ * here: a note does not move between clients.
+ */
+const clientNoteMutableShape = {
+  body: clientNoteBodySchema,
+  /** Pinned notes sit at the head of the client record. */
+  pinned: z
+    .boolean({ error: 'Please say whether to pin this note to the record.' })
+    .default(false),
+  visibility: noteVisibilitySchema.default('STAFF'),
+} as const
+
+/**
  * Writing a note against a client.
  *
  * `authorId` is absent by design: the author is the session, and a note that
  * claims to be by someone else is not a note we would keep.
+ *
+ * The two defaults belong here and only here. On a create an omitted `pinned`
+ * honestly means "not pinned" and an omitted `visibility` means "staff only";
+ * on an update the same omission means "leave it as it was", which is why
+ * `clientNoteUpdateSchema` strips them.
  */
 export const clientNoteCreateSchema = z
   .object({
     clientProfileId: cuidSchema,
-    body: clientNoteBodySchema,
-    /** Pinned notes sit at the head of the client record. */
-    pinned: z
-      .boolean({ error: 'Please say whether to pin this note to the record.' })
-      .default(false),
-    visibility: noteVisibilitySchema.default('STAFF'),
+    ...clientNoteMutableShape,
   })
   .strict()
 export type ClientNoteCreateInput = z.infer<typeof clientNoteCreateSchema>
@@ -186,21 +187,25 @@ export type ClientNoteCreateRawInput = z.input<typeof clientNoteCreateSchema>
  *
  * `clientProfileId` is absent: a note does not move between clients. To record
  * something about a different household, write it there.
+ *
+ * ## Why this goes through `buildUpdateSchema` (MCV-005)
+ *
+ * The fields were previously re-declared by hand with the defaults left off,
+ * which was correct but unenforced — the two lists had to be kept in step by
+ * whoever edited them next, and the message on `pinned` was already duplicated
+ * verbatim. Deriving the update from `clientNoteMutableShape` means the shared
+ * builder performs the strip: `withoutDefaults` removes `pinned`'s `false` and
+ * `visibility`'s `'STAFF'` *before* `.partial()` runs, so unpinning a note by
+ * correcting its wording is impossible, and a note written for the client's eyes
+ * cannot be quietly returned to staff-only by an edit that never mentioned
+ * visibility. The "nothing to save" guard is supplied by the builder as
+ * `hasSomethingToSaveBeyond(1)`, so a bare `{ id }` is still refused on the `id`
+ * path with the same message.
  */
-export const clientNoteUpdateSchema = z
-  .object({
-    id: cuidSchema,
-    body: clientNoteBodySchema.optional(),
-    pinned: z
-      .boolean({ error: 'Please say whether to pin this note to the record.' })
-      .optional(),
-    visibility: noteVisibilitySchema.optional(),
-  })
-  .strict()
-  .refine(hasSomethingToSave, {
-    error: NOTHING_TO_SAVE_MESSAGE,
-    path: ['id'],
-  })
+export const clientNoteUpdateSchema = buildUpdateSchema(
+  clientNoteMutableShape,
+  { requireKeys: { id: cuidSchema } }
+)
 export type ClientNoteUpdateInput = z.infer<typeof clientNoteUpdateSchema>
 export type ClientNoteUpdateRawInput = z.input<typeof clientNoteUpdateSchema>
 
@@ -342,8 +347,14 @@ export const interactionLogFilterSchema = paginationSchema
       })
       .transform((value) => (value.length > 0 ? value : undefined))
       .optional(),
-    occurredFrom: isoDateTimeSchema.optional(),
-    occurredTo: isoDateTimeSchema.optional(),
+    /**
+     * Reachable over GET, so both bounds coerce. The `.optional()` sits inside
+     * the coercion so a rendered-but-empty `?occurredFrom=` reads as "no
+     * filter"; wrapped the other way round the empty string sails past
+     * `z.ZodOptional` and is rejected as a malformed date.
+     */
+    occurredFrom: withTemporalCoercion(isoDateTimeSchema.optional()),
+    occurredTo: withTemporalCoercion(isoDateTimeSchema.optional()),
   })
   .refine(
     ({ occurredFrom, occurredTo }) =>
@@ -603,10 +614,29 @@ export const clientPipelineFilterSchema = paginationSchema
         error: 'That source is already part of your search.',
       })
       .default([]),
-    minLifetimeValueCents: lifetimeValueCentsSchema.optional(),
-    maxLifetimeValueCents: lifetimeValueCentsSchema.optional(),
+    /**
+     * The two bounds the MCV-005 audit proved broken.
+     *
+     * The pipeline is the most heavily filtered view in the OS and its state
+     * lives in the URL — the "worth more than" control writes
+     * `?minLifetimeValueCents=50000`, which comes back as the string `"50000"`.
+     * `lifetimeValueCentsSchema` is built on `z.int()` and does not coerce, so
+     * the pipeline rejected the very query string it had just written, and a
+     * bookmarked or shared pipeline view failed to load at all.
+     *
+     * `withNumericCoercion` wraps the bound rather than restating it: the
+     * $1,000,000 ceiling and the message "That figure is beyond anything in our
+     * records" are unchanged, and a real number in a request body is validated
+     * by exactly the same schema.
+     */
+    minLifetimeValueCents: withNumericCoercion(
+      lifetimeValueCentsSchema.optional()
+    ),
+    maxLifetimeValueCents: withNumericCoercion(
+      lifetimeValueCentsSchema.optional()
+    ),
     /** Clients nobody has spoken to since this moment. */
-    lastContactedBefore: isoDateTimeSchema.optional(),
+    lastContactedBefore: withTemporalCoercion(isoDateTimeSchema.optional()),
     /** Clients who have never been contacted at all. */
     neverContacted: queryFlag(
       false,
@@ -618,9 +648,9 @@ export const clientPipelineFilterSchema = paginationSchema
       'Please say whether to show only clients due a follow-up.'
     ),
     /** Clients with a follow-up scheduled before this moment. */
-    followUpBefore: isoDateTimeSchema.optional(),
-    createdFrom: isoDateTimeSchema.optional(),
-    createdTo: isoDateTimeSchema.optional(),
+    followUpBefore: withTemporalCoercion(isoDateTimeSchema.optional()),
+    createdFrom: withTemporalCoercion(isoDateTimeSchema.optional()),
+    createdTo: withTemporalCoercion(isoDateTimeSchema.optional()),
     sortBy: clientPipelineSortBySchema,
   })
   .refine(
@@ -669,6 +699,17 @@ export type ClientPipelineFilterRawInput = z.input<
  * `boundariesCents` is the list of cut points, ascending and without repeats;
  * `n` boundaries make `n + 1` buckets. The defaults are the house tiers, so the
  * common case is `clientLtvBucketingSchema.parse({})`.
+ *
+ * ## Why this one is not coerced
+ *
+ * It reads like a filter and it is not one. This is a request body: it is
+ * `.strict()`, it has no pagination, and its principal field is an array of
+ * integers, which is not a thing a `URLSearchParams` round trip represents. The
+ * chart posts it. So `moneyCentsSchema` and `isoDateTimeSchema` stay strict here
+ * — a string where a number belongs in this payload is a bug in the caller, not
+ * an artefact of the transport. If the distribution is ever exposed over `GET`,
+ * the bounds move to `withNumericCoercion` / `withTemporalCoercion` and
+ * `boundariesCents` needs a serialisation of its own.
  */
 export const clientLtvBucketingSchema = z
   .object({

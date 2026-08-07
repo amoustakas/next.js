@@ -12,24 +12,47 @@
  *  1. No runtime dependency on `@prisma/client` — enum values arrive from
  *     `./enums`, which re-declares them as Zod enums.
  *  2. Shared primitives come from `./common`; nothing is re-implemented here.
+ *     `hasUniqueValues`, `withoutDefaults`, `hasSomethingToSave`,
+ *     `NOTHING_TO_SAVE_MESSAGE`, `queryFlag`, `optionalProse`, `isInTheFuture`,
+ *     `MS_PER_DAY` and `MAX_SEARCH_LENGTH` were all declared locally here — and
+ *     in as many as five sibling modules — until MCV-004 gave each of them a
+ *     single home. This file carried the third and worst copy of
+ *     `withoutDefaults`, the one that bridged its return type through
+ *     `as unknown as`; the shared version needs only a direct narrowing cast.
  *  3. Money is always a whole count of minor units. A total is never trusted
  *     from the client: it is recomputed here and the client's figure, if it sent
  *     one, has to agree.
  *  4. Attribution fields (`issuedById`, `stripeCustomerId`, …) are resolved from
  *     the session or from Stripe inside the server action and are never accepted
  *     from the browser (`mannachef/CONTRACT.md` §5).
+ *  5. Filter bounds are read from a query string — `invoice.list`,
+ *     `subscription.list` and `plan.list` are all `GET` routes in
+ *     `@mannachef/api-contract`. Every numeric and temporal bound in an
+ *     `xFilterSchema` therefore goes through the coercion helpers in `./common`;
+ *     the create, update and webhook schemas stay strict, because a string where
+ *     a number belongs in a request body is a bug in the caller rather than an
+ *     artefact of the transport.
  */
 
 import { z } from 'zod'
 
 import {
+  MAX_SEARCH_LENGTH,
+  MS_PER_DAY,
+  buildUpdateSchema,
   cuidSchema,
   currencySchema,
+  hasUniqueValues,
+  isInTheFuture,
   isoDateTimeSchema,
   moneyCentsSchema,
+  optionalProse,
   paginationSchema,
+  queryFlag,
   slugSchema,
   urlSchema,
+  withNumericCoercion,
+  withTemporalCoercion,
 } from './common'
 import {
   billingIntervalSchema,
@@ -76,9 +99,6 @@ const MAX_FEATURE_LENGTH = 160
 /** How many selling points one plan card may carry before it stops selling. */
 export const MAX_PLAN_FEATURES = 20
 
-/** Longest accepted free-text search phrase. */
-const MAX_SEARCH_LENGTH = 120
-
 /** A manual position within the plan ladder. */
 const MAX_SORT_ORDER = 10_000
 
@@ -109,9 +129,6 @@ export const MAX_SUBSCRIPTION_QUANTITY = 20
 /** The longest a subscription may rest before it must be resumed or ended. */
 export const MAX_PAUSE_DAYS = 180
 
-/** Milliseconds in a day, used by the pause-window refinement. */
-const MS_PER_DAY = 24 * 60 * 60 * 1000
-
 /** Stripe price identifier: `price_1PabcdEFGHijklMN`. */
 const STRIPE_PRICE_ID_PATTERN = /^price_[A-Za-z0-9_]+$/
 
@@ -137,65 +154,12 @@ const SHA256_PATTERN = /^[0-9a-f]{64}$/
 // Local helpers
 // =============================================================================
 
-/** True when no value in the list repeats. */
-function hasUniqueValues(values: readonly unknown[]): boolean {
-  return new Set(values).size === values.length
-}
-
-type WithoutDefaults<T extends z.ZodRawShape> = {
-  [K in keyof T]: T[K] extends z.ZodDefault<infer Inner> ? Inner : T[K]
-}
-
 /**
- * Strips `.default(...)` from every field of a shape.
- *
- * A default belongs on a create form, where an omitted field honestly means
- * "use the house setting". On a partial update it is actively harmful: Zod still
- * applies a default underneath `.partial()`, so a payload that only corrected a
- * plan's tagline would quietly reset its price, its currency, and whether it is
- * on sale at all.
+ * Only one helper is genuinely local to billing. Everything that used to sit
+ * here — `hasUniqueValues`, `withoutDefaults`, `hasSomethingToSave`,
+ * `NOTHING_TO_SAVE_MESSAGE`, `queryFlag`, `optionalProse` and `isInTheFuture` —
+ * now lives in `./common` and is imported at the head of this file.
  */
-function withoutDefaults<T extends z.ZodRawShape>(
-  shape: T
-): WithoutDefaults<T> {
-  const stripped: Record<string, unknown> = {}
-
-  for (const [key, schema] of Object.entries(shape)) {
-    stripped[key] = schema instanceof z.ZodDefault ? schema.unwrap() : schema
-  }
-
-  return stripped as unknown as WithoutDefaults<T>
-}
-
-/** Every update schema rejects a payload that carries an id and nothing else. */
-const NOTHING_TO_SAVE_MESSAGE =
-  'Nothing has changed yet — adjust a field before saving.'
-
-function hasSomethingToSave(value: Record<string, unknown>): boolean {
-  return Object.keys(value).length > 1
-}
-
-/**
- * A boolean that survives the trip through a URL search-parameter object, where
- * `true` arrives as the string `"true"`. A transport concern of list filters
- * rather than a domain primitive, which is why it is not in `./common`.
- */
-function queryFlag(defaultValue: boolean, error: string) {
-  return z
-    .union([z.boolean({ error }), z.stringbool({ error })], { error })
-    .default(defaultValue)
-}
-
-/** `@db.Text` prose that may be cleared by sending `null`. */
-function optionalProse(maxLength: number, tooLongMessage: string) {
-  return z
-    .string({ error: 'Please provide text, or leave the field empty.' })
-    .trim()
-    .max(maxLength, { error: tooLongMessage })
-    .transform((value) => (value.length > 0 ? value : null))
-    .nullable()
-    .optional()
-}
 
 /** A Stripe identifier of a known shape. */
 function stripeIdSchema(
@@ -399,19 +363,38 @@ export type SubscriptionPlanCreateRawInput = z.input<
   typeof subscriptionPlanCreateSchema
 >
 
-export const subscriptionPlanUpdateSchema = z
-  .object(withoutDefaults(subscriptionPlanBaseSchema.shape))
-  .partial()
-  .extend({ id: cuidSchema })
-  .strict()
-  .refine(hasSomethingToSave, {
-    error: NOTHING_TO_SAVE_MESSAGE,
-    path: ['id'],
-  })
-  .refine(trialIsOfferable, {
-    error: TRIAL_REQUIRES_ACTIVE_MESSAGE,
-    path: ['trialDays'],
-  })
+/**
+ * Amending a plan.
+ *
+ * ## Why this goes through `buildUpdateSchema` (MCV-005)
+ *
+ * The three steps this schema performs by hand — strip the defaults, make the
+ * rest optional, put the identifier back and refuse an identifier on its own —
+ * are the three steps every update schema in the package performs, in the one
+ * order that is correct. They are now performed in exactly one place.
+ *
+ * The order is what matters. `subscriptionPlanBaseSchema` carries six defaults
+ * (`interval`, `intervalCount`, `currency`, `features`, `isActive`,
+ * `isFeatured`, `sortOrder`), and a default survives `.partial()` in zod 4:
+ * `z.ZodOptional` wrapping a `z.ZodDefault` delegates rather than
+ * short-circuiting on `undefined`. Correcting a plan's tagline would therefore
+ * have parsed to a payload that also reset its renewal cadence to monthly, its
+ * currency to CAD, its inclusions to `[]`, its position in the ladder to zero,
+ * and re-opened it for enrolment. Handed to `prisma.update`, a closed plan goes
+ * back on sale because somebody fixed a typo.
+ *
+ * Both refinements survive the move: `trialIsOfferable` still guards the
+ * trial/enrolment pairing, and the "nothing to save" guard is supplied by
+ * `buildUpdateSchema` itself as `hasSomethingToSaveBeyond(1)` — the generalised
+ * form of `hasSomethingToSave`, computed from the one key kept required.
+ */
+export const subscriptionPlanUpdateSchema = buildUpdateSchema(
+  subscriptionPlanBaseSchema.shape,
+  { requireKeys: { id: cuidSchema } }
+).refine(trialIsOfferable, {
+  error: TRIAL_REQUIRES_ACTIVE_MESSAGE,
+  path: ['trialDays'],
+})
 export type SubscriptionPlanUpdateInput = z.infer<
   typeof subscriptionPlanUpdateSchema
 >
@@ -456,8 +439,19 @@ export const subscriptionPlanFilterSchema = paginationSchema
       false,
       'Please say whether to show only the plans that lead the collection.'
     ),
-    minPriceCents: amountCentsSchema.optional(),
-    maxPriceCents: amountCentsSchema.optional(),
+    /**
+     * GET filter bounds, so both go through the query-string coercion in
+     * `./common`: `?minPriceCents=1500` arrives as the string `"1500"` and has
+     * to parse, while a JSON body carrying a real `1500` is held to the very
+     * same ceiling and reports the very same message.
+     *
+     * The `.optional()` sits *inside* the coercion deliberately. Wrapped the
+     * other way round, a rendered-but-empty `?minPriceCents=` is the string
+     * `''`, which sails straight past `z.ZodOptional` and is then rejected by
+     * `z.int()`; inside, it is read as "no filter" and becomes `undefined`.
+     */
+    minPriceCents: withNumericCoercion(amountCentsSchema.optional()),
+    maxPriceCents: withNumericCoercion(amountCentsSchema.optional()),
     sortBy: subscriptionPlanSortBySchema,
   })
   .refine(
@@ -569,11 +563,6 @@ export const changeEffectiveAtSchema = z.enum(['IMMEDIATELY', 'PERIOD_END'], {
   error: 'Please choose when this change should take effect.',
 })
 export type ChangeEffectiveAt = z.infer<typeof changeEffectiveAtSchema>
-
-/** True when the moment is still ahead of us. */
-function isInTheFuture(value: Date): boolean {
-  return value.getTime() > Date.now()
-}
 
 /**
  * Every move a subscriber (or an admin acting for one) may make, as a
@@ -763,8 +752,14 @@ export const userSubscriptionFilterSchema = paginationSchema
       false,
       'Please say whether to show only subscriptions at rest.'
     ),
-    renewingFrom: isoDateTimeSchema.optional(),
-    renewingUntil: isoDateTimeSchema.optional(),
+    /**
+     * `subscription.list` is a `GET` route, so both bounds coerce. Beyond the
+     * epoch-millisecond form, this is what absorbs `Date.prototype.toString()`
+     * output — which is what `new URLSearchParams({ renewingFrom: someDate })`
+     * actually writes, and which the strict `isoDateTimeSchema` rightly refuses.
+     */
+    renewingFrom: withTemporalCoercion(isoDateTimeSchema.optional()),
+    renewingUntil: withTemporalCoercion(isoDateTimeSchema.optional()),
   })
   .refine(
     ({ renewingFrom, renewingUntil }) =>
@@ -1065,12 +1060,26 @@ export const invoiceFilterSchema = paginationSchema
       false,
       'Please say whether to show only invoices past their due date.'
     ),
-    minAmountDueCents: amountCentsSchema.optional(),
-    maxAmountDueCents: amountCentsSchema.optional(),
-    issuedFrom: isoDateTimeSchema.optional(),
-    issuedTo: isoDateTimeSchema.optional(),
-    dueFrom: isoDateTimeSchema.optional(),
-    dueTo: isoDateTimeSchema.optional(),
+    /**
+     * The two bounds the MCV-005 audit proved broken.
+     *
+     * `invoice.list` is a `GET` route in `@mannachef/api-contract`, and the
+     * contract's own serializer turns a filter object into a `URLSearchParams`
+     * bag — so `{ minAmountDueCents: 1500 }` leaves as `?minAmountDueCents=1500`
+     * and arrives as the string `"1500"`. `amountCentsSchema` is built on
+     * `z.int()`, which does not coerce, so the invoice table rejected every
+     * amount filter it had itself just rendered.
+     *
+     * The bounds and the messages are unchanged: `withNumericCoercion` wraps
+     * `amountCentsSchema`, it does not restate it.
+     */
+    minAmountDueCents: withNumericCoercion(amountCentsSchema.optional()),
+    maxAmountDueCents: withNumericCoercion(amountCentsSchema.optional()),
+    /** Four temporal bounds on the same GET route, coerced for the same reason. */
+    issuedFrom: withTemporalCoercion(isoDateTimeSchema.optional()),
+    issuedTo: withTemporalCoercion(isoDateTimeSchema.optional()),
+    dueFrom: withTemporalCoercion(isoDateTimeSchema.optional()),
+    dueTo: withTemporalCoercion(isoDateTimeSchema.optional()),
     sortBy: invoiceSortBySchema,
   })
   .refine(

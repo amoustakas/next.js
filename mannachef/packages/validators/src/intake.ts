@@ -21,16 +21,21 @@ import { z } from 'zod'
 
 import {
   addressSchema,
+  buildUpdateSchema,
   cuidSchema,
   currencySchema,
   durationMinutesSchema,
   emailSchema,
+  freeTextList,
+  hasUniqueValues,
   isoDateTimeSchema,
   moneyCentsSchema,
   paginationSchema,
   percentSchema,
   phoneSchema,
   urlSchema,
+  withNumericCoercion,
+  withTemporalCoercion,
 } from './common'
 import type { Address } from './common'
 import {
@@ -97,58 +102,29 @@ export const MAX_REFERRAL_CODE_LENGTH = 40
 const REFERRAL_CODE_PATTERN = /^[A-Z0-9][A-Z0-9-]*$/
 
 // =============================================================================
-// Local helpers
+// Free-text lists (MCV-004 / MCV-005)
 // =============================================================================
 
 /**
- * Keeps the first spelling of each entry and drops later case-insensitive
- * repeats, so "Peanuts" and "peanuts" never both reach the kitchen.
- */
-function dedupeCaseInsensitive(values: readonly string[]): string[] {
-  const seen = new Set<string>()
-  const unique: string[] = []
-
-  for (const value of values) {
-    const key = value.toLocaleLowerCase()
-
-    if (seen.has(key)) {
-      continue
-    }
-
-    seen.add(key)
-    unique.push(value)
-  }
-
-  return unique
-}
-
-/**
- * A capped, trimmed, de-duplicated list of short free-text entries — the shape
- * every `String[]` column on `ClientIntakeForm` takes.
+ * `dedupeCaseInsensitive` and `freeTextList` used to live here, with the comment
+ * "not a redefinition of a shared primitive". They were both, and both now come
+ * from `common.ts` — the messages were always per-call-site configuration, which
+ * is exactly what `FreeTextListConfig` carries.
  *
- * Not a redefinition of a shared primitive: `common.ts` has no list factory, and
- * each call site needs its own copy so the message names the thing being listed.
+ * The move is not cosmetic. The copy in this file built its lists as
+ * `.default([]).transform(dedupeCaseInsensitive)`, which leaves a `z.ZodPipe` as
+ * the outermost wrapper with the default buried inside it. `withoutDefaults`
+ * only inspects the outermost wrapper, so it could not see that default and
+ * could not strip it; the fields escaped the injection bug only by accident,
+ * because `z.ZodOptional` short-circuits on `undefined` over a `ZodPipe` while it
+ * does *not* over a `ZodDefault`. The shared version transforms first and
+ * defaults last, so every default in a shape is visible to `withoutDefaults` and
+ * the ordering is deterministic rather than lucky.
+ *
+ * `MAX_LIST_ENTRY_LENGTH` is passed explicitly rather than left to the shared
+ * `MAX_FREE_TEXT_ENTRY_LENGTH` fallback, because the messages below quote it and
+ * the two constants must be seen to agree.
  */
-function freeTextList(config: {
-  readonly maxEntries: number
-  readonly missingError: string
-  readonly emptyEntryError: string
-  readonly longEntryError: string
-  readonly tooManyError: string
-}) {
-  return z
-    .array(
-      z
-        .string({ error: config.emptyEntryError })
-        .trim()
-        .min(1, { error: config.emptyEntryError })
-        .max(MAX_LIST_ENTRY_LENGTH, { error: config.longEntryError }),
-      { error: config.missingError }
-    )
-    .max(config.maxEntries, { error: config.tooManyError })
-    .default([])
-    .transform(dedupeCaseInsensitive)
-}
 
 // =============================================================================
 // Cook days
@@ -230,6 +206,7 @@ const dietaryStepShape = {
    */
   allergies: freeTextList({
     maxEntries: MAX_ALLERGIES,
+    maxEntryLength: MAX_LIST_ENTRY_LENGTH,
     missingError: 'Please list any allergies, or leave the list empty.',
     emptyEntryError: 'Please name the allergy, or remove the empty line.',
     longEntryError: `Please keep each allergy to ${MAX_LIST_ENTRY_LENGTH} characters or fewer.`,
@@ -237,6 +214,7 @@ const dietaryStepShape = {
   }),
   dislikes: freeTextList({
     maxEntries: MAX_DISLIKES,
+    maxEntryLength: MAX_LIST_ENTRY_LENGTH,
     missingError:
       'Please list anything you would rather not see, or leave it empty.',
     emptyEntryError:
@@ -246,6 +224,7 @@ const dietaryStepShape = {
   }),
   cuisinePreferences: freeTextList({
     maxEntries: MAX_CUISINE_PREFERENCES,
+    maxEntryLength: MAX_LIST_ENTRY_LENGTH,
     missingError:
       'Please choose the cuisines you love, or leave the list empty.',
     emptyEntryError: 'Please name the cuisine, or remove the empty line.',
@@ -260,10 +239,18 @@ const dietaryStepShape = {
     .max(MAX_DIETARY_PREFERENCE_TAGS, {
       error: `Please choose up to ${MAX_DIETARY_PREFERENCE_TAGS} dietary preferences.`,
     })
-    .default([])
-    .refine((ids) => new Set(ids).size === ids.length, {
+    /**
+     * Attached before `.default([])`, not after.
+     *
+     * A check added on top of a default lands on the `z.ZodDefault` wrapper, and
+     * `withoutDefaults` strips that wrapper with `.unwrap()` — which would carry
+     * the uniqueness rule away with it. Ordered like this, `.unwrap()` yields the
+     * array with the rule intact, and an empty default needs no checking.
+     */
+    .refine(hasUniqueValues, {
       error: 'Each dietary preference may only be chosen once.',
-    }),
+    })
+    .default([]),
 } as const
 
 export const intakeDietaryStepSchema = z.object(dietaryStepShape).strict()
@@ -277,6 +264,7 @@ export type IntakeDietaryStepInput = z.input<typeof intakeDietaryStepSchema>
 const kitchenStepShape = {
   kitchenEquipment: freeTextList({
     maxEntries: MAX_KITCHEN_EQUIPMENT,
+    maxEntryLength: MAX_LIST_ENTRY_LENGTH,
     missingError:
       'Please tell us what the kitchen holds, or leave the list empty.',
     emptyEntryError:
@@ -286,6 +274,7 @@ const kitchenStepShape = {
   }),
   favouriteDishes: freeTextList({
     maxEntries: MAX_FAVOURITE_DISHES,
+    maxEntryLength: MAX_LIST_ENTRY_LENGTH,
     missingError: 'Please name a few favourites, or leave the list empty.',
     emptyEntryError: 'Please name the dish, or remove the empty line.',
     longEntryError: `Please keep each dish to ${MAX_LIST_ENTRY_LENGTH} characters or fewer.`,
@@ -376,10 +365,11 @@ const preferencesStepShape = {
         'Please choose the days that suit you, or leave them all unchosen.',
     })
     .max(7, { error: 'There are only seven days in the week.' })
-    .default([])
-    .refine((days) => new Set(days).size === days.length, {
+    /** Before the default, for the reason spelled out on `dietaryPreferenceTagIds`. */
+    .refine(hasUniqueValues, {
       error: 'Each day may only be chosen once.',
-    }),
+    })
+    .default([]),
   notes: z
     .string({ error: 'Please add anything else we should know.' })
     .trim()
@@ -566,15 +556,26 @@ export type ClientIntakeCreateRawInput = z.input<
  * household-sum rule is checked only once all three numbers are on the table —
  * changing the number of children alone still has to balance against whatever is
  * already stored, which the action verifies after merging.
+ *
+ * ## Why this goes through `buildUpdateSchema` (MCV-005)
+ *
+ * `.partial()` does not stop a `.default(...)` from firing, so
+ * `{ clientProfileId, notes: 'gate code changed' }` used to parse to a payload
+ * that also carried `dietaryPreferenceTagIds: []`. Written through
+ * `prisma.update`, that deletes every `ClientIntakeFormTag` join row on the
+ * form — which in a private-chef product is the household's allergen record.
+ * The same edit reset `hasPets`, `deliveryFrequency`, `preferredContactMethod`,
+ * `preferredCookDays`, `currency`, and all five free-text lists.
+ *
+ * `submittedAt` is carried in the shape rather than in `requireKeys` so it stays
+ * an editable field: putting it among the required keys would raise the
+ * "something to save" threshold to two and let a bare `{ clientProfileId,
+ * submittedAt }` through as if it were an edit.
  */
-export const clientIntakeUpdateSchema = z
-  .object(clientIntakeShape)
-  .partial()
-  .extend({
-    clientProfileId: cuidSchema,
-    submittedAt: isoDateTimeSchema.optional(),
-  })
-  .strict()
+export const clientIntakeUpdateSchema = buildUpdateSchema(
+  { ...clientIntakeShape, submittedAt: isoDateTimeSchema },
+  { requireKeys: { clientProfileId: cuidSchema } }
+)
   .refine(
     (value) => {
       if (
@@ -659,20 +660,51 @@ export function serviceAddressToColumns(
   }
 }
 
-/** Admin list filter for submitted and in-progress questionnaires. */
+/**
+ * Admin list filter for submitted and in-progress questionnaires.
+ *
+ * Reachable over GET, so both date bounds coerce: `withTemporalCoercion` sits
+ * *outside* the `.optional()` so a rendered-but-empty `?submittedFrom=` reads as
+ * "no bound" instead of failing as an invalid date.
+ *
+ * The two flags are three-state — set, cleared, or absent — so `queryFlag` is
+ * not what they want: its default would collapse "show everything" into "show
+ * only the false side". They take `queryFlag`'s union without its default, which
+ * is what lets `?isSubmitted=true` arrive as the string it really is.
+ */
 export const clientIntakeFilterSchema = paginationSchema.extend({
   deliveryFrequency: deliveryFrequencySchema.optional(),
   /** `true` keeps only submitted forms, `false` keeps only drafts. */
   isSubmitted: z
-    .boolean({ error: 'Please choose whether to show submitted forms.' })
+    .union(
+      [
+        z.boolean({
+          error: 'Please choose whether to show submitted forms.',
+        }),
+        z.stringbool({
+          error: 'Please choose whether to show submitted forms.',
+        }),
+      ],
+      { error: 'Please choose whether to show submitted forms.' }
+    )
     .optional(),
   hasAllergies: z
-    .boolean({
-      error: 'Please choose whether to show households with allergies.',
-    })
+    .union(
+      [
+        z.boolean({
+          error: 'Please choose whether to show households with allergies.',
+        }),
+        z.stringbool({
+          error: 'Please choose whether to show households with allergies.',
+        }),
+      ],
+      {
+        error: 'Please choose whether to show households with allergies.',
+      }
+    )
     .optional(),
-  submittedFrom: isoDateTimeSchema.optional(),
-  submittedUntil: isoDateTimeSchema.optional(),
+  submittedFrom: withTemporalCoercion(isoDateTimeSchema.optional()),
+  submittedUntil: withTemporalCoercion(isoDateTimeSchema.optional()),
 })
 export type ClientIntakeFilter = z.infer<typeof clientIntakeFilterSchema>
 export type ClientIntakeFilterInput = z.input<typeof clientIntakeFilterSchema>
@@ -730,11 +762,14 @@ export const consultationRequestSchema = z
       .refine((dates) => dates.every((date) => date.getTime() > Date.now()), {
         error: 'Every time you offer must fall in the future.',
       })
-      .refine(
-        (dates) =>
-          new Set(dates.map((date) => date.getTime())).size === dates.length,
-        { error: 'Please offer times that differ from one another.' }
-      ),
+      /**
+       * Mapped to epoch milliseconds first: `hasUniqueValues` compares by
+       * identity, and two `Date` objects for the same instant are not the same
+       * object. This is the pattern `common.ts` documents for structural values.
+       */
+      .refine((dates) => hasUniqueValues(dates.map((date) => date.getTime())), {
+        error: 'Please offer times that differ from one another.',
+      }),
     durationMinutes: durationMinutesSchema
       .min(MIN_CONSULTATION_MINUTES, {
         error: 'A consultation needs at least a quarter of an hour.',
@@ -798,8 +833,15 @@ export type ConsultationRequestRawInput = z.input<
 // Consultation interview — the record staff keep
 // =============================================================================
 
-const consultationInterviewShape = {
-  clientProfileId: cuidSchema,
+/**
+ * Everything about an interview that may be edited after it is written.
+ *
+ * Split out from `consultationInterviewShape` so `consultationInterviewUpdateSchema`
+ * can be built from a shape rather than by `.omit()`-ing `clientProfileId` off an
+ * assembled object: `buildUpdateSchema` needs the raw shape in order to strip the
+ * `.default(...)`s before `.partial()` makes the fields optional.
+ */
+const consultationInterviewEditableShape = {
   /** The `User` who ran the interview. */
   conductedById: cuidSchema.optional(),
   /** The chef being matched, when a specific one is in the room. */
@@ -842,6 +884,15 @@ const consultationInterviewShape = {
   outcome: consultationOutcomeSchema.default('PENDING'),
   followUpAt: isoDateTimeSchema.optional(),
   convertedToClientAt: isoDateTimeSchema.optional(),
+} as const
+
+/**
+ * The interview, plus the household it was arranged for. Only a create payload
+ * names the household — a consultation is never moved between them.
+ */
+const consultationInterviewShape = {
+  clientProfileId: cuidSchema,
+  ...consultationInterviewEditableShape,
 } as const
 
 interface ConsultationTimingShape {
@@ -912,13 +963,25 @@ export type ConsultationInterviewCreateInput = ConsultationInterviewInput
  * Editing an interview after the fact — rescheduling it, scoring it, or recording
  * how it ended. `clientProfileId` is not editable: a consultation belongs to the
  * household it was arranged for.
+ *
+ * ## Why this goes through `buildUpdateSchema` (MCV-005)
+ *
+ * A default still fires underneath `.partial()`, so
+ * `{ consultationInterviewId, notes: 'sent the menu' }` used to parse with
+ * `outcome: 'PENDING'` and `durationMinutes: 30` attached. Writing that back
+ * clobbers a `CONVERTED` outcome — the household drops out of the pipeline board
+ * and back into the follow-up queue because somebody typed up their notes — and
+ * quietly rewrites the length of an interview that ran for an hour.
+ *
+ * Worse, `outcome: 'PENDING'` slipping in is invisible to the two refinements
+ * below: both are satisfied by `PENDING`, so nothing objected. Stripping the
+ * default first is the only fix; a guard after the fact cannot tell an injected
+ * `PENDING` from one the caller meant.
  */
-export const consultationInterviewUpdateSchema = z
-  .object(consultationInterviewShape)
-  .omit({ clientProfileId: true })
-  .partial()
-  .extend({ consultationInterviewId: cuidSchema })
-  .strict()
+export const consultationInterviewUpdateSchema = buildUpdateSchema(
+  consultationInterviewEditableShape,
+  { requireKeys: { consultationInterviewId: cuidSchema } }
+)
   .refine(completionFollowsStart, {
     error: COMPLETION_AFTER_START_ERROR,
     path: ['completedAt'],
@@ -944,15 +1007,25 @@ export type ConsultationInterviewUpdateRawInput = z.input<
   typeof consultationInterviewUpdateSchema
 >
 
-/** Admin list filter for the consultation calendar and pipeline board. */
+/**
+ * Admin list filter for the consultation calendar and pipeline board.
+ *
+ * Reachable over GET, so every bound coerces. `minCompatibilityScore` in
+ * particular arrives from the board's score slider as `?minCompatibilityScore=70`
+ * — the string `'70'`, which `percentSchema` is right to reject in a request body
+ * and wrong to reject here. `withNumericCoercion` keeps `percentSchema`'s bounds
+ * and its messages, and wrapping the `.optional()` from the outside is what makes
+ * a rendered-but-empty `?minCompatibilityScore=` read as "no bound" rather than
+ * as zero.
+ */
 export const consultationInterviewFilterSchema = paginationSchema.extend({
   clientProfileId: cuidSchema.optional(),
   conductedById: cuidSchema.optional(),
   staffProfileId: cuidSchema.optional(),
   outcome: consultationOutcomeSchema.optional(),
-  scheduledFrom: isoDateTimeSchema.optional(),
-  scheduledUntil: isoDateTimeSchema.optional(),
-  minCompatibilityScore: percentSchema.optional(),
+  scheduledFrom: withTemporalCoercion(isoDateTimeSchema.optional()),
+  scheduledUntil: withTemporalCoercion(isoDateTimeSchema.optional()),
+  minCompatibilityScore: withNumericCoercion(percentSchema.optional()),
 })
 export type ConsultationInterviewFilter = z.infer<
   typeof consultationInterviewFilterSchema

@@ -7,7 +7,10 @@
     ".": "./src/index.ts"
   },
   "scripts": {
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "verify:round-trip": "node --experimental-strip-types --disable-warning=ExperimentalWarning --import ./scripts/register.mjs ./scripts/verify-round-trip.ts",
+    "verify:responses": "node --experimental-strip-types --disable-warning=ExperimentalWarning --import ./scripts/register.mjs ./scripts/verify-response-schemas.ts",
+    "verify": "pnpm run verify:round-trip && pnpm run verify:responses"
   },
   "dependencies": {
     "@mannachef/validators": "workspace:*",

@@ -11,12 +11,20 @@
  * import { menuItemFilterSchema, type MenuItemFilterInput } from '@mannachef/validators'
  * ```
  *
+ * ## The fifteen modules
+ *
+ * `common` and `enums` hold the shared vocabulary; the other thirteen are one
+ * domain each. `staff`, `user`, `payment`, `onboarding` and `client` joined in
+ * MCV-005, when the audit found five Prisma tables being written to with no
+ * schema in front of them at all.
+ *
  * ## Collision policy
  *
- * Eight of the ten modules are re-exported wholesale because their public
- * surfaces are provably disjoint. Two are not: `intake.ts` and `referral.ts`
- * both declare a constant named `MAX_REFERRAL_CODE_LENGTH`, and they mean
- * genuinely different things:
+ * The export sets of all fifteen modules were enumerated with the TypeScript
+ * compiler API (`checker.getExportsOfModule`) rather than by reading them, and
+ * diffed for duplicate names. Across 774 exports there is exactly **one**
+ * collision, and it is a genuine difference of meaning rather than an accident:
+ * `intake.ts` and `referral.ts` both declare `MAX_REFERRAL_CODE_LENGTH`.
  *
  *  - `referral.ts` → `12`. The longest code `generateReferralCode` will mint,
  *    and the ceiling `referralCodeSchema` enforces. This is the referral
@@ -27,182 +35,153 @@
  *    typed from memory rather than one we generated. It is re-exported as
  *    `MAX_INTAKE_REFERRAL_CODE_LENGTH`.
  *
- * A blanket `export *` from both modules would silently drop the name from this
- * barrel and produce a confusing "has no exported member" at the call site, so
- * those two modules are enumerated explicitly instead. Everything else they
- * export is listed below verbatim — adding a declaration to `intake.ts` or
- * `referral.ts` means adding it here too.
+ * ## How the collision is resolved
+ *
+ * A name exported by two `export *` declarations is *ambiguous*: ECMAScript
+ * makes it inaccessible through the re-exporting module rather than picking a
+ * winner. TypeScript refuses to guess either, and reports `TS2308: Module
+ * './intake' has already exported a member named 'MAX_REFERRAL_CODE_LENGTH'.
+ * Consider explicitly re-exporting to resolve the ambiguity.` Deleting the
+ * *plain* re-export below therefore fails the build rather than quietly
+ * changing which constant callers receive.
+ *
+ * An **explicit** re-export outranks a star re-export. `ResolveExport` consults
+ * the module's own export entries before it walks `export *`, so the two named
+ * declarations at the bottom of this file settle the ambiguity in both
+ * directions: the plain name resolves to referral's `12`, and intake's `40`
+ * arrives under its qualified alias.
+ *
+ * The *alias* has no such natural protection, and this is the direction that
+ * used to be unguarded. Deleting `MAX_INTAKE_REFERRAL_CODE_LENGTH` does not
+ * reintroduce an ambiguity — it simply removes a name — so the barrel went on
+ * compiling perfectly while the constant disappeared from the public surface,
+ * and the only symptom was a "has no exported member" at some unrelated call
+ * site. The earlier guard did not catch it because it asserted on
+ * `IntakeModule.MAX_REFERRAL_CODE_LENGTH`, which is the *source module's*
+ * constant and stays `40` whether or not this file re-exports it.
+ *
+ * The assertions at the foot of this file therefore read the barrel's own
+ * export surface through a self-referential `import type * as Barrel from
+ * './index'`. That is what makes them load-bearing in both directions: they
+ * fail if either constant changes value, and they fail if either name stops
+ * being exported from *here*. Both directions are mutation-tested — removing
+ * each declaration in turn is verified to break the build.
+ *
+ * This is why the barrel is fifteen star exports rather than 774 enumerated
+ * names. The enumerated form had to be edited every time any module gained a
+ * declaration, and an omission was invisible until something failed to import.
  *
  * `verbatimModuleSyntax` is on, so type-only re-exports use `export type`.
  */
 
 // =============================================================================
-// Disjoint modules — re-exported wholesale
+// Domain modules
+//
+// Provably disjoint apart from the single documented collision, which the
+// explicit re-exports at the foot of this file resolve.
 // =============================================================================
 
 export * from './common'
 export * from './enums'
-export * from './menu'
-export * from './media'
-export * from './review'
-export * from './booking'
+
 export * from './billing'
+export * from './booking'
+export * from './client'
 export * from './crm'
+export * from './intake'
+export * from './media'
+export * from './menu'
+export * from './onboarding'
+export * from './payment'
+export * from './referral'
+export * from './review'
+export * from './staff'
+export * from './user'
 
 // =============================================================================
-// intake.ts — enumerated (see collision policy above)
+// Collision resolution
+//
+// These two declarations must stay below the `export *` block for the sake of
+// the reader; ECMAScript itself is order-independent here, because explicit
+// export entries are resolved before star exports regardless of position.
 // =============================================================================
 
-export {
-  // Limits
-  MAX_HOUSEHOLD_SIZE,
-  MAX_ALLERGIES,
-  MAX_DISLIKES,
-  MAX_CUISINE_PREFERENCES,
-  MAX_KITCHEN_EQUIPMENT,
-  MAX_FAVOURITE_DISHES,
-  MAX_DIETARY_PREFERENCE_TAGS,
-  MAX_LIST_ENTRY_LENGTH,
-  MAX_PETS_NOTE_LENGTH,
-  MAX_NOTES_LENGTH,
-  MIN_BUDGET_PER_MEAL_CENTS,
-  MAX_BUDGET_PER_MEAL_CENTS,
-  MIN_CONSULTATION_MINUTES,
-  MAX_CONSULTATION_MINUTES,
-  MAX_PREFERRED_CONSULTATION_DATES,
-  MAX_CONSULTATION_LOCATION_LENGTH,
-  MAX_SOURCE_DETAIL_LENGTH,
-  /**
-   * `ReferralCode.code` is `@db.VarChar(40)`, so the intake form accepts up to
-   * forty characters from a guest typing a code they were given. Renamed here
-   * to keep it distinct from `MAX_REFERRAL_CODE_LENGTH` (12), which is the
-   * longest code we ourselves generate.
-   */
-  MAX_REFERRAL_CODE_LENGTH as MAX_INTAKE_REFERRAL_CODE_LENGTH,
-  // Schemas & helpers
-  cookDaySchema,
-  intakeHouseholdStepSchema,
-  intakeDietaryStepSchema,
-  intakeKitchenStepSchema,
-  intakeServiceStepSchema,
-  intakePreferencesStepSchema,
-  intakeStepSchemas,
-  INTAKE_STEP_COUNT,
-  INTAKE_STEP_IDS,
-  INTAKE_STEPS,
-  intakeStepSchemaAt,
-  clientIntakeSchema,
-  clientIntakeCreateSchema,
-  clientIntakeUpdateSchema,
-  serviceAddressToColumns,
-  clientIntakeFilterSchema,
-  consultationRequestSchema,
-  consultationInterviewSchema,
-  consultationInterviewCreateSchema,
-  consultationInterviewUpdateSchema,
-  consultationInterviewFilterSchema,
-  PROSPECT_CONVERSION_STATUSES,
-  PROSPECT_CONVERSION_OUTCOMES,
-  PROSPECT_CONVERSION_STAGES,
-  prospectConversionSchema,
-} from './intake'
+/**
+ * The longest code `generateReferralCode` mints and `referralCodeSchema`
+ * accepts — `12`. The referral domain owns the concept, so it keeps the plain
+ * name.
+ */
+export { MAX_REFERRAL_CODE_LENGTH } from './referral'
 
-export type {
-  CookDay,
-  IntakeHouseholdStep,
-  IntakeHouseholdStepInput,
-  IntakeDietaryStep,
-  IntakeDietaryStepInput,
-  IntakeKitchenStep,
-  IntakeKitchenStepInput,
-  IntakeServiceStep,
-  IntakeServiceStepInput,
-  IntakePreferencesStep,
-  IntakePreferencesStepInput,
-  IntakeStepSchema,
-  IntakeStepValues,
-  IntakeStepInput,
-  IntakeStepId,
-  ClientIntake,
-  ClientIntakeInput,
-  ClientIntakeCreateInput,
-  ClientIntakeCreateRawInput,
-  ClientIntakeUpdateInput,
-  ClientIntakeUpdateRawInput,
-  ServiceAddressColumns,
-  ClientIntakeFilter,
-  ClientIntakeFilterInput,
-  ConsultationRequestInput,
-  ConsultationRequestRawInput,
-  ConsultationInterviewInput,
-  ConsultationInterviewRawInput,
-  ConsultationInterviewCreateInput,
-  ConsultationInterviewUpdateInput,
-  ConsultationInterviewUpdateRawInput,
-  ConsultationInterviewFilter,
-  ConsultationInterviewFilterInput,
-  ProspectConversionInput,
-  ProspectConversionRawInput,
-} from './intake'
+/**
+ * `ReferralCode.code` is `@db.VarChar(40)`, so the intake form accepts up to
+ * forty characters from a guest typing a code they were given. Renamed to keep
+ * it distinct from `MAX_REFERRAL_CODE_LENGTH` (12), which is the longest code
+ * we ourselves generate.
+ */
+export { MAX_REFERRAL_CODE_LENGTH as MAX_INTAKE_REFERRAL_CODE_LENGTH } from './intake'
 
 // =============================================================================
-// referral.ts — enumerated (see collision policy above)
+// Compile-time guard on the collision
+//
+// Type-only imports, so nothing below survives to the emitted module.
+//
+// `Barrel` is this module, imported into itself. A self-referential type import
+// is legal and costs nothing at runtime, and it is the only way to assert on
+// what this file *publishes* rather than on what its dependencies happen to
+// declare. Reading `Barrel.X` fails to compile when `X` is not exported from
+// here, which is precisely the regression the source-module form could not see.
+//
+// `Intake` and `Referral` are kept alongside it so a failure distinguishes the
+// two ways this can break: a constant that changed value, and a constant that
+// stopped being re-exported.
 // =============================================================================
 
-export {
-  // Limits & alphabet
-  MIN_REFERRAL_CODE_LENGTH,
-  /**
-   * The longest code `generateReferralCode` mints and `referralCodeSchema`
-   * accepts. The referral domain owns the concept, so it keeps the plain name.
-   */
-  MAX_REFERRAL_CODE_LENGTH,
-  DEFAULT_REFERRAL_CODE_LENGTH,
-  MAX_REWARD_CENTS,
-  MAX_REDEMPTIONS,
-  REFERRAL_CODE_ALPHABET,
-  // Schemas & helpers
-  referralCodeSchema,
-  generateReferralCode,
-  referralRewardValueKind,
-  rewardCentsSchema,
-  rewardPercentSchema,
-  referralCodeCreateSchema,
-  referralCodeUpdateSchema,
-  referralCodeSortBySchema,
-  referralCodeFilterSchema,
-  referralRedemptionCreateSchema,
-  referralRedemptionStatusUpdateSchema,
-  REFERRAL_REDEMPTION_ACTIONS,
-  referralRedemptionFilterSchema,
-  rewardPayoutSchema,
-  rewardAdjustmentSchema,
-  signedLedgerAmountCents,
-  rewardLedgerFilterSchema,
-} from './referral'
+import type * as Barrel from './index'
+import type * as IntakeModule from './intake'
+import type * as ReferralModule from './referral'
 
-export type {
-  ReferralCode,
-  RewardCents,
-  RewardPercent,
-  ReferralCodeCreateInput,
-  ReferralCodeCreateRawInput,
-  ReferralCodeUpdateInput,
-  ReferralCodeUpdateRawInput,
-  ReferralCodeSortBy,
-  ReferralCodeFilterInput,
-  ReferralCodeFilterRawInput,
-  ReferralRedemptionCreateInput,
-  ReferralRedemptionCreateRawInput,
-  ReferralRedemptionStatusUpdateInput,
-  ReferralRedemptionStatusUpdateRawInput,
-  ReferralRedemptionAction,
-  ReferralRedemptionFilterInput,
-  ReferralRedemptionFilterRawInput,
-  RewardPayoutInput,
-  RewardPayoutRawInput,
-  RewardAdjustmentInput,
-  RewardAdjustmentRawInput,
-  RewardLedgerFilterInput,
-  RewardLedgerFilterRawInput,
-} from './referral'
+/** Fails to instantiate unless `T` is exactly `true`. */
+type Assert<T extends true> = T
+
+// --- The source constants still mean what the policy above says they mean ---
+
+/** `referral.ts` owns the concept and mints codes no longer than 12. */
+export type _ReferralSourceIsTwelve = Assert<
+  typeof ReferralModule.MAX_REFERRAL_CODE_LENGTH extends 12 ? true : false
+>
+
+/** `intake.ts` bounds its free-text field by the `VarChar(40)` column width. */
+export type _IntakeSourceIsForty = Assert<
+  typeof IntakeModule.MAX_REFERRAL_CODE_LENGTH extends 40 ? true : false
+>
+
+// --- ...and this barrel actually re-exports each of them, under the right name
+
+/**
+ * The unqualified `MAX_REFERRAL_CODE_LENGTH` must be exported from here and
+ * must be referral's ceiling of 12 — not intake's 40.
+ */
+export type _BarrelPlainNameIsReferrals = Assert<
+  typeof Barrel.MAX_REFERRAL_CODE_LENGTH extends 12 ? true : false
+>
+
+/**
+ * `MAX_INTAKE_REFERRAL_CODE_LENGTH` must be exported from here and must be
+ * intake's column width of 40. Deleting the alias re-export above makes this
+ * line a compile error rather than a silent removal from the public surface.
+ */
+export type _BarrelAliasIsIntakes = Assert<
+  typeof Barrel.MAX_INTAKE_REFERRAL_CODE_LENGTH extends 40 ? true : false
+>
+
+/**
+ * The two names must not have collapsed onto the same constant. A single
+ * `export *` surviving on its own would satisfy each assertion above
+ * individually while making both names mean the same thing.
+ */
+export type _BarrelNamesAreDistinct = Assert<
+  typeof Barrel.MAX_REFERRAL_CODE_LENGTH extends typeof Barrel.MAX_INTAKE_REFERRAL_CODE_LENGTH
+    ? false
+    : true
+>
