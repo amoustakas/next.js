@@ -63,13 +63,27 @@
  * | 1 | spray, household never answers   | no decision action was invoked        |
  * | 2 | spray, household declines        | `referral.claim.decline` was invoked  |
  * | 3 | spray, household accepts         | `referral.claim.accept` was invoked   |
- * | 4 | spray, then the household's own  | which submission the *placeholder*    |
- * |   | enquiry naming a different code  | received last, before it was proved   |
+ * | 4 | two anonymous POSTs at one       | which of them the *placeholder*       |
+ * |   | address, run in **both** orders  | received last, before it was proved   |
  * | 5 | genuine invitation, end to end   | a second sweep over settled rows      |
  * | 6 | four simultaneous acceptances    | concurrency against one claim token   |
  * | 7 | the same spray, aged one day     | the age of the claim, and nothing     |
  * |   | inside and one day outside the   | else — see §12                        |
  * |   | window, and accepted both times  |                                       |
+ * | 8 | a sign-in whose clear of         | whether `unclaimedSince` is still     |
+ * |   | `unclaimedSince` faulted         | stamped on an account with a session  |
+ *
+ * Scenario 4 is the one that had to be run twice, and §9 argues why at length.
+ * Its previous single ordering — spray, then the household's own enquiry —
+ * concluded that the household is shown their own code, and that conclusion was
+ * produced by the author's choice of which POST to send second rather than by
+ * anything the server does. `recordReferralClaim` is last-writer-wins; the other
+ * ordering shows a genuinely-referred household the sprayer's code with the
+ * sprayer named as their inviter, and a sprayer picks when to fire. Both
+ * orderings now run from one body, the differing property is asserted as `last`
+ * rather than as a code literal, and the invariant that does *not* vary — the
+ * genuine inviter is paid, the sprayer is not — is asserted in identical terms
+ * on both sides.
  *
  * ## What is real here
  *
@@ -83,12 +97,13 @@
  * three request-scoped Next.js modules are substituted, at module resolution, by
  * `scripts/action-resolver.mjs`.
  *
- * Two scenarios reach past the actions and write a column directly, and both say
- * so where they do it: scenario 2 forges a claim back onto a profile to prove
- * the tombstone outranks the column, and scenario 7 ages `claimedAt` with
- * `backdateReferralClaim` so the lapse window can be crossed without waiting a
- * month. Neither substitutes a decision — the clock stays the real one, and
- * every verdict in both scenarios is the shipped action's own.
+ * Three scenarios reach past the actions, and all three say so where they do it:
+ * scenario 2 forges a claim back onto a profile to prove the tombstone outranks
+ * the column; scenario 7 ages `claimedAt` with `backdateReferralClaim` so the
+ * lapse window can be crossed without waiting a month; and scenario 8 renames
+ * `User.unclaimedSince` for the length of one call so that a clear of it faults
+ * for real. None of the three substitutes a decision — the clock stays the real
+ * one, the fault is PostgreSQL's own, and every verdict is the shipped code's.
  *
  * Every scenario asserts on **rows**: redemptions, `ReferralCode.redemptionCount`,
  * `RewardBalance`, `RewardLedgerEntry`, the two claim columns on `ClientProfile`,
@@ -118,7 +133,11 @@ import {
   settleReferralRedemptions,
 } from '@/server/actions/referral'
 import { prisma } from '@/server/db'
-import { CLAIM_WINDOW_DAYS, markMailboxProved } from '@/server/referral-claim'
+import {
+  CLAIM_WINDOW_DAYS,
+  ensureMailboxProved,
+  markMailboxProved,
+} from '@/server/referral-claim'
 
 import { asUser, signInAs, type HarnessUser } from './fixtures/harness-state'
 import {
@@ -380,6 +399,31 @@ async function declineAs(
   clearRateLimits()
 
   const result = await declineReferralClaim({ code })
+
+  signInAs(null)
+
+  return result
+}
+
+/**
+ * The *other* door: `redeemReferralCode`, as the household, naming a code they
+ * were given privately rather than one the platform is holding for them.
+ *
+ * This is what `ReferralClaimBanner`'s "I was given a different code" affordance
+ * routes to, and it is deliberately not the consent door. It is separately
+ * audited, separately rate limited, and it takes free-form input — which is
+ * exactly why the consent door refuses free-form input and converts only the
+ * attribution already on file. A household whose banner is showing a stranger's
+ * code has this; nothing here depends on the claim column at all.
+ */
+async function redeemAs(
+  user: HarnessUser,
+  code: string
+): Promise<Awaited<ReturnType<typeof redeemReferralCode>>> {
+  signInAs(user)
+  clearRateLimits()
+
+  const result = await redeemReferralCode({ code })
 
   signInAs(null)
 
@@ -963,57 +1007,175 @@ async function scenarioAccepted(): Promise<SweepRecord> {
 }
 
 // =============================================================================
-// 9. Scenario 4 — precedence
+// 9. Scenario 4 — precedence, run in both orderings
 // =============================================================================
 
 /**
- * Round three's finding 1, measured.
+ * One anonymous submission at {@link HOUSEHOLD_EMAIL}: a code, whose code it is,
+ * and the call that sends it.
  *
- * An attacker sprays `HARVEST24` at an address. The household — who really were
- * invited, by a member who really gave them `GENUINE24` — then fill in the same
- * public enquiry form themselves, naming their own code. Then they sign in.
- *
- * Three things must hold:
- *
- *  1. the household is shown **the code they were given**, not the sprayed one;
- *  2. they can accept it, and the member who actually invited them is paid;
- *  3. the sprayed code cannot lock the genuine inviter out. Under the automatic
- *     settlement this replaces, `HARVEST24` was converted into a live redemption
- *     at the victim's sign-in, and `ALREADY_REFERRED` then refused every genuine
- *     invitation for ever — by any route, `redeemReferralCode` included. That is
- *     theft *and* denial, and it was deterministic rather than racy.
- *
- * What makes (1) true is bounded by a property of the row rather than by
- * ordering luck: a public submission may refresh the claim on a `User` that is
- * still an **unproved placeholder** — a row this same public path opened and
- * that no human has ever signed into. It may not touch a household that has ever
- * proved its mailbox, which is asserted at the end of this scenario. And it
- * confers nothing either way, because the household still has to consent.
+ * Two names for one function, carried as data on purpose. Whichever of `send`
+ * this scenario invokes, the server receives the identical request from the
+ * identical position — see {@link enquireAnonymously}. Nothing downstream can
+ * branch on which field of this record produced the POST, and that is the fact
+ * the whole scenario turns on.
  */
-async function scenarioPrecedence(): Promise<void> {
-  section('4. precedence — the sprayed code must not outrank the real one')
+interface Submission {
+  readonly code: string
+  readonly inviter: HarnessUser
+  readonly send: (email: string, code: string) => Promise<void>
+}
+
+const SPRAY: Submission = {
+  code: SPRAYED_CODE,
+  inviter: ATTACKER,
+  send: sprayAnonymously,
+}
+
+const GENUINE: Submission = {
+  code: GENUINE_CODE,
+  inviter: PATRON,
+  send: enquireAnonymously,
+}
+
+/** Which of the two anonymous submissions arrived first. */
+type SubmissionOrder = 'spray-first' | 'genuine-first'
+
+/** How the household reached the invitation they actually hold. */
+type RouteToTheTruth =
+  /** The standing claim *was* theirs. One click on the banner. */
+  | 'accept the standing claim'
+  /** It was not. They asserted their own through `redeemReferralCode`. */
+  | 'redeem the code they hold, then decline the standing claim'
+
+/** What one ordering left behind, read from rows rather than return values. */
+interface PrecedenceObservation {
+  readonly order: SubmissionOrder
+  readonly firstSubmitted: string
+  readonly lastSubmitted: string
+  /** `ClientProfile.claimedReferralCode` once both submissions have landed. */
+  readonly standingCode: string | null
+  /** What the consent banner offered the signed-in household. */
+  readonly bannerCode: string | null
+  /** Who the banner named as the inviter. */
+  readonly bannerInviter: string | null
+  /** Every money-bearing row, read before the household did anything. */
+  readonly moneyBeforeConsent: MoneySnapshot
+  readonly route: RouteToTheTruth
+  /** How many authenticated acts the household had to perform. */
+  readonly authenticatedActs: number
+  readonly swept: SweepRecord
+  readonly redemptions: readonly HouseholdRedemption[]
+  readonly patronBalanceCents: number
+  readonly attackerBalanceCents: number
+}
+
+/**
+ * Round three's finding 1, and the residual round five found sitting beside it,
+ * measured in **both** orderings.
+ *
+ * ## Why this scenario is parameterised, and what the previous version proved
+ *
+ * The version this replaces ran one ordering: the sprayer POSTs `HARVEST24`,
+ * then the household POSTs `GENUINE24`, and it concluded "the household is shown
+ * the code THEY were given". That conclusion was produced by the author's choice
+ * of which submission to send second. `recordReferralClaim` is last-writer-wins
+ * and says so; run the same two calls the other way round and the household —
+ * a household that genuinely *was* referred, who will answer *yes* to "were you
+ * referred?" — is shown `HARVEST24` with the **attacker** named as their
+ * inviter. That ordering is at least as available to a sprayer as the other one,
+ * because a sprayer choosing when to fire is the one degree of freedom a sprayer
+ * definitely has. A harness that runs only the flattering ordering is the same
+ * self-deception this file was rewritten to remove — it is the `firstSignIn`
+ * mistake wearing different clothes.
+ *
+ * So both orderings run, from one body, and the report prints them side by side.
+ *
+ * ## The property the two orderings differ by
+ *
+ * Exactly one, and it is a property of the row rather than of the test data:
+ *
+ * > While `User.unclaimedSince` is stamped, `ClientProfile.claimedReferralCode`
+ * > holds whichever public submission arrived **last**.
+ *
+ * That is asserted directly, in terms of `first` and `last` rather than in terms
+ * of `GENUINE_CODE` and `SPRAYED_CODE`, so the assertion cannot be satisfied by
+ * an ordering-dependent accident. The banner's contents follow from it, in both
+ * directions, including the direction that is bad news.
+ *
+ * ## The properties that do *not* differ by ordering
+ *
+ * These are the guarantees the system actually makes, and they are asserted
+ * identically in both arms:
+ *
+ *  1. **No money moves before the household acts.** `moneyBeforeConsent` is
+ *     `NO_MONEY_MOVED` in both orderings, however the two POSTs were arranged.
+ *  2. **The genuine inviter is paid and the sprayer is not** — `PATRON` ends on
+ *     `REWARD_CENTS`, `ATTACKER` on zero, one redemption against `GENUINE_CODE`,
+ *     `SPRAYED_CODE`'s counter at zero. In both orderings. What differs is only
+ *     the *route*: one click when the standing claim happens to be theirs, and
+ *     `redeemReferralCode` — the authenticated, separately audited, rate-limited
+ *     door that `ReferralClaimBanner`'s "I was given a different code" affordance
+ *     opens — when it is not.
+ *  3. **The sprayed code never locks the genuine inviter out.** Under the
+ *     automatic settlement this replaces, `HARVEST24` became a live redemption at
+ *     the victim's sign-in and `ALREADY_REFERRED` then refused every genuine
+ *     invitation for ever, by any route. Here the one live redemption per
+ *     household is held by the invitation the household chose, in both orderings,
+ *     and the refusal of the *other* code is the rule working rather than the
+ *     harm.
+ *
+ * ## What is therefore admitted rather than papered over
+ *
+ * In `genuine-first`, a household that really was referred is shown a stranger's
+ * code with a stranger's name on it. That is a phishing surface and it is real.
+ * The system's answer is not that it cannot happen — it demonstrably can, and
+ * this scenario is what makes it a measured fact rather than a paragraph — but
+ * that it costs the sprayer nothing and gains them nothing, and that the
+ * household has a one-action route to the invitation they actually hold. Both
+ * halves of that are asserted below.
+ */
+async function runPrecedence(
+  order: SubmissionOrder
+): Promise<PrecedenceObservation> {
+  section(`4${order === 'spray-first' ? 'a' : 'b'}. precedence — ${order}`)
 
   const stageIds = await stage()
 
-  // The sprayer goes first, as a sprayer would.
-  await sprayAnonymously(HOUSEHOLD_EMAIL, SPRAYED_CODE)
+  // The only line in this function that reads the parameter. Everything after
+  // it is written in terms of `first` and `last`, never of which party sent
+  // them, because the server has no access to that distinction either.
+  const submissions: readonly [Submission, Submission] =
+    order === 'spray-first' ? [SPRAY, GENUINE] : [GENUINE, SPRAY]
+  const [first, last] = submissions
+
+  await first.send(HOUSEHOLD_EMAIL, first.code)
 
   const userId = (await userIdForEmail(HOUSEHOLD_EMAIL)) ?? ''
   const clientProfileId = (await profileIdForEmail(HOUSEHOLD_EMAIL)) ?? ''
-  const sprayed = await referralClaimOf(clientProfileId)
 
-  check('the spray lands first, as it always could', () => {
-    assert.equal(sprayed?.code, SPRAYED_CODE)
+  assert.notEqual(userId, '', 'the public form did not open an account')
+  assert.notEqual(clientProfileId, '', 'the public form did not open a file')
+
+  const afterFirst = await referralClaimOf(clientProfileId)
+  const placeholderBefore = await unclaimedSinceOf(userId)
+
+  check('the first submission stands, whichever party sent it', () => {
+    assert.equal(afterFirst?.code, first.code)
   })
 
-  // The household now fills in the same form themselves, with the code their
-  // friend actually gave them. Same action, same anonymous position.
-  await enquireAnonymously(HOUSEHOLD_EMAIL, GENUINE_CODE)
+  await last.send(HOUSEHOLD_EMAIL, last.code)
 
-  const standingClaim = await referralClaimOf(clientProfileId)
+  const standing = await referralClaimOf(clientProfileId)
+  const placeholderAfter = await unclaimedSinceOf(userId)
 
-  check('the household’s own submission is what stands on their unproved file', () => {
-    assert.equal(standingClaim?.code, GENUINE_CODE)
+  // The property, stated as a property. Not "the genuine code wins" — that is
+  // an artefact of which submission a test author sends second.
+  check('the LAST public submission is what stands, while the row is unproved', () => {
+    assert.notEqual(placeholderBefore, null)
+    assert.notEqual(placeholderAfter, null)
+    assert.equal(standing?.code, last.code)
+    assert.notEqual(standing?.code, first.code)
   })
 
   await magicLinkSignIn(userId)
@@ -1022,30 +1184,80 @@ async function scenarioPrecedence(): Promise<void> {
   const banner = await readBanner(household)
   const attribution = attributionOf(banner?.standing)
 
-  check('so the banner shows them the code THEY were given', () => {
-    assert.equal(banner?.code, GENUINE_CODE)
-  })
-
-  check('and names the member who invited them, not the sprayer', () => {
+  check('the banner offers exactly that submission, and names its owner', () => {
+    assert.equal(banner?.code, last.code)
     assert.notEqual(attribution, null)
-    assert.equal(attribution?.inviterDisplayName, PATRON.name)
+    assert.equal(attribution?.inviterDisplayName, last.inviter.name)
   })
 
-  // A prompt rendered against the sprayed code must consume nothing.
-  const stale = await acceptAs(household, SPRAYED_CODE)
+  // Whoever the named party turns out to be, the card says where the string
+  // came from and that nobody has vouched for it. In `genuine-first` this is
+  // the only thing standing between a referred household and a stranger's
+  // code, which is why it is asserted in both arms rather than in one.
+  check('and states its provenance as what it is: unverified public input', () => {
+    assert.equal(banner?.provenance, 'public-enquiry-form')
+    assert.equal(banner?.assurance, 'unverified')
+  })
+
+  // A prompt rendered against the *other* code must consume nothing. This is
+  // the stale-render guard, and it holds in both directions.
+  const stale = await acceptAs(household, first.code)
   const afterStale = await referralClaimOf(clientProfileId)
 
-  check('accepting the sprayed code is superseded, and takes nothing with it', () => {
+  check('accepting the superseded submission takes nothing with it', () => {
     assert.equal(stale.ok, true)
     assert.equal(stale.ok ? stale.data.kind : '', 'superseded')
     assert.equal(
       stale.ok && stale.data.kind === 'superseded' ? stale.data.standing : '',
-      GENUINE_CODE
+      last.code
     )
-    assert.equal(afterStale?.code, GENUINE_CODE)
+    assert.equal(afterStale?.code, last.code)
   })
 
-  const accepted = await acceptAs(household, GENUINE_CODE)
+  const moneyBeforeConsent = await moneySnapshot(stageIds)
+
+  check('no row carrying money exists in either ordering, before consent', () => {
+    assert.deepEqual(moneyBeforeConsent, NO_MONEY_MOVED)
+  })
+
+  // ---- the household reaches the invitation it actually holds --------------
+  // The household knows one thing the server does not and cannot: their friend
+  // gave them `GENUINE_CODE`. Which route that takes is decided by the standing
+  // claim, not by this function's parameter.
+  const standingIsTheirs = last.code === GENUINE_CODE
+  const route: RouteToTheTruth = standingIsTheirs
+    ? 'accept the standing claim'
+    : 'redeem the code they hold, then decline the standing claim'
+
+  if (standingIsTheirs) {
+    const accepted = await acceptAs(household, GENUINE_CODE)
+
+    check('the genuine case is one authenticated act, on the banner', () => {
+      assert.equal(accepted.ok, true)
+      assert.equal(accepted.ok ? accepted.data.kind : '', 'accepted')
+    })
+  } else {
+    // `ReferralClaimBanner`'s "I was given a different code" affordance, driven
+    // through the two shipped actions it calls, in the order it calls them.
+    // Redeem first: a decline is a tombstone, so declining before the assertion
+    // succeeded would cost the household the standing claim with nothing to
+    // show for it if their own code turned out to be refused.
+    const redeemed = await redeemAs(household, GENUINE_CODE)
+    const declined = await declineAs(household, SPRAYED_CODE)
+    const afterDecline = await referralClaimOf(clientProfileId)
+
+    check('a household shown a stranger’s code can assert their own', () => {
+      assert.equal(redeemed.ok, true)
+      assert.equal(redeemed.ok ? redeemed.data.code : '', GENUINE_CODE)
+      assert.equal(redeemed.ok ? redeemed.data.status : '', 'PENDING')
+    })
+
+    check('and the stranger’s claim is then cleared, not left on the card', () => {
+      assert.equal(declined.ok, true)
+      assert.equal(declined.ok ? declined.data.kind : '', 'declined')
+      assert.equal(afterDecline, null)
+    })
+  }
 
   await payInvoice(userId, HOUSEHOLD_INVOICE_CENTS)
 
@@ -1054,35 +1266,26 @@ async function scenarioPrecedence(): Promise<void> {
   const redemptions = await redemptionsOf(userId)
   const sprayedCounter = await redemptionCountOf(stageIds.sprayedCodeId)
   const genuineCounter = await redemptionCountOf(stageIds.genuineCodeId)
-  const patronBalance = await balanceCentsOf(PATRON.id)
-  const attackerBalance = await balanceCentsOf(ATTACKER.id)
+  const patronBalanceCents = await balanceCentsOf(PATRON.id)
+  const attackerBalanceCents = await balanceCentsOf(ATTACKER.id)
 
-  check('the genuine invitation settles, and only it', () => {
-    assert.equal(accepted.ok, true)
-    assert.equal(accepted.ok ? accepted.data.kind : '', 'accepted')
-    assert.deepEqual(redemptions, [{ code: GENUINE_CODE, status: 'REWARDED' }])
-    assert.equal(sprayedCounter, 0)
-    assert.equal(genuineCounter, 1)
-  })
-
+  // The invariant. Identical text, identical values, in both orderings.
   check('the member who actually invited them is paid, and the sprayer is not', () => {
+    assert.deepEqual(redemptions, [{ code: GENUINE_CODE, status: 'REWARDED' }])
+    assert.equal(genuineCounter, 1)
+    assert.equal(sprayedCounter, 0)
     assert.deepEqual(swept, ONE_REWARD_SWEPT)
-    assert.equal(patronBalance, REWARD_CENTS)
-    assert.equal(attackerBalance, 0)
+    assert.equal(patronBalanceCents, REWARD_CENTS)
+    assert.equal(attackerBalanceCents, 0)
   })
 
-  // --- the lockout, asserted from the other end ----------------------------
-  // A household holding a live redemption is refused a second one with
-  // `ALREADY_REFERRED`. Under the automatic settlement the *sprayed* code
-  // occupied that slot before the household had done anything at all, so the
-  // real inviter could never be paid. Here the slot is held by the invitation
-  // the household consented to, which is the correct occupant — the refusal
-  // below is the rule working rather than the harm.
-  signInAs(household)
-  clearRateLimits()
-  const second = await redeemReferralCode({ code: SPRAYED_CODE })
-  signInAs(null)
-
+  // ---- the lockout, asserted from the other end ---------------------------
+  // A household holding a live redemption is refused a second one. Under the
+  // automatic settlement the *sprayed* code occupied that slot before the
+  // household had done anything at all, so the real inviter could never be
+  // paid. Here the slot is held by the invitation the household chose — in
+  // both orderings — so the refusal below is the rule working, not the harm.
+  const second = await redeemAs(household, SPRAYED_CODE)
   const unchanged = await redemptionsOf(userId)
 
   check('one live redemption per household still binds — on the right one', () => {
@@ -1091,9 +1294,42 @@ async function scenarioPrecedence(): Promise<void> {
     assert.deepEqual(unchanged, [{ code: GENUINE_CODE, status: 'REWARDED' }])
   })
 
-  // --- and the refresh is bounded by a property, not by ordering -----------
-  // A member who has ever proved their mailbox cannot have their attribution
-  // rewritten by anybody's public submission.
+  return {
+    order,
+    firstSubmitted: first.code,
+    lastSubmitted: last.code,
+    standingCode: standing?.code ?? null,
+    bannerCode: banner?.code ?? null,
+    bannerInviter: attribution?.inviterDisplayName ?? null,
+    moneyBeforeConsent,
+    route,
+    authenticatedActs: standingIsTheirs ? 1 : 2,
+    swept,
+    redemptions,
+    patronBalanceCents,
+    attackerBalanceCents,
+  }
+}
+
+/**
+ * Both orderings, plus the bound that makes the refresh tolerable at all.
+ *
+ * The refresh `runPrecedence` measures — a second public POST overwriting the
+ * first — is admitted only while the row is an **unproved placeholder**. The
+ * tail of this function asserts the other side of that: a member who has ever
+ * proved their mailbox cannot have their attribution rewritten by anybody's
+ * public submission, so the whole of the above is confined to accounts the
+ * public path itself opened.
+ */
+async function scenarioPrecedence(): Promise<{
+  readonly sprayFirst: PrecedenceObservation
+  readonly genuineFirst: PrecedenceObservation
+}> {
+  const sprayFirst = await runPrecedence('spray-first')
+  const genuineFirst = await runPrecedence('genuine-first')
+
+  section('4c. precedence — the bound on the refresh itself')
+
   const patronBefore: AccountSnapshot = await accountSnapshot(PATRON.id)
 
   await sprayAnonymously(PATRON.email ?? '', SPRAYED_CODE)
@@ -1106,7 +1342,9 @@ async function scenarioPrecedence(): Promise<void> {
     assert.deepEqual(patronAfter, patronBefore)
   })
 
-  note('the household chooses; the sprayer neither wins nor blocks.')
+  note('ordering decides which code is *shown*; consent decides who is paid.')
+
+  return { sprayFirst, genuineFirst }
 }
 
 // =============================================================================
@@ -1642,7 +1880,150 @@ async function scenarioClaimWindow(): Promise<{
 }
 
 // =============================================================================
-// 13. The report
+// 13. Scenario 8 — the degraded placeholder, and its repair
+// =============================================================================
+
+/**
+ * Rename `User.unclaimedSince` for the duration of `run`, so that every write
+ * touching it faults against a real PostgreSQL.
+ *
+ * The only fault injection in this file, and it is a real fault rather than a
+ * substituted decision: Prisma issues its ordinary statement, the server refuses
+ * it because the column is not there, and the code under test meets a genuine
+ * `PrismaClientKnownRequestError` from a genuine connection. Nothing is mocked
+ * and no branch is forced.
+ *
+ * `finally` puts the column back whatever happens, and the database this runs
+ * against has already been asserted disposable — but the rename is still scoped
+ * as tightly as it can be, because a harness that leaves a schema mangled on a
+ * failed assertion is a harness that makes the *next* failure unreadable.
+ */
+async function withoutUnclaimedSinceColumn<T>(run: () => Promise<T>): Promise<T> {
+  await prisma.$executeRawUnsafe(
+    'ALTER TABLE "User" RENAME COLUMN "unclaimedSince" TO "unclaimedSince_hidden"'
+  )
+
+  try {
+    return await run()
+  } finally {
+    await prisma.$executeRawUnsafe(
+      'ALTER TABLE "User" RENAME COLUMN "unclaimedSince_hidden" TO "unclaimedSince"'
+    )
+  }
+}
+
+/**
+ * The state a reviewer reproduced, and the two things that were missing from it.
+ *
+ * `authConfig.events.signIn` used to call `markMailboxProved` inside a
+ * `try`/`catch` that logged and dropped the error. The reviewer produced the
+ * consequence directly: a session exists, and `User.unclaimedSince` is still
+ * stamped. Nothing reported it, and nothing ever fixed it — the old comment
+ * conceded the window and left it open "until the next sign-in re-runs this",
+ * which for a magic-link household can be never.
+ *
+ * What makes that a defect rather than a stale column is asserted first, before
+ * anything is repaired: while the stamp stands, `attachReferralClaim` still
+ * admits an anonymous POST against this household, so a sprayer can **re-aim
+ * the consent prompt of an account that already has a session**. That is the
+ * capability the clear is supposed to have closed.
+ *
+ * Then the two properties `ensureMailboxProved` adds:
+ *
+ *  1. **Observable.** A failing clear returns `{kind: 'failed'}` — a value the
+ *     caller has to handle rather than an exception a `catch` can drop on the
+ *     floor. Measured here against a real fault, not a stub.
+ *  2. **Recoverable.** `authConfig.callbacks.session` calls it again on every
+ *     authenticated request, so the very next page load repairs it. That call
+ *     cannot be driven from here (`server/auth.ts` needs a Next.js runtime),
+ *     so this drives the function that callback calls, with the argument it
+ *     passes — the same seam every other scenario in this file uses for
+ *     `signIn`.
+ *
+ * The scenario ends by proving the repair actually bought the property it was
+ * for: the same anonymous POST that landed a moment ago is now inert.
+ */
+async function scenarioDegradedPlaceholder(): Promise<void> {
+  section('8. a sign-in whose clear failed — observable, and repaired')
+
+  await stage()
+
+  await sprayAnonymously(HOUSEHOLD_EMAIL, SPRAYED_CODE)
+
+  const userId = (await userIdForEmail(HOUSEHOLD_EMAIL)) ?? ''
+  const clientProfileId = (await profileIdForEmail(HOUSEHOLD_EMAIL)) ?? ''
+
+  // The sign-in, with its clear faulting. `magicLinkSignIn` is not used here
+  // precisely because it asserts the clear succeeded; this is the run where it
+  // does not, and the fault is a real one against a real column.
+  const atSignIn = await withoutUnclaimedSinceColumn(async () =>
+    ensureMailboxProved(userId)
+  )
+
+  await prisma.user.update({
+    where: { id: userId },
+    data: { lastLoginAt: new Date() },
+    select: { id: true },
+  })
+
+  const stampAfterSignIn = await unclaimedSinceOf(userId)
+
+  check('the failed clear is reported as a value, not swallowed', () => {
+    assert.equal(atSignIn.kind, 'failed')
+    assert.equal(atSignIn.kind === 'failed' ? atSignIn.attempts : 0, 2)
+    assert.notEqual(
+      atSignIn.kind === 'failed' ? atSignIn.message : '',
+      'unknown'
+    )
+  })
+
+  check('and the household is left signed in, with the stamp still standing', () => {
+    assert.notEqual(stampAfterSignIn, null)
+  })
+
+  // --- what the stamp still permits, stated before it is cleared ------------
+  // This is the harm. A second sprayer POSTs at an address whose owner is
+  // already signed in, and re-aims the consent prompt they will be shown.
+  await sprayAnonymously(HOUSEHOLD_EMAIL, GENUINE_CODE)
+
+  const reAimed = await referralClaimOf(clientProfileId)
+
+  check('while it stands, the public form can still re-aim a live account', () => {
+    assert.equal(reAimed?.code, GENUINE_CODE)
+  })
+
+  // --- the repair, as `authConfig.callbacks.session` performs it ------------
+  const atSession = await ensureMailboxProved(userId)
+  const stampAfterRepair = await unclaimedSinceOf(userId)
+
+  check('the next authenticated request repairs it', () => {
+    assert.equal(atSession.kind, 'newly-proved')
+    assert.equal(stampAfterRepair, null)
+  })
+
+  const again = await ensureMailboxProved(userId)
+
+  check('and every request after that is a WHERE and no UPDATE', () => {
+    assert.equal(again.kind, 'not-applicable')
+  })
+
+  // --- and the repair bought the property it was for ------------------------
+  const beforeThirdSpray = await referralClaimOf(clientProfileId)
+
+  await sprayAnonymously(HOUSEHOLD_EMAIL, SPRAYED_CODE)
+
+  const afterThirdSpray = await referralClaimOf(clientProfileId)
+
+  check('the identical POST is inert once the stamp is gone', () => {
+    assert.equal(beforeThirdSpray?.code, GENUINE_CODE)
+    assert.equal(afterThirdSpray?.code, GENUINE_CODE)
+  })
+
+  note('a swallowed failure was a standing capability; now it is a logged one that heals.')
+}
+
+// =============================================================================
+// 14. The report
 // =============================================================================
 
 function printReport(
@@ -1678,6 +2059,93 @@ function printReport(
       '  attacker does differs between them, and nothing in the test data differs\n' +
       '  between them. The only difference is which consent action the household\n' +
       '  invoked, and that is the only thing that moves the money.'
+  )
+}
+
+/**
+ * The two orderings, side by side.
+ *
+ * Printed separately from {@link printReport} because it answers the question
+ * that report cannot: that one holds the *submissions* fixed and varies the
+ * household's answer; this one holds the household's intent fixed — they were
+ * genuinely referred, and they want the invitation they were actually given —
+ * and varies only which of two identical anonymous POSTs arrived second.
+ *
+ * The top half of the table is where the two columns differ, and every line of
+ * it is bad news in the right-hand column. The bottom half is where they do not,
+ * and that is the guarantee: the divergence is confined to what the household is
+ * *shown* and how many acts it costs them, and never reaches who is paid.
+ */
+function printPrecedenceReport(
+  sprayFirst: PrecedenceObservation,
+  genuineFirst: PrecedenceObservation
+): void {
+  printTable(
+    'The same two anonymous POSTs, at one address, in the two possible orders',
+    [
+      ['', 'spray first', 'genuine first'],
+      [
+        'second POST to arrive',
+        sprayFirst.lastSubmitted,
+        genuineFirst.lastSubmitted,
+      ],
+      [
+        'code standing on the file',
+        sprayFirst.standingCode ?? '(none)',
+        genuineFirst.standingCode ?? '(none)',
+      ],
+      [
+        'code the banner offered',
+        sprayFirst.bannerCode ?? '(none)',
+        genuineFirst.bannerCode ?? '(none)',
+      ],
+      [
+        'inviter the banner named',
+        sprayFirst.bannerInviter ?? '(none)',
+        genuineFirst.bannerInviter ?? '(none)',
+      ],
+      ['route to the real invitation', sprayFirst.route, genuineFirst.route],
+      [
+        'authenticated acts required',
+        String(sprayFirst.authenticatedActs),
+        String(genuineFirst.authenticatedActs),
+      ],
+      ['—', '—', '—'],
+      [
+        'money moved before consent',
+        money(
+          sprayFirst.moneyBeforeConsent.attackerBalanceCents +
+            sprayFirst.moneyBeforeConsent.patronBalanceCents
+        ),
+        money(
+          genuineFirst.moneyBeforeConsent.attackerBalanceCents +
+            genuineFirst.moneyBeforeConsent.patronBalanceCents
+        ),
+      ],
+      [
+        'redemption finally written',
+        sprayFirst.redemptions.map((row) => row.code).join(', ') || '(none)',
+        genuineFirst.redemptions.map((row) => row.code).join(', ') || '(none)',
+      ],
+      [
+        'paid to the real inviter',
+        money(sprayFirst.patronBalanceCents),
+        money(genuineFirst.patronBalanceCents),
+      ],
+      [
+        'paid to the sprayer',
+        money(sprayFirst.attackerBalanceCents),
+        money(genuineFirst.attackerBalanceCents),
+      ],
+    ],
+    '  Above the rule the columns differ, and the right-hand one is the honest\n' +
+      '  bad news: a household that really was referred is shown a stranger’s\n' +
+      '  code, with the stranger named as their inviter. `recordReferralClaim`\n' +
+      '  is last-writer-wins, and a sprayer chooses when to fire. Below the rule\n' +
+      '  the columns are identical, and that is the guarantee — the ordering\n' +
+      '  decides what is displayed and how many acts it costs, never who is paid.\n' +
+      '  The right-hand column costs one extra act because the household reaches\n' +
+      '  `redeemReferralCode` instead of the banner’s Accept.'
   )
 }
 
@@ -1733,7 +2201,7 @@ function printClaimWindowReport(
 }
 
 // =============================================================================
-// 14. Entry point
+// 15. Entry point
 // =============================================================================
 
 async function main(): Promise<void> {
@@ -1748,7 +2216,7 @@ async function main(): Promise<void> {
   const declined = await scenarioDeclined()
   const accepted = await scenarioAccepted()
 
-  await scenarioPrecedence()
+  const precedence = await scenarioPrecedence()
 
   const legitimate = await scenarioLegitimate()
 
@@ -1756,7 +2224,10 @@ async function main(): Promise<void> {
 
   const window = await scenarioClaimWindow()
 
+  await scenarioDegradedPlaceholder()
+
   printReport(noConsent, declined, accepted, legitimate)
+  printPrecedenceReport(precedence.sprayFirst, precedence.genuineFirst)
   printClaimWindowReport(window.inside, window.outside)
 
   console.log(`\nPASS — ${String(checkCount())} assertions, 0 failures.`)

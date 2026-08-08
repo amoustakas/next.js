@@ -105,7 +105,8 @@ import { z } from 'zod'
 import { prisma } from '@/server/db'
 import {
   adoptUnclaimedAccount,
-  markMailboxProved,
+  ensureMailboxProved,
+  type MailboxProofRepair,
   type OAuthAccountLink,
 } from '@/server/referral-claim'
 
@@ -375,6 +376,76 @@ async function adoptForOAuthSignIn(
   }
 }
 
+/**
+ * Where an operator finds out that `User.unclaimedSince` is still stamped on an
+ * account that has a session.
+ *
+ * ## Why this is a function rather than a `catch` block
+ *
+ * Because the thing it is replacing was a `catch` block, and a `catch` block is
+ * the wrong shape for this. `ensureMailboxProved` returns a discriminated union
+ * with a `failed` arm, so the failure is a value that has to be passed
+ * somewhere; routing every caller through one reporter means there is exactly
+ * one sentence describing this fault on the platform, and adding a third caller
+ * cannot accidentally reintroduce silence. That is the property the previous
+ * design lacked: two call sites of a `try`/`catch` can disagree about whether a
+ * failure matters, and nothing notices.
+ *
+ * ## The three levels, and why they are not all the same
+ *
+ *  - `failed` is an **error**. It is a live security-relevant degradation: the
+ *    public enquiry form can still overwrite this household's
+ *    `ClientProfile.claimedReferralCode`, so a sprayer can still re-aim the
+ *    consent prompt of an account that already has a session. The line names
+ *    that consequence rather than the Prisma call, because an operator reading
+ *    it at 3am needs to know what is exposed, not which statement threw. It
+ *    carries the `userId` and no other identifier — CONTRACT.md §5 forbids
+ *    logging secrets, and an email address in a log is a worse trade here than
+ *    a cuid an operator can look up.
+ *  - `newly-proved` from a *session read* is a **warning**, and it is the most
+ *    informative line this function emits: it means an earlier sign-in's clear
+ *    did not happen, the repair has just run, and the account was exposed for
+ *    the interval between the two. `origin` is what makes that visible — the
+ *    same outcome from `sign-in` is the ordinary first sign-in of every
+ *    household the intake path ever opened, and is merely `info`.
+ *  - `not-applicable` is silent. It is the outcome of essentially every
+ *    authenticated request on the platform, and a line printed on all of them
+ *    is one nobody reads — which is how the previous failure went unnoticed for
+ *    a whole audit round.
+ */
+function reportMailboxProof(
+  userId: string,
+  outcome: MailboxProofRepair,
+  origin: 'sign-in' | 'session'
+): void {
+  if (outcome.kind === 'failed') {
+    console.error(
+      '[auth] unclaimedSince could not be cleared — the public enquiry form can still overwrite this household’s referral claim',
+      {
+        userId,
+        origin,
+        attempts: outcome.attempts,
+        error: outcome.message,
+      }
+    )
+    return
+  }
+
+  if (outcome.kind !== 'newly-proved') {
+    return
+  }
+
+  if (origin === 'session') {
+    console.warn(
+      '[auth] unclaimedSince was still set on an account with a live session — repaired now, so an earlier sign-in failed to clear it',
+      { userId }
+    )
+    return
+  }
+
+  console.info('[auth] unclaimed account proved by sign-in', { userId })
+}
+
 // =============================================================================
 // 6. Configuration
 // =============================================================================
@@ -459,6 +530,29 @@ export const authConfig = {
      * `signIn` only fires at the door; this fires continuously, which is why
      * the deactivation check has to live here as well. A household deactivated
      * while signed in loses access on its next request, not at cookie expiry.
+     *
+     * ## And why the placeholder repair lives here too
+     *
+     * "Fires continuously" is exactly what a state transition that must not be
+     * lost needs behind it. The `signIn` event gets one attempt at clearing
+     * `User.unclaimedSince`; this gets one on every authenticated request the
+     * household ever makes, so a clear that faulted at the door is repaired at
+     * the household's next page load rather than at their next sign-in — which,
+     * for a magic-link household, may never come.
+     *
+     * The repair costs **no extra query in the ordinary case**. This callback
+     * already reads the row, so `unclaimedSince` is one more column on a
+     * `SELECT` that was happening anyway, and `ensureMailboxProved` is called
+     * only when that column is non-null — which, for every household that has
+     * ever signed in successfully, it is not.
+     *
+     * A live session is not a hint that the mailbox was proved, it is the
+     * proof: Auth.js issued it only after verifying a magic link or completing
+     * an OAuth exchange. So "there is a session **and** the stamp is set" is
+     * unambiguous — it is the degraded state and nothing else — and clearing it
+     * here is not a new policy, it is the sign-in event's policy applied at the
+     * next opportunity. Nothing about money is decided here or anywhere near
+     * here; see `@/server/referral-claim`.
      */
     async session({ session, user }) {
       const record = await prisma.user.findUnique({
@@ -472,6 +566,10 @@ export const authConfig = {
           isActive: true,
           timeZone: true,
           locale: true,
+          // Read for the repair below, never surfaced on `session.user`. It is
+          // a server-side capability marker and no client has business seeing
+          // whether an account was opened by the intake path.
+          unclaimedSince: true,
           clientProfile: { select: { id: true } },
           staffProfile: { select: { id: true } },
         },
@@ -480,6 +578,19 @@ export const authConfig = {
       if (record === null || !record.isActive) {
         await revokeSessionsFor(user.id)
         return anonymousExpiredSession()
+      }
+
+      // The session is live and active, so the mailbox is proved. If the stamp
+      // survived the sign-in event, that event's write failed and this is the
+      // re-attempt. Awaited rather than fired and forgotten: an unawaited
+      // promise in a serverless invocation is a promise that may never run, and
+      // this is the code path that is supposed to be the reliable one.
+      if (record.unclaimedSince !== null) {
+        reportMailboxProof(
+          record.id,
+          await ensureMailboxProved(record.id),
+          'session'
+        )
       }
 
       const sessionUser: SessionUser = {
@@ -517,9 +628,12 @@ export const authConfig = {
      *
      *  1. `User.lastLoginAt` is stamped. Purely informational — the CRM sorts
      *     dormant households by it.
-     *  2. {@link markMailboxProved} clears `User.unclaimedSince`, so a row the
+     *  2. {@link ensureMailboxProved} clears `User.unclaimedSince`, so a row the
      *     public intake path opened for an unproved address stops being a
      *     placeholder.
+     *
+     * The two are **not** the same kind of write and are no longer handled as
+     * though they were. See {@link reportMailboxProof}.
      *
      * ## No referral is settled here (MCV-052)
      *
@@ -540,11 +654,18 @@ export const authConfig = {
      * consent action on behalf of the signed-in household. Nothing in this file
      * has a use for it: an Auth.js event has no household in front of it to ask.
      *
-     * Failures are logged and swallowed rather than allowed to break a sign-in
-     * that has otherwise succeeded. A household must never be shown "try again",
-     * which reads as a rejected sign-in, because a bookkeeping write failed.
-     * Neither write carries money, so losing one costs a stale column and not a
-     * cent.
+     * ## Neither write may fail the sign-in; only one of them may fail quietly
+     *
+     * A household must never be shown "try again", which reads as a rejected
+     * sign-in, because a write behind the scenes failed. That part is unchanged.
+     * What has changed is what happens instead, because the previous version of
+     * this comment justified swallowing *both* failures on the ground that
+     * "neither write carries money, so losing one costs a stale column and not a
+     * cent" — and that is true of `lastLoginAt` and false of `unclaimedSince`.
+     * The first is a record; the second is a capability boundary, and while it
+     * stands the public enquiry form may still overwrite this household's
+     * `ClientProfile.claimedReferralCode`. See {@link reportMailboxProof} and
+     * `ensureMailboxProved`.
      */
     async signIn({ user }) {
       if (typeof user.id !== 'string') {
@@ -565,21 +686,10 @@ export const authConfig = {
         })
       }
 
-      try {
-        const outcome = await markMailboxProved(userId)
-
-        // Only the transition is worth a line. `not-applicable` is the outcome
-        // of essentially every sign-in on the platform, and a line printed on
-        // all of them is one nobody reads.
-        if (outcome.kind === 'newly-proved') {
-          console.info('[auth] unclaimed account proved by sign-in', { userId })
-        }
-      } catch (error) {
-        console.error('[auth] failed to clear unclaimedSince', {
-          userId,
-          error: error instanceof Error ? error.message : 'unknown',
-        })
-      }
+      // No `try`/`catch`: `ensureMailboxProved` reports its own failure as a
+      // value, which is the whole point of it existing. A `catch` here would
+      // put the swallow back exactly where it was.
+      reportMailboxProof(userId, await ensureMailboxProved(userId), 'sign-in')
     },
   },
 

@@ -81,7 +81,12 @@
  *    that did not send that enquiry can clear the suggestion instead of waiting
  *    {@link CLAIM_WINDOW_DAYS} for it to lapse.
  *  - {@link markMailboxProved} is what is left of the `signIn` event: it clears
- *    `User.unclaimedSince` and touches nothing that carries money.
+ *    `User.unclaimedSince` and touches nothing that carries money. It is reached
+ *    through {@link ensureMailboxProved}, which retries it, reports a failure as
+ *    a value rather than swallowing one, and is called again on every
+ *    authenticated request so a failed clear repairs itself. That column is a
+ *    capability boundary rather than bookkeeping — see the bullet below — and
+ *    the previous version of this module treated a failed write to it as free.
  *
  * Because eligibility is decided at acceptance rather than at claim time, the
  * public path has no cap check, no expiry check and no owner-identity check of
@@ -130,6 +135,13 @@
  *    writes not one column — nor one row — of that household's. No column other
  *    than these two is reachable from the public path at any point, and neither
  *    of these two carries money.
+ *
+ *    That promise is only as good as the clear, which is why the clear is no
+ *    longer allowed to fail quietly. `unclaimedSince` is the boundary itself,
+ *    not a record of it, so a swallowed failure to clear it does not cost a
+ *    stale column — it leaves the public form writing on a household that has a
+ *    session. {@link ensureMailboxProved} retries, reports, and re-attempts on
+ *    the next authenticated request.
  *  - **Closed:** an unbounded attribution. A claim lapses after
  *    {@link CLAIM_WINDOW_DAYS} and can be declined before that.
  *  - **Residual, and named rather than dismissed:** a sprayer can still cause a
@@ -396,11 +408,12 @@ export type MailboxProofOutcome =
  * of that column from the authenticated reader of it: once it has run, the
  * account's claim can no longer be re-aimed from the public path, which is what
  * bounds `readPendingReferralClaim` to one code per proved mailbox rather than
- * one per public POST. It is a runtime fact, not a database constraint, and
- * `authConfig.events.signIn` logs and swallows a failure here rather than
- * failing the sign-in — so a failed call leaves that door open until the next
- * sign-in re-runs this. See the oracle argument in `actions/referral-claim.ts`
- * for what that window is worth to an attacker.
+ * one per public POST. It is a runtime fact, not a database constraint.
+ *
+ * This function **throws** on a fault, and deliberately keeps throwing. Its
+ * resilience lives one level up, in {@link ensureMailboxProved}, so that the
+ * write and the policy about what a failed write means are not the same piece
+ * of code — see that function for what the policy is and why it changed.
  *
  * `updateMany` guarded on the prior value, so a household's fiftieth sign-in
  * costs a `WHERE` and no `UPDATE`, and running twice is a no-op rather than a
@@ -418,6 +431,125 @@ export async function markMailboxProved(
   return cleared.count === 1
     ? { kind: 'newly-proved' }
     : { kind: 'not-applicable' }
+}
+
+/**
+ * How many times {@link ensureMailboxProved} will try before reporting a
+ * failure.
+ *
+ * Two, with no delay between them, and both halves of that are deliberate.
+ *
+ * Two rather than one because the failure this is guarding against is
+ * overwhelmingly a dropped pooled connection, and Prisma's next call
+ * re-establishes one; a second immediate attempt converts most of this
+ * function's failures into successes for the price of one round trip on a path
+ * that is already doing several.
+ *
+ * No delay, and no third attempt, because this runs inside a sign-in and inside
+ * a session read — a human is waiting behind both, and a backoff loop on a
+ * request path trades one degraded state for a slower one. The real backoff is
+ * structural rather than temporal: the caller of record is
+ * `authConfig.callbacks.session`, which runs on **every authenticated request**,
+ * so an account that survives both attempts is retried within seconds by the
+ * household's own next page load. Sleeping here would only be racing that.
+ */
+const MAILBOX_PROOF_ATTEMPTS = 2
+
+/** What {@link ensureMailboxProved} did, including the ways it did not. */
+export type MailboxProofRepair =
+  /** Cleared. The account is no longer an unproved placeholder. */
+  | { readonly kind: 'newly-proved' }
+  /** Nothing to clear: already proved, gone, or deactivated. */
+  | { readonly kind: 'not-applicable' }
+  /**
+   * Every attempt faulted. The stamp is **still set** and the public path can
+   * therefore still overwrite this household's `claimedReferralCode`.
+   *
+   * Reported rather than thrown, and carrying the message rather than the
+   * error, because the two callers must both keep going — one is a sign-in that
+   * has otherwise succeeded, the other is a session read — and because a Prisma
+   * error object is not a thing to hand to a logger. Neither caller may treat
+   * this as fatal, and neither may treat it as nothing.
+   */
+  | {
+      readonly kind: 'failed'
+      readonly attempts: number
+      readonly message: string
+    }
+
+/**
+ * Clear `User.unclaimedSince`, and say plainly when that did not happen.
+ *
+ * ## The defect this replaces
+ *
+ * `authConfig.events.signIn` used to call {@link markMailboxProved} inside a
+ * `try`/`catch` that logged and dropped the error, and the comment above it
+ * argued the drop was safe because "neither write carries money, so losing one
+ * costs a stale column and not a cent". That reasoning is wrong about which
+ * column. `lastLoginAt` is bookkeeping and losing it costs a CRM sort order.
+ * `unclaimedSince` is a **capability boundary**: while it is stamped,
+ * `attachReferralClaim` will let an anonymous POST overwrite this household's
+ * `ClientProfile.claimedReferralCode`, and clearing it at the first sign-in is
+ * the entire reason a proved household is out of reach from the public form.
+ * A reviewer reproduced the degraded state directly — a live session, the stamp
+ * still set — and nothing anywhere reported it or fixed it. The old code's own
+ * next sentence admitted the window and then left it open until the household
+ * happened to sign in again, which for a magic-link household can be never.
+ *
+ * A silently swallowed failure of a security-relevant state transition is not
+ * acceptable, so this function exists to make that transition three things it
+ * was not: **retried**, **observable**, and **recoverable**.
+ *
+ *  - *Retried* — {@link MAILBOX_PROOF_ATTEMPTS}, which argues its own numbers.
+ *  - *Observable* — a `failed` arm that a caller cannot receive by accident.
+ *    It is a distinct variant of a discriminated union, so a caller that stops
+ *    handling it stops compiling. That is the part the previous design could
+ *    never have: a `catch` block is invisible to the type system, and the way
+ *    to notice one had been left empty was to read it.
+ *  - *Recoverable* — because `authConfig.callbacks.session` calls this too, on
+ *    every authenticated request, and it already reads the row that says
+ *    whether there is anything to do. A live session is itself proof that Auth.js
+ *    verified a magic link or completed an OAuth exchange for this address, so
+ *    "a session exists **and** the stamp is set" is not an ambiguous state that
+ *    needs interpreting — it is exactly the degraded state, and repairing it
+ *    there is not a new policy, it is the sign-in event's own policy applied at
+ *    the next opportunity.
+ *
+ * ## Why this is not simply "let the sign-in fail"
+ *
+ * Because the household would be shown "try again", which reads as a rejected
+ * sign-in, for a write that has nothing to do with whether they may come in.
+ * That was the right call in the old code and it stays the right call; what was
+ * wrong was everything after it. Refusing to fail the sign-in obliges the code
+ * to do something *else* about the failure, and previously it did nothing.
+ *
+ * ## Why this does not throw
+ *
+ * Both callers are non-transactional side paths that must complete regardless.
+ * Contrast {@link settleAcceptedClaim}, which deliberately does not swallow:
+ * there a household is waiting on an answer to something they just clicked, so
+ * the error belongs to the caller to report. Here nobody asked for this write —
+ * it is the platform's own bookkeeping about its own capability boundary — so
+ * the obligation is to report it to an operator, not to a household.
+ */
+export async function ensureMailboxProved(
+  userId: string
+): Promise<MailboxProofRepair> {
+  let lastMessage = 'unknown'
+
+  for (let attempt = 1; attempt <= MAILBOX_PROOF_ATTEMPTS; attempt += 1) {
+    try {
+      return await markMailboxProved(userId)
+    } catch (error) {
+      lastMessage = error instanceof Error ? error.message : 'unknown'
+    }
+  }
+
+  return {
+    kind: 'failed',
+    attempts: MAILBOX_PROOF_ATTEMPTS,
+    message: lastMessage,
+  }
 }
 
 // =============================================================================
