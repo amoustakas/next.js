@@ -535,7 +535,30 @@ export const authConfig = {
       }
 
       try {
-        await settleFirstAuthenticatedSession(userId)
+        const outcome = await settleFirstAuthenticatedSession(userId)
+
+        // Record what happened. The outcome union is the only account of a
+        // decision that moves money, and this event returns nothing to anybody,
+        // so leaving it unread would make a settlement — or a refusal a
+        // household will ask about — invisible outside the harness.
+        //
+        // `nothing-claimed` is skipped because it is the outcome of essentially
+        // every sign-in on the platform, and a line printed on all of them is
+        // one nobody reads. The code is included: it is an invitation the owner
+        // hands out, not a credential, and a refusal cannot be investigated
+        // without knowing which code was refused. No reward amount or invoice is
+        // logged — those live in the ledger.
+        if (outcome.kind !== 'nothing-claimed') {
+          console.info('[auth] referral claim settlement', {
+            userId,
+            outcome: outcome.kind,
+            ...('code' in outcome ? { code: outcome.code } : {}),
+            ...(outcome.kind === 'refused' ? { reason: outcome.reason } : {}),
+            ...(outcome.kind === 'settled'
+              ? { redemptionId: outcome.redemptionId }
+              : {}),
+          })
+        }
       } catch (error) {
         console.error('[auth] failed to settle a referral claim', {
           userId,
