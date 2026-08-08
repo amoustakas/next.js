@@ -135,7 +135,6 @@ import { useAction } from '@/lib/action-client'
 import { cn } from '@/lib/utils'
 import { zodResolver } from '@/lib/zod-resolver'
 import { redeemReferralCode } from '@/server/actions/referral'
-import type { ReferralRedemptionReceipt } from '@/server/actions/referral'
 import {
   acceptReferralClaim,
   declineReferralClaim,
@@ -145,7 +144,8 @@ import type {
   ReferralClaimAcceptanceView,
   ReferralClaimAttributionView,
   ReferralClaimDeclineView,
-} from '@/server/actions/referral-claim'
+  ReferralRedemptionReceipt,
+} from '@/components/portal/view-models'
 
 export interface ReferralClaimBannerProps {
   /**
@@ -339,7 +339,7 @@ function describeOutcome(outcome: Outcome): OutcomeDisplay {
     case 'declined':
       return {
         icon: Check,
-        iconClassName: 'text-sage',
+        iconClassName: 'text-sage-ink',
         title: 'Understood — thank you for telling us.',
         body: "We've cleared that invitation. It will not be offered to you again.",
         showRecheck: false,

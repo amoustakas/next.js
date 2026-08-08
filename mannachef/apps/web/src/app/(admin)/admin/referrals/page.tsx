@@ -588,7 +588,7 @@ function OwnerLookupSection({
             </Card>
           ) : (
             <div className="flex items-start gap-3 rounded-md border border-terracotta/50 bg-terracotta/12 px-3 py-3">
-              <AlertCircle aria-hidden="true" className="mt-0.5 size-4 shrink-0 text-terracotta" />
+              <AlertCircle aria-hidden="true" className="mt-0.5 size-4 shrink-0 text-terracotta-ink" />
               <p className="font-sans text-sm leading-relaxed text-parchment">
                 The balance and ledger for this account could not be loaded.
               </p>

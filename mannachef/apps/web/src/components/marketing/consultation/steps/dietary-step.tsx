@@ -107,7 +107,7 @@ export function DietaryStep({
             <div className="mb-4 flex items-start gap-3">
               <ShieldAlert
                 aria-hidden="true"
-                className="mt-0.5 size-5 shrink-0 text-claret"
+                className="mt-0.5 size-5 shrink-0 text-claret-ink"
               />
               <div className="flex flex-col gap-1">
                 <h3

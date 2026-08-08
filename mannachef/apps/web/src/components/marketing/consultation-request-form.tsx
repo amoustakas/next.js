@@ -220,7 +220,7 @@ export function ConsultationRequestForm(): React.JSX.Element {
         <CardContent className="flex flex-col gap-5 p-8 pt-8">
           <span
             aria-hidden="true"
-            className="flex size-11 items-center justify-center rounded-full border border-ash text-sage"
+            className="flex size-11 items-center justify-center rounded-full border border-ash text-sage-ink"
           >
             <Check className="size-5" />
           </span>

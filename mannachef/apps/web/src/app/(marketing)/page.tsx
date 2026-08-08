@@ -19,6 +19,7 @@ import { ReviewCard } from '@/components/marketing/review-card'
 import { CONSULTATION_CTA, SERVICE_AREA } from '@/components/marketing/site-config'
 import { listMenuItems } from '@/server/actions/menu'
 import { listPublishedReviews } from '@/server/actions/review'
+import { readAsGuest } from '@/server/guards'
 
 /**
  * The home page.
@@ -45,6 +46,14 @@ import { listPublishedReviews } from '@/server/actions/review'
  * `revalidatePath('/')` through `MENU_REVALIDATE_PATHS` and `REVIEW_PATHS` in
  * their action modules. The hour is therefore a backstop against a missed
  * invalidation rather than the primary freshness mechanism.
+ *
+ * That number was decorative until MCV-072. Both reads below go through
+ * `readAsGuest`, which is what actually keeps this page prerenderable: without
+ * it `withAction` resolves a session before every handler, `auth()` reads the
+ * session cookie, the cookie read is a dynamic API, and the route falls back to
+ * rendering on every request with `revalidate` quietly meaning nothing. This
+ * page displays nothing that varies by viewer — the header's sign-in state is a
+ * client island — so the guest view is the only view it ever wanted.
  */
 export const revalidate = 3600
 
@@ -239,9 +248,13 @@ function SignatureStrip(): React.JSX.Element {
  * already narrows to published dishes in published collections that are in
  * season this month — so nothing here has to filter for visibility, and nothing
  * here is permitted to widen it.
+ *
+ * `readAsGuest` pins it to exactly that floor. The home page shows the same
+ * three signature dishes to everyone, including the `ADMIN` who published them,
+ * so there is nothing for a session to change here and no reason to read one.
  */
 async function SignatureDishes(): Promise<React.JSX.Element> {
-  const result = await listMenuItems({
+  const result = await readAsGuest(listMenuItems, {
     signatureOnly: true,
     page: 1,
     pageSize: 3,
@@ -323,9 +336,13 @@ function ReviewStrip(): React.JSX.Element {
  * running order rather than showing whichever three are newest. The action
  * refuses to return anything outside `APPROVED | FEATURED` whatever it is
  * asked for, so there is no path from this component to an unmoderated review.
+ *
+ * The handler never reads `ctx.user` at all — it is pinned to the published
+ * statuses for every caller — so `readAsGuest` changes nothing about its answer
+ * and only stops the session lookup that was making this page dynamic.
  */
 async function FeaturedReviews(): Promise<React.JSX.Element> {
-  const result = await listPublishedReviews({
+  const result = await readAsGuest(listPublishedReviews, {
     featuredOnly: true,
     page: 1,
     pageSize: 3,

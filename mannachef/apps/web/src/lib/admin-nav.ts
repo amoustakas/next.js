@@ -24,19 +24,65 @@
  *
  * ## Why the minimum roles are what they are
  *
- * Each `minRole` below is the *floor of the actions the section calls*, read out
- * of `src/server/actions/**` rather than guessed:
+ * A `minRole` is the floor for *opening the screen*, so it is set by the
+ * cheapest read the page performs on arrival — not by the most privileged
+ * thing an operator could go on to do there. Every one below was read out of
+ * `ACTIONS-INDEX.md` and the page's own imports rather than guessed. The test
+ * that decides each line is: **what does this page put on screen before anyone
+ * clicks anything, and does a chef need it to cook?**
  *
- *  - `menu.*` and `media.*` **reads** are public or `CHEF_STAFF`; their writes
- *    are `ADMIN`. The kitchen reads the catalogue to cook from it, so both
- *    sections sit at `CHEF_STAFF` and the *write* affordances inside them are
- *    gated separately on `canCurate`.
- *  - Review moderation, billing, referrals, staff administration and settings
- *    are `ADMIN` throughout, so their sections are too.
- *  - Bookings, the calendar, intake and clients are `CHEF_STAFF`: a chef needs
- *    the allergies, the address and the sitting they are cooking. The row-level
- *    ownership rules inside those actions are what stop one chef reading
- *    another's engagement, and no navigation decision can or should do that.
+ *  - **Kitchen — `CHEF_STAFF`.** `menu.*` and `media.*` reads are public or
+ *    `CHEF_STAFF`; their writes are `ADMIN`. The kitchen reads the catalogue to
+ *    cook from it, so Menu and Media sit at `CHEF_STAFF` and the *write*
+ *    affordances inside them are gated separately on `canCurate`. Reviews is
+ *    `ADMIN`: `listModerationQueue` is `ADMIN`, and an unmoderated queue is
+ *    guest correspondence, not a service tool.
+ *
+ *  - **Service — `CHEF_STAFF`.** Calendar and Intake are the job: the sitting,
+ *    the allergies, the address, who is cooking when. `listAppointments` and
+ *    `availability.*` are `CHEF_STAFF` and the row-level ownership rules inside
+ *    those actions are what stop one chef reading another's engagement — no
+ *    navigation decision can or should do that. There was a third entry here,
+ *    Bookings, pointing at `/admin/bookings`; that route was never built and the
+ *    Calendar is the screen that answers it, so the entry was removed and its
+ *    search keywords folded into Calendar rather than left aimed at a 404.
+ *
+ *  - **Staff — `CHEF_STAFF`, deliberately.** `/admin/staff` branches on role
+ *    before it reads anything: `ADMIN` and above get `listStaffRoster` (`ADMIN`),
+ *    everybody else gets `readMyStaffProfile` (`CHEF_STAFF`), which is that
+ *    chef's own record and nobody else's. Declaring `ADMIN` here — as this file
+ *    once did — locked a chef out of their own rate, service area and public
+ *    listing, on a page built to serve exactly that.
+ *
+ *  - **Money and Relationships — `ADMIN`.** Subscriptions, Invoices and
+ *    Referrals put commercial aggregates on screen the instant they render, and
+ *    that is the whole reason the layout guard exists: a Server Action refusing
+ *    a *write* does nothing about a chef reading a revenue total. Clients is
+ *    `ADMIN` for the same reason and it is the correction that is easiest to get
+ *    wrong — `crm.pipeline.query` is only `CHEF_STAFF`, but the section is a
+ *    commercial funnel (lifetime value, churn cohorts, follow-up status) and
+ *    `/admin/clients/[id]` composes `listInvoices` and `listSubscriptions` into a
+ *    household's billing history. The service data a chef genuinely needs
+ *    reaches them through Bookings, Calendar and Intake, which stay open.
+ *
+ *  - **No Settings section.** There was one, at `/admin/settings`, and that
+ *    route was never built. Nothing in this application is a general settings
+ *    surface: the only configuration an admin can change is the referral
+ *    programme's terms, and that editor already lives under Referrals. The entry
+ *    was removed rather than retargeted, because a permanent rail item that
+ *    leads nowhere is worse than an absent one — it is on screen for every
+ *    admin on every page, and it teaches them the navigation lies.
+ *
+ *    The pattern it used to illustrate still holds for whatever replaces it: a
+ *    panel whose floor is higher than its section's (`SUPER_ADMIN` role
+ *    assignment, say) asserts that for itself with `requireAdminRole`; this file
+ *    sets the floor for a section, never a ceiling for what is inside it.
+ *
+ * Both directions of a wrong declaration cost something. Too high locks a chef
+ * out of work they are paid to do and teaches them the OS is broken; too low
+ * opens a screen the guard will then happily render. `minimumRoleForPathname`
+ * is consulted on every request by `@/server/admin-access`, and
+ * `scripts/verify-admin-route-guard.ts` pins every line of the table above.
  */
 
 import type { Route } from 'next'
@@ -51,7 +97,6 @@ import {
   MessageSquareQuote,
   Receipt,
   Repeat,
-  Settings,
   UsersRound,
   UtensilsCrossed,
 } from 'lucide-react'
@@ -132,7 +177,15 @@ export const ADMIN_NAV: readonly AdminNavGroup[] = [
         description: 'Dishes, collections, courses and the tag vocabulary.',
         icon: UtensilsCrossed,
         minRole: 'CHEF_STAFF',
-        keywords: ['dish', 'dishes', 'catalogue', 'catalog', 'seasonal', 'course', 'tag'],
+        keywords: [
+          'dish',
+          'dishes',
+          'catalogue',
+          'catalog',
+          'seasonal',
+          'course',
+          'tag',
+        ],
       },
       {
         href: '/admin/media',
@@ -140,7 +193,15 @@ export const ADMIN_NAV: readonly AdminNavGroup[] = [
         description: 'The photograph library behind every plate and page.',
         icon: Images,
         minRole: 'CHEF_STAFF',
-        keywords: ['photo', 'photograph', 'image', 'library', 'asset', 'upload', 'gallery'],
+        keywords: [
+          'photo',
+          'photograph',
+          'image',
+          'library',
+          'asset',
+          'upload',
+          'gallery',
+        ],
       },
       {
         href: '/admin/reviews',
@@ -156,21 +217,38 @@ export const ADMIN_NAV: readonly AdminNavGroup[] = [
     id: 'service',
     label: 'Service',
     items: [
-      {
-        href: '/admin/bookings',
-        label: 'Bookings',
-        description: 'Engagements from first enquiry through to the plate.',
-        icon: ClipboardList,
-        minRole: 'CHEF_STAFF',
-        keywords: ['appointment', 'engagement', 'sitting', 'service', 'event'],
-      },
+      /*
+       * There is no separate "Bookings" entry. There was one, pointing at
+       * `/admin/bookings`, which was never built — and the screen that would
+       * have answered it is this one: `/admin/calendar` renders the diary,
+       * the sittings and who is cooking when. Retargeting the entry would have
+       * left two sidebar rows leading to the same route, which reads as a bug
+       * to anybody using the sidebar to find out what the OS contains.
+       *
+       * So the row is gone and its search terms moved here instead. That
+       * matters because `keywords` is what the command bar matches on: a chef
+       * who opens it and types "booking" or "engagement" still lands on the
+       * calendar, which is where the engagements are.
+       */
       {
         href: '/admin/calendar',
         label: 'Calendar',
-        description: 'Availability, sittings and who is cooking when.',
+        description:
+          'Engagements and availability: sittings, slots, and who is cooking when.',
         icon: CalendarDays,
         minRole: 'CHEF_STAFF',
-        keywords: ['diary', 'schedule', 'availability', 'slot'],
+        keywords: [
+          'diary',
+          'schedule',
+          'availability',
+          'slot',
+          'booking',
+          'appointment',
+          'engagement',
+          'sitting',
+          'service',
+          'event',
+        ],
       },
       {
         href: '/admin/intake',
@@ -178,7 +256,14 @@ export const ADMIN_NAV: readonly AdminNavGroup[] = [
         description: 'Household questionnaires: allergies, dislikes, kitchens.',
         icon: ClipboardList,
         minRole: 'CHEF_STAFF',
-        keywords: ['questionnaire', 'form', 'allergy', 'allergen', 'dietary', 'consultation'],
+        keywords: [
+          'questionnaire',
+          'form',
+          'allergy',
+          'allergen',
+          'dietary',
+          'consultation',
+        ],
       },
     ],
   },
@@ -191,7 +276,10 @@ export const ADMIN_NAV: readonly AdminNavGroup[] = [
         label: 'Clients',
         description: 'Households, their history and the notes kept on them.',
         icon: UsersRound,
-        minRole: 'CHEF_STAFF',
+        // `ADMIN`, not `CHEF_STAFF`: the pipeline board and `/admin/clients/[id]`
+        // render lifetime value, churn and billing history. A chef gets the
+        // household detail they cook from via Bookings, Calendar and Intake.
+        minRole: 'ADMIN',
         keywords: ['household', 'crm', 'customer', 'guest', 'contact', 'note'],
       },
       {
@@ -200,7 +288,14 @@ export const ADMIN_NAV: readonly AdminNavGroup[] = [
         description: 'Invitation codes, rewards and who introduced whom.',
         icon: Gift,
         minRole: 'ADMIN',
-        keywords: ['invite', 'code', 'reward', 'introduction', 'programme', 'program'],
+        keywords: [
+          'invite',
+          'code',
+          'reward',
+          'introduction',
+          'programme',
+          'program',
+        ],
       },
     ],
   },
@@ -235,17 +330,27 @@ export const ADMIN_NAV: readonly AdminNavGroup[] = [
         label: 'Staff',
         description: 'Chefs, their profiles and what each of them may reach.',
         icon: CreditCard,
-        minRole: 'ADMIN',
+        // `CHEF_STAFF`: the page reads `readMyStaffProfile` for anyone below
+        // `ADMIN`, so this is a chef's own record. The roster itself stays
+        // `ADMIN` because `listStaffRoster` is `ADMIN`.
+        minRole: 'CHEF_STAFF',
         keywords: ['chef', 'team', 'role', 'permission', 'access', 'people'],
       },
-      {
-        href: '/admin/settings',
-        label: 'Settings',
-        description: 'How the platform behaves, and who may change it.',
-        icon: Settings,
-        minRole: 'ADMIN',
-        keywords: ['configuration', 'preferences', 'account', 'integration'],
-      },
+      /*
+       * There is no "Settings" entry, and deliberately so.
+       *
+       * One pointed at `/admin/settings`, which was never built. Nothing in
+       * this application is a general settings surface: the only configuration
+       * an admin can actually change is the referral programme's terms, and
+       * that editor already lives on `/admin/referrals` — which has its own row
+       * above, and already matches "programme" in its keywords. Pointing
+       * Settings there too would be a second name for one screen.
+       *
+       * A permanent sidebar row leading nowhere is worse than an absent one: it
+       * is on screen for every admin on every page, and it teaches them that
+       * the navigation lies. Restore this only alongside a screen that answers
+       * it.
+       */
     ],
   },
 ]

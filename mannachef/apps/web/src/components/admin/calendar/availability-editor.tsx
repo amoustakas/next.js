@@ -368,7 +368,7 @@ function RefusalNotice({
       role="alert"
       className="flex gap-3 rounded-md border border-claret/50 bg-claret/10 px-3 py-3"
     >
-      <Icon aria-hidden="true" className="mt-0.5 size-4 shrink-0 text-claret" />
+      <Icon aria-hidden="true" className="mt-0.5 size-4 shrink-0 text-claret-ink" />
       <div className="flex flex-col gap-1">
         <p className="font-sans text-sm leading-tight font-medium text-linen">
           {copy.title}

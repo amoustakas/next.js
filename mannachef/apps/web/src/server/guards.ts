@@ -20,6 +20,9 @@
  *     throws into a guest-safe `ActionResult`, and revalidates on success only.
  *  5. **{@link rateLimit}** — a token bucket for the three public-facing
  *     actions that a stranger can reach.
+ *  6. **{@link readAsGuest}** — the opt-in that lets a `'PUBLIC'` action run
+ *     without resolving a session, so a page built entirely from public reads
+ *     can actually be prerendered instead of only claiming to be.
  *
  * ## Failure vocabulary
  *
@@ -39,6 +42,8 @@
  * Role checks are the exception — `requireRole` returns `FORBIDDEN`, because a
  * role failure reveals nothing about any particular row.
  */
+
+import { AsyncLocalStorage } from 'node:async_hooks'
 
 import { headers } from 'next/headers'
 import { revalidatePath, revalidateTag, updateTag } from 'next/cache'
@@ -1061,6 +1066,102 @@ export type ActionHandler<TParsed, TAuth extends ActionAuth, TData> = (
 /** The function `withAction` returns — this is what a component imports. */
 export type Action<TRaw, TData> = (raw: TRaw) => Promise<ActionResult<TData>>
 
+// -----------------------------------------------------------------------------
+// 5a. The guest-viewer scope (MCV-072)
+// -----------------------------------------------------------------------------
+
+/**
+ * Set for the duration of a {@link readAsGuest} call.
+ *
+ * `AsyncLocalStorage` propagates through `await`, so the flag covers the whole
+ * of the wrapped action — including everything the handler awaits — and covers
+ * *only* that. Two concurrent renders, or a `Promise.all` where one branch is a
+ * guest read and another is a privileged one, do not see each other's store.
+ */
+const guestViewerScope = new AsyncLocalStorage<true>()
+
+/**
+ * Run a `'PUBLIC'` action with **no viewer**, without reading cookies.
+ *
+ * ## The problem this solves
+ *
+ * `withAction` resolves the session before it does anything else, and
+ * `getSessionUser()` calls Auth.js `auth()`, which reads the session cookie.
+ * Reading a cookie is a dynamic API: it opts the surrounding render out of
+ * static generation for good. So *any* page that called *any* action — even a
+ * `'PUBLIC'` one that only ever wanted the published menu — was silently forced
+ * to render per-request, and its `export const revalidate` was inert. The whole
+ * marketing site was dynamic for the sake of a session none of it displayed.
+ *
+ * Inside this scope, a `'PUBLIC'` action skips session resolution entirely and
+ * its handler sees `ctx.user === null` — the same context a genuinely
+ * signed-out visitor produces. No cookie is read, so the render stays
+ * static/ISR-eligible and `revalidate` means something again.
+ *
+ * ## Why per call site rather than per action
+ *
+ * The obvious alternative is a flag on `ActionConfig` — mark an action
+ * "anonymous" once, at its definition. That is the wrong granularity here, and
+ * `listMenuItems` is the proof: the public menu page needs the guest view of it
+ * (published, in-season, no cost prices) so the page can be prerendered, while
+ * `/admin/menu` needs the *viewer-aware* view of the very same action, because
+ * an `ADMIN` passing `includeInactive` is exactly how the kitchen sees its
+ * drafts. Viewer-sensitivity is therefore a property of the **call**, not of
+ * the action, and a per-action flag could only serve one of those two callers.
+ *
+ * The trade-off that buys: the decision is not made once, it is made at every
+ * call site, and a call site that forgets simply gets today's behaviour — a
+ * session read and a dynamic page. That is the right default. The failure mode
+ * of forgetting is a slow page; the failure mode of the opposite default
+ * (anonymous unless told otherwise) would be an admin screen quietly losing the
+ * rows it is meant to show, which is worse and much harder to notice.
+ *
+ * ## Why this is safe
+ *
+ * The scope can only ever *narrow* what an action returns. `ctx.user === null`
+ * is the least privileged context that exists, and every `'PUBLIC'` handler
+ * already treats it as the visibility floor — `const role = ctx.user?.role ??
+ * null` is the first line of all five menu reads. Wrapping the wrong call
+ * cannot widen access; at worst it hides a row from someone entitled to see it.
+ *
+ * Two deliberate non-effects:
+ *
+ *  - **Non-`'PUBLIC'` actions are unaffected.** A `'SESSION'` or `Role` action
+ *    called inside the scope still resolves its session and still enforces its
+ *    check, because skipping it would turn an authorization requirement into a
+ *    caller-supplied option. Such a call keeps the page dynamic, correctly:
+ *    its answer really does depend on who is asking.
+ *  - **Rate limiting is unaffected.** A `'PUBLIC'` action carrying a
+ *    `rateLimit` still falls back to the IP bucket, and `callerIpAddress()`
+ *    reads `headers()` — also a dynamic API. No read on the public site is
+ *    rate limited (see the note on {@link rateLimit}: the three that are are
+ *    all submissions), so this does not cost the marketing pages anything; it
+ *    does mean `readAsGuest` around a rate-limited action would not make it
+ *    prerenderable.
+ *
+ * ## Use
+ *
+ * ```ts
+ * const result = await readAsGuest(listMenuItems, {
+ *   signatureOnly: true,
+ *   page: 1,
+ *   pageSize: 3,
+ *   sortBy: 'CURATED',
+ *   sortDirection: 'asc',
+ * })
+ * ```
+ *
+ * One call, one action, one explicit decision — including inside
+ * `generateStaticParams`, where there is no request scope at all and this is
+ * the difference between enumerating the menu and giving up on it.
+ */
+export async function readAsGuest<TRaw, TData>(
+  action: Action<TRaw, TData>,
+  raw: TRaw
+): Promise<ActionResult<TData>> {
+  return guestViewerScope.run(true, () => action(raw))
+}
+
 /**
  * Revalidate, ignoring failures.
  *
@@ -1104,8 +1205,12 @@ function applyRevalidation<TParsed, TRaw, TAuth extends ActionAuth>(
  *
  * Exactly the sequence `CONTRACT.md` §5 prescribes:
  *
- *  1. **Resolve the session.** Always — even a `'PUBLIC'` action wants to know
- *     who is asking, so a signed-in guest's review is attributed.
+ *  1. **Resolve the session.** For every requirement except one: a `'PUBLIC'`
+ *     action running inside {@link readAsGuest} skips it and gets
+ *     `ctx.user === null`, so a page that only wants the published menu never
+ *     touches a cookie and stays prerenderable. Everywhere else the session is
+ *     resolved unconditionally — even for `'PUBLIC'`, because a signed-in
+ *     guest's review should be attributed to them.
  *  2. **Enforce the minimum role.** `'SESSION'` requires only a live session;
  *     a `Role` is compared with `hasRoleAtLeast`.
  *  3. **Rate limit**, when configured. Placed after the identity is known so
@@ -1173,7 +1278,17 @@ export function withAction<TParsed, TRaw, TAuth extends ActionAuth, TData>(
     const requirement: ActionAuth = config.auth
 
     // --- 1. Session --------------------------------------------------------
-    const sessionUser = await getSessionUser()
+    // The one path that does not resolve a session. `auth()` reads the session
+    // cookie, and a cookie read is a dynamic API — so resolving here is what
+    // made every page that called any action render per-request. A `'PUBLIC'`
+    // action inside a `readAsGuest` scope is asking for the signed-out view by
+    // name, and the signed-out view needs no cookie to compute. See
+    // {@link readAsGuest} for why the opt-in is per call site and why it can
+    // only narrow.
+    const asGuest =
+      requirement === 'PUBLIC' && guestViewerScope.getStore() === true
+
+    const sessionUser = asGuest ? null : await getSessionUser()
 
     // --- 2. Role -----------------------------------------------------------
     if (requirement !== 'PUBLIC') {

@@ -40,18 +40,34 @@ export const metadata: Metadata = {
 }
 
 /**
- * The screens each tile explains itself with. None of these routes exist yet
- * — this is the first admin screen built — but the destinations are named so
- * the moment `/admin/billing`, `/admin/crm`, `/admin/reviews`, and
- * `/admin/appointments` land, every tile below is already pointing at the
- * right place.
+ * Where each tile's call to action goes.
+ *
+ * Every entry is a route that exists. Three of them used to name screens that
+ * were never built (`/admin/billing`, `/admin/crm`, `/admin/appointments`),
+ * which made the dashboard's primary drill-downs dead ends; they now point at
+ * the screens that actually hold the figures:
+ *
+ *  - `billing` → the Billing OS, which is what `/admin/subscriptions` renders:
+ *    MRR, the subscriber base by status, and money collected against owed.
+ *  - `churn` → the client pipeline. The tile states a *rate*; the pipeline is
+ *    where the households behind it stand, in a `CHURNED` column. The old
+ *    `?tab=churn` is dropped rather than carried, because `/admin/clients`
+ *    reads no `tab` key and a query the destination ignores is a promise the
+ *    interface does not keep.
+ *  - `appointments` → the calendar, which is the diary this tile counts from.
+ *
+ * `pipeline` keeps its query: `?followUpDue=true` is read by
+ * `/admin/clients` through `clientPipelineFilterSchema`, whose `followUpDue`
+ * is a `queryFlag` — so the link lands on the filtered board, not the whole of
+ * it. That is the one query string here that the destination honours, and the
+ * reason it survives while `?tab=churn` did not.
  */
 const ROUTES = {
-  billing: '/admin/billing',
-  churn: '/admin/crm?tab=churn',
-  appointments: '/admin/appointments',
+  billing: '/admin/subscriptions',
+  churn: '/admin/clients',
+  appointments: '/admin/calendar',
   moderation: '/admin/reviews?awaitingModeration=true',
-  pipeline: '/admin/crm?followUpDue=true',
+  pipeline: '/admin/clients?followUpDue=true',
 } as const
 
 const CHURN_WINDOW_MONTHS = 3
@@ -216,7 +232,15 @@ function TileErrorState({
           description="Your session ended before this could load."
           action={
             <Button asChild size="sm" variant="outline">
-              <Link href="/sign-in">Sign in</Link>
+              {/*
+                Auth.js v5 mounts its own sign-in page under the handler's base
+                path, and `auth.ts` sets no `pages.signIn` override — so this is
+                the real door, not `/sign-in`, which was never built. The portal
+                layout's `SIGN_IN_PATH` is the same string for the same reason.
+                `callbackUrl` returns the admin here rather than to the site root
+                once the session is renewed.
+              */}
+              <Link href="/api/auth/signin?callbackUrl=%2Fadmin">Sign in</Link>
             </Button>
           }
         />
@@ -415,7 +439,7 @@ async function ChurnTile() {
         icon={TrendingDown}
         label="Churn"
         href={ROUTES.churn}
-        cta="Open CRM analytics"
+        cta="Open the client pipeline"
       >
         <EmptyState
           tone="empty"
@@ -433,7 +457,7 @@ async function ChurnTile() {
       icon={TrendingDown}
       label="Churn"
       href={ROUTES.churn}
-      cta="Open CRM analytics"
+      cta="Open the client pipeline"
     >
       <span className="text-3xl font-semibold text-champagne tabular-nums">
         {report.overallChurnRate.toFixed(1)}%
@@ -470,7 +494,7 @@ async function UpcomingAppointmentsTile() {
         icon={CalendarClock}
         label="Upcoming appointments"
         href={ROUTES.appointments}
-        cta="Open dispatch board"
+        cta="Open the calendar"
       >
         <EmptyState
           tone="empty"
@@ -490,7 +514,7 @@ async function UpcomingAppointmentsTile() {
       icon={CalendarClock}
       label="Upcoming appointments"
       href={ROUTES.appointments}
-      cta="Open dispatch board"
+      cta="Open the calendar"
     >
       <span className="text-3xl font-semibold text-champagne tabular-nums">
         {board.counts.upcoming}

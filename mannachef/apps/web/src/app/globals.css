@@ -22,6 +22,51 @@
   --color-sage: #6e7f63;
   --color-claret: #7c2f35;
 
+  /* ---- Semantic TEXT ramp (MCV-061) -----------------------------------
+   * `terracotta`, `sage` and `claret` above are surface-weight colours. They
+   * are correct for a 1px border, a 12–15% wash, or an icon fill sitting on a
+   * label that carries its own contrast — and they are NOT legible as small
+   * text on any surface in this palette:
+   *
+   *     claret     #7c2f35   1.95:1 on slate-warm   (2.08 charcoal, 2.18 obsidian)
+   *     terracotta #9c5b3c   3.35:1 on slate-warm   (2.96 on ash)
+   *     sage       #6e7f63   4.11:1 on slate-warm   (3.63 on ash)
+   *
+   * WCAG 2.x SC 1.4.3 wants 4.5:1 for text under 24px (19px bold). All three
+   * miss it, so every one of them gets a lifted `-ink` sibling below. The lift
+   * holds the token's HSL hue and saturation exactly and raises only lightness,
+   * so `text-claret-ink` is the same wine that `border-claret` is — the ramp
+   * is one colour at two weights, not two colours.
+   *
+   * USE `-ink` FOR TEXT AND ICONS. Use the base token for borders and fills.
+   * `scripts/verify-contrast.ts` fails the build if that rule is broken, and
+   * the BUDGET block below it records every pair this product actually renders.
+   *
+   * Each ratio below is against the worst (lightest) surface the token lands
+   * on; the full per-surface table is in the BUDGET block after this @theme.
+   */
+
+  /* sage #6e7f63 hsl(96 12% 44%) → hsl(96 12% 55%).
+   * 5.19:1 on ash · 5.87:1 on slate-warm · 6.26:1 on charcoal · 6.56:1 on
+   * obsidian. Worst case is the `success` badge's own wash, sage/12 on ash
+   * (#2f2e27): 4.52:1. */
+  --color-sage-ink: #889a7d;
+
+  /* terracotta #9c5b3c hsl(19 44% 42%) → hsl(19 44% 58%).
+   * 5.05:1 on ash · 5.71:1 on slate-warm · 6.09:1 on charcoal · 6.39:1 on
+   * obsidian. Worst case is the `warning` badge's own wash, terracotta/12 on
+   * ash (#342a22): 4.52:1. */
+  --color-terracotta-ink: #c48365;
+
+  /* claret #7c2f35 hsl(355 45% 34%) → hsl(355 45% 62%).
+   * 4.55:1 on ash · 5.15:1 on slate-warm · 5.49:1 on charcoal · 5.76:1 on
+   * obsidian. It never sits on a claret wash: `bg-claret/15` always pairs with
+   * `text-linen` (badge `destructive`, dropdown `destructive` highlighted),
+   * which is 14.58:1 on slate-warm. The lift is the largest of the three
+   * because the starting point was the worst — 1.95:1 is under half of what a
+   * validation error, the one string a form exists to make readable, needs. */
+  --color-claret-ink: #c97177;
+
   /* ---- Semantic aliases (shadcn/ui primitives read these) ------------- */
   --color-background: var(--color-obsidian);
   --color-foreground: var(--color-linen);
@@ -74,6 +119,119 @@
   --duration-base: 200ms;
   --duration-slow: 250ms;
 }
+
+/*
+ * ============================================================================
+ * CONTRAST BUDGET (MCV-061) — the whole ledger, so nobody has to rediscover it
+ * ============================================================================
+ *
+ * Every text/surface pair this product actually renders, with its WCAG 2.x
+ * relative-luminance ratio against the REAL COMPOSITED background. Read this
+ * before you reach for a colour; do not re-derive it, and do not trust a
+ * token's nominal figure once alpha is involved.
+ *
+ * How to read a row:
+ *
+ *     BUDGET | <text token> | <surface expression> | <composited> | <ratio>
+ *
+ * A surface expression is either a bare token (`ash`) or a wash
+ * (`sage/12 on ash` = --color-sage at 12% alpha composited over --color-ash).
+ * The <composited> column is the sRGB the eye actually receives, which is what
+ * the ratio is computed from.
+ *
+ * THRESHOLDS
+ *   text (< 24px, or < 19px bold) ....... 4.5:1   SC 1.4.3
+ *   large text (>= 24px / 19px bold) .... 3:1     SC 1.4.3
+ *   focus rings, state borders, icons ... 3:1     SC 1.4.11
+ *
+ * This table is not decorative. `scripts/verify-contrast.ts` parses the token
+ * values out of this file, recomputes every row below, and fails the build if
+ * any computed ratio disagrees with the number written here or falls under its
+ * threshold. Editing a hex above without regenerating this block is a hard
+ * error, not a stale comment. Regenerate with:
+ *
+ *     pnpm --filter @mannachef/web verify:contrast
+ *
+ * ---- Text, threshold 4.5:1 ------------------------------------------------
+ *
+ * BUDGET | linen          | obsidian                   | #0b0a09 | 17.41:1 | PASS
+ * BUDGET | linen          | charcoal                   | #121110 | 16.60:1 | PASS
+ * BUDGET | linen          | slate-warm                 | #1a1817 | 15.58:1 | PASS
+ * BUDGET | linen          | ash                        | #26231f | 13.77:1 | PASS
+ * BUDGET | linen          | claret/15 on obsidian      | #1c1010 | 16.35:1 | PASS
+ * BUDGET | linen          | claret/15 on charcoal      | #221616 | 15.48:1 | PASS
+ * BUDGET | linen          | claret/15 on slate-warm    | #291b1c | 14.58:1 | PASS
+ * BUDGET | linen          | claret/15 on ash           | #332522 | 12.94:1 | PASS
+ * BUDGET | parchment      | obsidian                   | #0b0a09 | 11.79:1 | PASS
+ * BUDGET | parchment      | charcoal                   | #121110 | 11.24:1 | PASS
+ * BUDGET | parchment      | slate-warm                 | #1a1817 | 10.54:1 | PASS
+ * BUDGET | parchment      | ash                        | #26231f |  9.32:1 | PASS
+ * BUDGET | stone          | obsidian                   | #0b0a09 |  5.29:1 | PASS
+ * BUDGET | stone          | charcoal                   | #121110 |  5.04:1 | PASS
+ * BUDGET | stone          | slate-warm                 | #1a1817 |  4.73:1 | PASS
+ * BUDGET | stone          | ash/40 on slate-warm       | #1f1c1a |  4.53:1 | PASS
+ * BUDGET | champagne      | obsidian                   | #0b0a09 | 11.49:1 | PASS
+ * BUDGET | champagne      | charcoal                   | #121110 | 10.95:1 | PASS
+ * BUDGET | champagne      | slate-warm                 | #1a1817 | 10.27:1 | PASS
+ * BUDGET | champagne      | ash                        | #26231f |  9.08:1 | PASS
+ * BUDGET | champagne      | champagne/10 on obsidian   | #201d18 |  9.75:1 | PASS
+ * BUDGET | champagne      | champagne/10 on charcoal   | #26231e |  9.09:1 | PASS
+ * BUDGET | champagne      | champagne/10 on slate-warm | #2d2924 |  8.38:1 | PASS
+ * BUDGET | champagne      | champagne/10 on ash        | #38332b |  7.27:1 | PASS
+ * BUDGET | gold           | obsidian                   | #0b0a09 |  6.38:1 | PASS
+ * BUDGET | gold           | charcoal                   | #121110 |  6.08:1 | PASS
+ * BUDGET | gold           | slate-warm                 | #1a1817 |  5.70:1 | PASS
+ * BUDGET | gold           | ash                        | #26231f |  5.04:1 | PASS
+ * BUDGET | sage-ink       | obsidian                   | #0b0a09 |  6.56:1 | PASS
+ * BUDGET | sage-ink       | charcoal                   | #121110 |  6.26:1 | PASS
+ * BUDGET | sage-ink       | slate-warm                 | #1a1817 |  5.87:1 | PASS
+ * BUDGET | sage-ink       | ash                        | #26231f |  5.19:1 | PASS
+ * BUDGET | sage-ink       | sage/12 on obsidian        | #171814 |  5.92:1 | PASS
+ * BUDGET | sage-ink       | sage/12 on charcoal        | #1d1e1a |  5.56:1 | PASS
+ * BUDGET | sage-ink       | sage/12 on slate-warm      | #242420 |  5.17:1 | PASS
+ * BUDGET | sage-ink       | sage/12 on ash             | #2f2e27 |  4.52:1 | PASS
+ * BUDGET | terracotta-ink | obsidian                   | #0b0a09 |  6.39:1 | PASS
+ * BUDGET | terracotta-ink | charcoal                   | #121110 |  6.09:1 | PASS
+ * BUDGET | terracotta-ink | slate-warm                 | #1a1817 |  5.71:1 | PASS
+ * BUDGET | terracotta-ink | ash                        | #26231f |  5.05:1 | PASS
+ * BUDGET | terracotta-ink | terracotta/12 on obsidian  | #1c140f |  5.86:1 | PASS
+ * BUDGET | terracotta-ink | terracotta/12 on charcoal  | #231a15 |  5.51:1 | PASS
+ * BUDGET | terracotta-ink | terracotta/12 on slate-warm | #2a201b |  5.13:1 | PASS
+ * BUDGET | terracotta-ink | terracotta/12 on ash       | #342a22 |  4.52:1 | PASS
+ * BUDGET | claret-ink     | obsidian                   | #0b0a09 |  5.76:1 | PASS
+ * BUDGET | claret-ink     | charcoal                   | #121110 |  5.49:1 | PASS
+ * BUDGET | claret-ink     | slate-warm                 | #1a1817 |  5.15:1 | PASS
+ * BUDGET | claret-ink     | ash                        | #26231f |  4.55:1 | PASS
+ * BUDGET | obsidian       | champagne                  | #d8c39a | 11.49:1 | PASS
+ *
+ * ---- Focus / state rings, threshold 3:1 (SC 1.4.11) -----------------------
+ *
+ * RING   | champagne      | obsidian                   | #0b0a09 | 11.49:1 | PASS
+ * RING   | champagne      | charcoal                   | #121110 | 10.95:1 | PASS
+ * RING   | champagne      | slate-warm                 | #1a1817 | 10.27:1 | PASS
+ * RING   | champagne      | ash                        | #26231f |  9.08:1 | PASS
+ * RING   | claret-ink     | obsidian                   | #0b0a09 |  5.76:1 | PASS
+ * RING   | claret-ink     | charcoal                   | #121110 |  5.49:1 | PASS
+ * RING   | claret-ink     | slate-warm                 | #1a1817 |  5.15:1 | PASS
+ * RING   | claret-ink     | ash                        | #26231f |  4.55:1 | PASS
+ *
+ * ---- What is deliberately NOT in this table -------------------------------
+ *
+ * `stone` (#8b8377) has no row against bare `ash`: it is 4.18:1 there and
+ * would fail. That is allowed only because `bg-ash` never carries stone text —
+ * audited, every `bg-ash` surface in src/ pairs with `text-linen` (13.77:1) or
+ * `text-parchment` (9.32:1), and the one place stone meets an ash-ish ground is
+ * the card hover `bg-ash/40` over slate-warm, which is the 4.53:1 row above.
+ * verify-contrast.ts enforces that exclusion as an invariant rather than
+ * leaving it as a promise in a comment: it fails if any single class list in
+ * src/ contains both `bg-ash` and `text-stone`. If you ever need stone on a
+ * full-strength ash panel, lift stone the way sage/terracotta/claret were
+ * lifted — do not delete the check.
+ *
+ * The base `sage`, `terracotta` and `claret` tokens have no text rows at all,
+ * because they are no longer legal as text. Their `-ink` siblings are.
+ * ============================================================================
+ */
 
 /*
  * Motion primitives (MCV-060).
@@ -274,10 +432,18 @@
     font-variant-numeric: tabular-nums;
   }
 
-  /* Visible focus ring in champagne at 40% opacity, per contract §3. */
+  /* Visible focus ring in SOLID champagne, per contract §3.
+   *
+   * This was `color-mix(… var(--color-champagne) 40%, transparent)`. Alpha does
+   * not preserve a token's nominal contrast: champagne is 9.08–11.49:1 as a
+   * solid, but at 40% it composites to #5d5443–#6d6350 and lands at 2.64–2.69:1
+   * against the very surface it is drawn on — under the 3:1 that WCAG SC 1.4.11
+   * requires of a focus indicator, on every surface in the palette. Solid
+   * champagne is 9.08:1 at its worst (on ash). Do not reintroduce the alpha;
+   * `scripts/verify-contrast.ts` fails on it. */
   :focus-visible {
     outline: none;
-    box-shadow: 0 0 0 2px color-mix(in oklab, var(--color-champagne) 40%, transparent);
+    box-shadow: 0 0 0 2px var(--color-champagne);
     border-radius: var(--radius-sm);
   }
 

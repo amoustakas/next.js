@@ -2,16 +2,13 @@
 import type { Metadata } from 'next'
 import type * as React from 'react'
 import Link from 'next/link'
-import { redirect } from 'next/navigation'
 import { ChevronRight, LogOut, Menu, Search } from 'lucide-react'
 
-import { hasRoleAtLeast, type Role } from '@mannachef/validators'
+import type { Role } from '@mannachef/validators'
 
-import { getSessionUser, signOut } from '@/server/auth'
-import { currentAdminPathname } from '@/server/admin-access'
+import { signOut } from '@/server/auth'
+import { currentAdminPathname, requireAdminViewer } from '@/server/admin-access'
 import {
-  ADMIN_FALLBACK_PATH,
-  ADMIN_MINIMUM_ROLE,
   ADMIN_ROOT_PATH,
   breadcrumbsForPathname,
   visibleNavGroups,
@@ -49,9 +46,6 @@ import {
   CommandList,
 } from '@/components/ui/command'
 
-/** Auth.js v5's default credential-less sign-in route (no custom page is configured). */
-const SIGN_IN_PATH = '/api/auth/signin'
-
 const ROLE_LABEL: Record<Role, string> = {
   SUPER_ADMIN: 'Super Admin',
   ADMIN: 'Admin',
@@ -73,36 +67,63 @@ interface AdminLayoutProps {
 /**
  * The business OS shell.
  *
- * Every route under `/admin` renders inside this layout, so this is the one
- * place the role floor is enforced — `visibleNavGroups` inside
- * `<AdminSidebar>` only ever *reflects* the outcome decided here, it never
- * decides on its own. An unauthenticated visitor is sent to sign in; a
- * signed-in visitor below `CHEF_STAFF` is shown a real "you don't have
- * access" screen rather than being bounced to `/portal` — a bounce back and
- * forth between two role-gated shells is how a redirect loop gets written by
- * accident.
+ * Every route under `/admin` renders inside this layout, which makes it the one
+ * place a *navigation* decision can be taken for the whole tree — and the one
+ * place a wrong decision is invisible, because a layout that forgets to guard
+ * still renders perfectly.
+ *
+ * ## Which layer is authoritative for what
+ *
+ * Three layers look like they are doing the same job. They are not, and mixing
+ * them up is what left this route tree open:
+ *
+ *  1. **`requireAdminViewer()` — authoritative for *reaching a page*.** Called
+ *     below, on the Node runtime, before a single child renders. It resolves the
+ *     session, applies the `CHEF_STAFF` floor for the whole tree, and then
+ *     applies `minimumRoleForPathname()` for the specific section being asked
+ *     for. This is the layer that stops a chef *loading* `/admin/invoices` and
+ *     reading aggregate revenue off a page that renders before any mutation is
+ *     ever attempted. Nothing else in the request can do that job: a Server
+ *     Action refusing a write does not un-render a table of numbers.
+ *
+ *  2. **The Server Actions — authoritative for *data and writes*.** Every action
+ *     re-resolves the session and re-checks the role inside `withAction`, and
+ *     re-reads every id that arrives from a browser. That is what holds when
+ *     this layout is wrong, when middleware did not run, and when a request
+ *     arrives from something that is not this UI at all. `CONTRACT.md` §5 is
+ *     unambiguous that this layer, not the shell, is the security boundary.
+ *
+ *  3. **`visibleNavGroups()` in the rail and the command bar — authoritative for
+ *     nothing.** It renders the same `minRole` declarations layer 1 enforces, so
+ *     an operator is not shown doors that will not open. A link it forgot to
+ *     hide must still not open, which is only true while layer 1 is actually
+ *     called.
+ *
+ * The guard used to be re-implemented inline here: `getSessionUser()` plus a
+ * `hasRoleAtLeast(user.role, ADMIN_MINIMUM_ROLE)` floor, with
+ * `minimumRoleForPathname()` never consulted at request time. The two copies
+ * drifted — the per-section half of the check simply never ran, so every
+ * `minRole: 'ADMIN'` in `@/lib/admin-nav` hid a link without gating its route
+ * and a `CHEF_STAFF` reached every ADMIN-only screen by typing the URL. There is
+ * now exactly one implementation, in `@/server/admin-access`, and
+ * `scripts/verify-admin-route-guard.ts` fails if this file stops calling it.
+ *
+ * `requireAdminViewer()` never returns for a caller who may not be here — it
+ * redirects, which throws — so `viewer` below needs no null check and no role
+ * check. A signed-out visitor goes to sign-in carrying a `callbackUrl`; a
+ * `CLIENT` goes to `/portal`, which admits any signed-in account and therefore
+ * cannot bounce them back; a staff member below a section's own floor goes to
+ * the OS root, which they can always reach.
  */
 export default async function AdminLayout({
   children,
 }: AdminLayoutProps): Promise<React.JSX.Element> {
-  const [user, pathname] = await Promise.all([
-    getSessionUser(),
-    currentAdminPathname(),
-  ])
+  const viewer = await requireAdminViewer()
+  const pathname = (await currentAdminPathname()) ?? ADMIN_ROOT_PATH
 
-  const resolvedPathname = pathname ?? ADMIN_ROOT_PATH
-
-  if (user === null) {
-    redirect(`${SIGN_IN_PATH}?callbackUrl=${encodeURIComponent(resolvedPathname)}`)
-  }
-
-  if (!hasRoleAtLeast(user.role, ADMIN_MINIMUM_ROLE)) {
-    return <ForbiddenScreen role={user.role} />
-  }
-
-  const breadcrumbs = breadcrumbsForPathname(resolvedPathname)
-  const navGroups = visibleNavGroups(user.role)
-  const displayName = user.name ?? user.email ?? 'Operator'
+  const breadcrumbs = breadcrumbsForPathname(pathname)
+  const navGroups = visibleNavGroups(viewer.role)
+  const displayName = viewer.name ?? viewer.email ?? 'Operator'
 
   return (
     <div className="flex min-h-screen bg-obsidian">
@@ -121,7 +142,7 @@ export default async function AdminLayout({
         aria-label="Primary"
         className="hidden w-64 shrink-0 border-r border-ash lg:flex lg:flex-col"
       >
-        <AdminSidebar role={user.role} collapsed={false} />
+        <AdminSidebar role={viewer.role} collapsed={false} />
       </aside>
 
       <div className="flex min-w-0 flex-1 flex-col">
@@ -143,7 +164,7 @@ export default async function AdminLayout({
               <SheetDescription className="sr-only">
                 Browse the sections of the business OS.
               </SheetDescription>
-              <AdminSidebar role={user.role} collapsed={false} />
+              <AdminSidebar role={viewer.role} collapsed={false} />
             </SheetContent>
           </Sheet>
 
@@ -164,7 +185,7 @@ export default async function AdminLayout({
                   )}
                 >
                   <Avatar size="sm">
-                    <AvatarFallback>{initialsFrom(user.name)}</AvatarFallback>
+                    <AvatarFallback>{initialsFrom(viewer.name)}</AvatarFallback>
                   </Avatar>
                 </button>
               </DropdownMenuTrigger>
@@ -173,13 +194,13 @@ export default async function AdminLayout({
                   <span className="truncate font-sans text-sm font-medium text-linen">
                     {displayName}
                   </span>
-                  {user.email === null ? null : (
+                  {viewer.email === null ? null : (
                     <span className="truncate font-sans text-xs text-stone">
-                      {user.email}
+                      {viewer.email}
                     </span>
                   )}
                   <Badge variant="outline" className="w-fit">
-                    {ROLE_LABEL[user.role]}
+                    {ROLE_LABEL[viewer.role]}
                   </Badge>
                 </DropdownMenuLabel>
                 <DropdownMenuSeparator />
@@ -329,30 +350,5 @@ function CommandBarMount({
         </Command>
       </DialogContent>
     </Dialog>
-  )
-}
-
-function ForbiddenScreen({ role }: { readonly role: Role }): React.JSX.Element {
-  return (
-    <main className="flex min-h-screen items-center justify-center bg-obsidian px-6 py-16">
-      <div className="w-full max-w-md rounded-lg border border-ash bg-slate-warm p-8 text-center shadow-[inset_0_1px_0_rgba(244,240,233,0.04)]">
-        <p className="font-sans text-xs tracking-[0.24em] text-terracotta uppercase">
-          Access restricted · 403
-        </p>
-        <h1 className="mt-3 font-display text-2xl font-light text-linen">
-          This part of the Business OS isn&rsquo;t open to your account
-        </h1>
-        <p className="mt-3 font-sans text-sm leading-relaxed text-parchment">
-          You&rsquo;re signed in as{' '}
-          <span className="font-medium text-linen">{ROLE_LABEL[role]}</span>. Reaching this
-          area needs Chef Staff access or higher — ask an admin to raise your access level if
-          you believe this is wrong.
-        </p>
-        <div className="hairline mt-6" aria-hidden="true" />
-        <Button asChild variant="champagne" className="mt-6">
-          <Link href={ADMIN_FALLBACK_PATH}>Return to your portal</Link>
-        </Button>
-      </div>
-    </main>
   )
 }

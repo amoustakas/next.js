@@ -168,10 +168,18 @@ export default function RootLayout({
 
           It targets `#main-content`, which every route group's layout must put
           on its `<main>` element.
+
+          The ring carries a `ring-offset-obsidian` gap (MCV-061). This chip is
+          the one focusable element in the product whose own background is the
+          ring colour, so a champagne ring drawn flush against a champagne pill
+          is a 1:1 edge — a wider pill, not an indicator. The obsidian offset
+          puts the page ground between the two, which reads as 11.49:1 on both
+          sides and satisfies SC 1.4.11 the way the flush ring never did (at the
+          40% alpha this used to carry it was 2.65:1 against the page as well).
         */}
         <a
           href="#main-content"
-          className="sr-only rounded-md border border-gold/70 bg-champagne px-4 py-2 font-sans text-sm font-semibold text-obsidian focus-visible:not-sr-only focus-visible:absolute focus-visible:top-4 focus-visible:left-4 focus-visible:z-100 focus-visible:ring-2 focus-visible:ring-champagne/40"
+          className="sr-only rounded-md border border-gold/70 bg-champagne px-4 py-2 font-sans text-sm font-semibold text-obsidian focus-visible:not-sr-only focus-visible:absolute focus-visible:top-4 focus-visible:left-4 focus-visible:z-100 focus-visible:ring-2 focus-visible:ring-champagne focus-visible:ring-offset-2 focus-visible:ring-offset-obsidian"
         >
           Skip to content
         </a>

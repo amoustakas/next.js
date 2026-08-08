@@ -1,6 +1,21 @@
 // mannachef/apps/web/src/components/admin/admin-nav.ts
 
 /**
+ * @deprecated **Dead module — nothing imports this.** Delete it.
+ *
+ * The navigation model the sidebar and command bar actually consume is
+ * `@/lib/admin-nav`. This file is an earlier, diverged draft of it: 183 lines
+ * against 466, the same four export names, and a different field name for the
+ * same concept (`minimumRole` here, `minRole` there). `admin-sidebar.tsx`,
+ * `command-bar.tsx`, `admin/layout.tsx` and `server/admin-access.ts` all import
+ * the `@/lib` one; no file in `src/` or `scripts/` imports this one.
+ *
+ * It is kept compiling rather than deleted only because removing a file was not
+ * this change's to make. It is a live trap while it exists: it declares the same
+ * symbols as the real module, so an editor's auto-import can pull the wrong one
+ * in, and a future nav change made here would silently do nothing. Whoever
+ * touches admin navigation next should delete this file.
+ *
  * The navigation model the admin sidebar and the command bar both consume.
  *
  * One declaration of every business-OS destination and the minimum role that
@@ -24,7 +39,6 @@ import {
   MessageSquareQuote,
   Receipt,
   Repeat,
-  Settings,
   UsersRound,
   UtensilsCrossed,
 } from 'lucide-react'
@@ -89,12 +103,9 @@ export const ADMIN_NAV_GROUPS: readonly AdminNavGroup[] = [
     id: 'service',
     label: 'Service',
     items: [
-      {
-        label: 'Bookings',
-        href: '/admin/bookings',
-        icon: ClipboardList,
-        minimumRole: 'CHEF_STAFF',
-      },
+      // "Bookings" (`/admin/bookings`) removed: the route was never built, and
+      // the calendar below is the screen that answers it. Mirrors the same
+      // removal in `@/lib/admin-nav`, which is the module actually in use.
       {
         label: 'Calendar',
         href: '/admin/calendar',
@@ -149,12 +160,10 @@ export const ADMIN_NAV_GROUPS: readonly AdminNavGroup[] = [
         icon: CreditCard,
         minimumRole: 'ADMIN',
       },
-      {
-        label: 'Settings',
-        href: '/admin/settings',
-        icon: Settings,
-        minimumRole: 'ADMIN',
-      },
+      // "Settings" (`/admin/settings`) removed: there is no settings surface in
+      // this application. The only editable configuration is the referral
+      // programme's terms, which live on `/admin/referrals`. Mirrors the same
+      // removal in `@/lib/admin-nav`.
     ],
   },
 ]

@@ -1850,7 +1850,7 @@ function TimeGrid({
               </time>
             </p>
             {data.column.hasOffsetShift ? (
-              <p className="mt-0.5 text-[0.625rem] text-terracotta">
+              <p className="mt-0.5 text-[0.625rem] text-terracotta-ink">
                 clock change
               </p>
             ) : null}
@@ -2110,7 +2110,7 @@ function DayColumnBody({
             className={cn(
               'absolute inset-x-0 block w-full cursor-pointer border-0 bg-transparent p-0',
               'hover:bg-champagne/5',
-              'focus-visible:z-30 focus-visible:ring-2 focus-visible:ring-champagne/40',
+              'focus-visible:z-30 focus-visible:ring-2 focus-visible:ring-champagne',
               'focus-visible:outline-none',
               isFocused && focusVisible && 'z-30'
             )}
@@ -2536,7 +2536,7 @@ function MonthGrid({
                   {formatters.dayNumber.format(column.start)}
                 </time>
                 {column.hasOffsetShift ? (
-                  <span className="text-[0.625rem] text-terracotta">DST</span>
+                  <span className="text-[0.625rem] text-terracotta-ink">DST</span>
                 ) : null}
               </button>
 

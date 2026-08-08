@@ -739,7 +739,7 @@ function CreateInvoiceForm({
                                 onClick={() => removeLine(index)}
                                 disabled={fields.length <= 1 || coreAction.isPending}
                                 className={cn(
-                                  'rounded-sm p-1 text-stone transition-colors duration-150 ease-luxe hover:text-claret',
+                                  'rounded-sm p-1 text-stone transition-colors duration-150 ease-luxe hover:text-claret-ink',
                                   'disabled:pointer-events-none disabled:opacity-40',
                                   FOCUS_RING
                                 )}

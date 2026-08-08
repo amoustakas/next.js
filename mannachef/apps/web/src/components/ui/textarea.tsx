@@ -16,7 +16,7 @@ const textareaVariants = cva(
   {
     variants: {
       invalid: {
-        true: 'border-claret/80 focus-visible:ring-claret/40',
+        true: 'border-claret/80 focus-visible:ring-claret-ink',
         false: 'border-ash hover:border-stone/60 focus-visible:border-champagne/60',
       },
       resize: {

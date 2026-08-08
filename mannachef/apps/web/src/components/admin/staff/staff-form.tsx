@@ -44,10 +44,8 @@ import {
   type StaffProfileUpdateInput,
 } from '@mannachef/validators'
 
-import {
-  updateStaffProfile,
-  type StaffRosterView,
-} from '@/server/actions/staff'
+import { updateStaffProfile } from '@/server/actions/staff'
+import type { AdminStaffRosterView as StaffRosterView } from '@/components/admin/view-models'
 import { useAction } from '@/lib/action-client'
 import { zodResolver } from '@/lib/zod-resolver'
 

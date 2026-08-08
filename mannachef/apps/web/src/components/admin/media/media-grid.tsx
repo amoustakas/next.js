@@ -39,7 +39,6 @@ import {
   type TagMatchMode,
 } from '@mannachef/validators'
 
-import type { MediaAssetListView, MediaAssetView } from '@/server/actions/media'
 import {
   bulkTagMediaAssets,
   completeMediaUpload,
@@ -47,9 +46,13 @@ import {
   listMediaAssets,
   updateMediaAsset,
 } from '@/server/actions/media'
-import type { TagView } from '@/server/actions/menu'
 
 import { describeActionError, useAction } from '@/lib/action-client'
+import type {
+  AdminMediaAssetListView as MediaAssetListView,
+  AdminMediaAssetView as MediaAssetView,
+  AdminTagView as TagView,
+} from '@/components/admin/view-models'
 import { zodResolver } from '@/lib/zod-resolver'
 import { cn, FOCUS_RING } from '@/lib/utils'
 
@@ -693,7 +696,7 @@ function UploadAssetDialog({
                 </p>
               )}
               {fileError === null ? null : (
-                <p role="alert" className="font-sans text-xs text-claret">
+                <p role="alert" className="font-sans text-xs text-claret-ink">
                   {fileError}
                 </p>
               )}
@@ -786,7 +789,7 @@ function UploadAssetDialog({
                 disabled={busy}
               />
               {tagIds.length > MAX_BULK_MEDIA_TAGS ? (
-                <p role="alert" className="font-sans text-xs text-claret">
+                <p role="alert" className="font-sans text-xs text-claret-ink">
                   Please apply {MAX_BULK_MEDIA_TAGS} tags or fewer.
                 </p>
               ) : null}

@@ -96,7 +96,13 @@ const QUICK_ACTIONS: readonly QuickAction[] = [
     id: 'new-appointment',
     label: 'New appointment',
     description: 'Schedule an engagement for a client.',
-    href: '/admin/bookings?new=appointment',
+    // `/admin/bookings` was never built; the calendar is where a sitting is
+    // scheduled. `?new=appointment` is kept for the same reason the sibling
+    // actions above and below keep `?new=item` and `?new=invoice`: none of the
+    // three destinations reads a `new` key yet, and this is the agreed shape
+    // for when they do. The route is now real even though the query is still
+    // inert.
+    href: '/admin/calendar?new=appointment',
     icon: CalendarPlus,
     minRole: 'CHEF_STAFF',
     keywords: ['booking', 'engagement', 'schedule', 'sitting', 'create'],

@@ -23,7 +23,9 @@
     "verify:billing": "pnpm run verify:proration && pnpm run verify:redemption",
     "verify:mcv043": "node --experimental-strip-types --disable-warning=ExperimentalWarning --import ./scripts/billing-register.mjs ./scripts/verify-mcv043.ts",
     "verify:mcv051": "node --experimental-strip-types --disable-warning=ExperimentalWarning --import ./scripts/billing-register.mjs ./scripts/verify-mcv051.ts",
-    "verify": "pnpm run test && pnpm run verify:referral && pnpm run verify:intake && pnpm run verify:preemption && pnpm run verify:media && pnpm run verify:billing && pnpm run verify:mcv043 && pnpm run verify:mcv051",
+    "verify:admin-guard": "node --experimental-strip-types --disable-warning=ExperimentalWarning ./scripts/verify-admin-route-guard.ts",
+    "verify:contrast": "node --experimental-strip-types --disable-warning=ExperimentalWarning ./scripts/verify-contrast.ts",
+    "verify": "pnpm run test && pnpm run verify:contrast && pnpm run verify:admin-guard && pnpm run verify:referral && pnpm run verify:intake && pnpm run verify:preemption && pnpm run verify:media && pnpm run verify:billing && pnpm run verify:mcv043 && pnpm run verify:mcv051",
     "db:generate": "turbo run db:generate --filter=@mannachef/db",
     "gen:action-index": "node scripts/gen-action-index.mjs"
   },

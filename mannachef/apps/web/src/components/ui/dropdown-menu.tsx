@@ -120,7 +120,7 @@ export const DropdownMenuItem = React.forwardRef<
         menuItemBase,
         inset === true && 'pl-8',
         variant === 'destructive' &&
-          'text-claret data-[highlighted]:bg-claret/15 data-[highlighted]:text-linen [&_svg]:text-claret',
+          'text-claret-ink data-[highlighted]:bg-claret/15 data-[highlighted]:text-linen [&_svg]:text-claret-ink',
         className
       )}
       {...props}

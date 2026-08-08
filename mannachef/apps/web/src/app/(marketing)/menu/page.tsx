@@ -36,6 +36,7 @@ import {
   listMenuSubcategories,
   listTags,
 } from '@/server/actions/menu'
+import { readAsGuest } from '@/server/guards'
 
 /**
  * The menu.
@@ -65,7 +66,7 @@ import {
  * Neither boundary blocks the other, so a slow tag query cannot delay the
  * dishes.
  *
- * ## Revalidation
+ * ## Revalidation — and why this route is still dynamic
  *
  * Fifteen minutes. The menu is the most volatile public page — a dish is
  * published, a price moves, a season closes — and every one of those mutations
@@ -74,6 +75,36 @@ import {
  * *missed* invalidation can leave it, chosen short because a guest reading a
  * price we no longer charge is a conversation we would rather not have, and
  * chosen no shorter because seasonality turns over monthly, not by the minute.
+ *
+ * **That constant does not currently take effect, and the build output says so
+ * — `/menu` prints as `ƒ` with no revalidate column.** This is the one page in
+ * the marketing group where that is honest rather than a defect, and it is
+ * worth being precise about why, because it used to be a defect for a
+ * different reason.
+ *
+ * There were two independent causes. The first was `withAction` resolving a
+ * session — and therefore reading a cookie — before every handler, including
+ * the four `'PUBLIC'` reads below. That one was illegitimate: this page shows
+ * every visitor the same menu, so the session it read could not change a single
+ * row. It is fixed; all four reads now go through `readAsGuest` (MCV-072), and
+ * removing it is what turned `/` and `/menu/[slug]` static.
+ *
+ * The second cause is `searchParams`, and it is legitimate. The filter is in
+ * the URL by design — see the opening paragraph — and a page whose content is a
+ * function of the query string is genuinely a different document per request.
+ * Without Partial Prerendering, Next.js decides static-versus-dynamic once per
+ * *route*, not per request, so one `searchParams` read anywhere in the tree
+ * makes the whole route dynamic; it makes no difference whether it is awaited
+ * here or inside a `<Suspense>` boundary, which was measured rather than
+ * assumed. Stubbing `searchParams` out and rebuilding turns this route into
+ * `○ /menu 15m 1y` immediately, which is how both causes were told apart.
+ *
+ * The constant stays because the remedy is a configuration change and not a
+ * change to this file: enabling PPR (`cacheComponents` in Next 16) prerenders
+ * the shell, the header and the filter rail, and leaves only the dish grid to
+ * fill per request — at which point `revalidate` starts governing the
+ * prerendered part with nothing here to edit. Deleting the constant now would
+ * mean re-deriving fifteen minutes later from an argument nobody wrote down.
  */
 export const revalidate = 900
 
@@ -149,6 +180,10 @@ export default async function MenuPage({
  * than a page without a menu: the dishes are the point, and the filters are a
  * convenience. That is the one place on this page where a silent partial result
  * is the right answer.
+ *
+ * All three go through `readAsGuest`, which states that intent instead of
+ * merely relying on it: the rail a stranger sees is the rail everyone sees, so
+ * there is no session worth resolving and no cookie worth reading to build it.
  */
 async function FilterPanel({
   filters,
@@ -156,19 +191,19 @@ async function FilterPanel({
   readonly filters: MenuFilterState
 }): Promise<React.JSX.Element> {
   const [categoriesResult, subcategoriesResult, tagsResult] = await Promise.all([
-    listMenuCategories({
+    readAsGuest(listMenuCategories, {
       page: 1,
       pageSize: 100,
       sortBy: 'CURATED',
       sortDirection: 'asc',
     }),
-    listMenuSubcategories({
+    readAsGuest(listMenuSubcategories, {
       page: 1,
       pageSize: 100,
       sortBy: 'CURATED',
       sortDirection: 'asc',
     }),
-    listTags({
+    readAsGuest(listTags, {
       page: 1,
       pageSize: 100,
       kinds: [...FILTERABLE_TAG_KINDS],
@@ -219,6 +254,13 @@ async function FilterPanel({
  * `undefined`: `exactOptionalPropertyTypes` is on, and `{ categorySlug:
  * undefined }` is not the same type as `{}` — nor the same value, since
  * `menuItemFilterSchema` is `.strict()` about the keys it accepts.
+ *
+ * `readAsGuest` pins the read to the signed-out view. `listMenuItems` is the
+ * one action on this page that genuinely varies by viewer — an `ADMIN` passing
+ * `includeInactive` is how `/admin/menu` shows the kitchen its drafts — which is
+ * exactly why the guest view is asked for here by name rather than declared once
+ * on the action itself. The public menu must never widen to a draft because the
+ * person reading it happens to be signed in as staff on the same browser.
  */
 async function MenuResults({
   filters,
@@ -242,7 +284,7 @@ async function MenuResults({
     ...(filters.search === null ? {} : { search: filters.search }),
   }
 
-  const result = await listMenuItems(raw)
+  const result = await readAsGuest(listMenuItems, raw)
 
   if (!result.ok) {
     return (

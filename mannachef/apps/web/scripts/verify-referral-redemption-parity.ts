@@ -61,16 +61,45 @@
  * alias is put to all three entry points, and the three verdicts have to match.
  * Before the fix they did not — the portal refused, Checkout accepted, and the
  * webhook wrote a `QUALIFIED` row.
+ *
+ * ## Scenarios 6 and 7 (MCV-057)
+ *
+ * A mutation audit found that most of `resolveRedemptionEligibility` was
+ * unreached: delete `NO_ACCOUNT`, `UNKNOWN_CODE`, `EXPIRED`, `OWN_CODE`,
+ * `ALREADY_USED` or `ALREADY_REFERRED` from the predicate and every harness in
+ * this repository still printed a pass. Three of the nine refusals were covered
+ * — `SAME_HOUSEHOLD` by scenario 1 above, `FULLY_REDEEMED` by
+ * `verify-intake-referral-cap.ts`, `ALREADY_A_CUSTOMER` by `verify-mcv051.ts` —
+ * and the other six were prose. The caller check on `redeemReferralCode` itself,
+ * the one that stops a `CLIENT` naming somebody else's `referredUserId`, was in
+ * the same state.
+ *
+ * They are covered here rather than in a harness of their own because this file
+ * is already the one that says what a valid redemption *is*, and because the
+ * shape each of them needs is the shape scenario 1 established: drive the
+ * shipped door, then read the rows.
+ *
+ * Every probe in scenario 6 is a **pair**, and the two halves of a pair differ
+ * by exactly one property of the server's own state — never by the payload,
+ * never by which literal was typed. The concierge closes an account in both
+ * halves and the halves differ in *whose*; the owner withdraws a code in both
+ * halves and the halves differ in *which*; the abuse review revokes a redemption
+ * in both halves and the halves differ in *whose*. The refusing half therefore
+ * always performs at least as many steps as the accepting one, which is the
+ * property that stops a refusal being manufactured by omission.
  */
 
 import assert from 'node:assert/strict'
 
 import {
   createReferralCode,
+  deactivateReferralCode,
   redeemReferralCode,
   settleReferralRedemptions,
+  updateReferralRedemption,
 } from '@/server/actions/referral'
 import { createCheckoutSession } from '@/server/actions/billing'
+import { setUserActive } from '@/server/actions/user'
 import { prisma } from '@/server/db'
 import { POST as stripeWebhook } from '@/app/api/webhooks/stripe/route'
 
@@ -79,9 +108,10 @@ import {
   legacyRecordReferralRedemption,
 } from './fixtures/billing-legacy'
 import { installStripeRecorder } from './fixtures/stripe-recorder'
-import { signInAs } from './fixtures/harness-state'
+import { signInAs, type HarnessUser } from './fixtures/harness-state'
 import {
   ALIAS,
+  CHEF,
   CONCIERGE,
   NEIGHBOUR,
   SUBSCRIBER,
@@ -109,6 +139,20 @@ import {
 // =============================================================================
 
 const CODE = 'MALLORY8'
+
+/**
+ * A second invitation, identical to {@link CODE} in every column that is not
+ * its identity: same owner, same terms, same mint path, minted a millisecond
+ * later through the same action.
+ *
+ * It exists so that scenario 6 can vary a *server-side property* rather than a
+ * payload. "The owner withdrew a code" is performed in both halves of the
+ * `UNKNOWN_CODE` pair; what differs is which of two interchangeable codes was
+ * withdrawn. A pair whose accepting half simply skipped the withdrawal would be
+ * a pair separated by an omission, and an omission is not a property.
+ */
+const SPARE_CODE = 'MALLORY9'
+
 const REWARD_CENTS = 5_000
 
 /** MCV-030's floor. A one-dollar invoice must not earn a full reward. */
@@ -606,7 +650,593 @@ async function scenarioFive(
 }
 
 // =============================================================================
-// 5. Entry point
+// 5. Scenario 6 — the six refusals nothing in this suite had reached
+// =============================================================================
+
+/**
+ * The world every probe in scenario 6 starts from.
+ *
+ * Two interchangeable codes owned by `SUBSCRIBER`, and four accounts: the
+ * inviter, the alias, an unrelated household (`NEIGHBOUR` — the one who
+ * redeems), a second unrelated household (`CHEF`), and the concierge who runs
+ * the admin doors.
+ *
+ * Nobody here has ever paid us anything, deliberately: `ALREADY_A_CUSTOMER` is
+ * `verify-mcv051.ts`'s claim, and an invoice in this world would let a probe
+ * pass for the wrong reason.
+ */
+async function stageRefusals(mintCodeFor: HarnessUser): Promise<{
+  readonly codeId: string
+  readonly spareId: string
+}> {
+  await resetDatabase()
+
+  await seedProgram({
+    rewardValueCents: REWARD_CENTS,
+    minimumQualifyingInvoiceCents: FLOOR_CENTS,
+  })
+
+  for (const person of [SUBSCRIBER, ALIAS, NEIGHBOUR, CHEF, CONCIERGE]) {
+    await seedUser(person)
+  }
+
+  const codeId = await mintOneCode(mintCodeFor, CODE)
+  const spareId = await mintOneCode(mintCodeFor, SPARE_CODE)
+
+  signInAs(null)
+  clearRateLimits()
+
+  return { codeId, spareId }
+}
+
+/** Mint one code as `owner`, through the audited door, and return its row id. */
+async function mintOneCode(owner: HarnessUser, code: string): Promise<string> {
+  signInAs(owner)
+  clearRateLimits()
+
+  const minted = await createReferralCode({
+    rewardType: 'FIXED_CREDIT',
+    rewardValueCents: REWARD_CENTS,
+    ownerId: owner.id,
+    code,
+    isActive: true,
+  })
+
+  signInAs(null)
+
+  assert.equal(
+    minted.ok,
+    true,
+    `${owner.name ?? 'a member'} could not mint ${code}: ${minted.ok ? '' : minted.error}`
+  )
+
+  const row = await prisma.referralCode.findUniqueOrThrow({
+    where: { code },
+    select: { id: true },
+  })
+
+  return row.id
+}
+
+/**
+ * What one attempt at the portal door did, to the answer **and** to the rows.
+ *
+ * The counts are deltas rather than totals, because two of the probes below
+ * have a redemption on file before the call under test and the claim being made
+ * is always the same one: a refusal writes nothing and moves nothing, and its
+ * contrast writes exactly one row and moves the counter exactly once.
+ */
+interface RedeemObservation {
+  readonly verdict: Verdict
+  readonly failureCode: string
+  readonly message: string
+  /** Rows naming the household the invitation was accepted *for*. */
+  readonly rowsAdded: number
+  /** `ReferralCode.redemptionCount` on the code that was named. */
+  readonly counterMoved: number
+  /** Rows naming the *caller*, when that is somebody else. Always nought. */
+  readonly rowsAddedForCaller: number
+}
+
+const ACCEPTED_AND_WRITTEN = { rowsAdded: 1, counterMoved: 1 } as const
+const REFUSED_AND_INERT = { rowsAdded: 0, counterMoved: 0 } as const
+
+async function redemptionCountFor(userId: string): Promise<number> {
+  return prisma.referralRedemption.count({ where: { referredUserId: userId } })
+}
+
+/**
+ * Drive `redeemReferralCode` once, reading the rows either side of it.
+ *
+ * `referredUserId` is passed only when the caller is acting for somebody else,
+ * because `exactOptionalPropertyTypes` distinguishes an absent key from an
+ * explicit `undefined` — and the absent key is what a household's own portal
+ * form posts.
+ */
+async function observeRedeem(options: {
+  readonly caller: HarnessUser
+  readonly code: string
+  readonly codeId: string
+  readonly onBehalfOf?: HarnessUser | undefined
+}): Promise<RedeemObservation> {
+  const subject = options.onBehalfOf ?? options.caller
+
+  const rowsBefore = await redemptionCountFor(subject.id)
+  const callerRowsBefore = await redemptionCountFor(options.caller.id)
+  const counterBefore = await redemptionCountOf(options.codeId)
+
+  signInAs(options.caller)
+  clearRateLimits()
+
+  const result = await redeemReferralCode(
+    options.onBehalfOf === undefined
+      ? { code: options.code }
+      : { code: options.code, referredUserId: options.onBehalfOf.id }
+  )
+
+  signInAs(null)
+
+  const rowsAfter = await redemptionCountFor(subject.id)
+  const callerRowsAfter = await redemptionCountFor(options.caller.id)
+  const counterAfter = await redemptionCountOf(options.codeId)
+
+  return {
+    verdict: result.ok ? 'accepted' : 'refused',
+    failureCode: result.ok ? '' : result.code,
+    message: result.ok ? '' : result.error,
+    rowsAdded: rowsAfter - rowsBefore,
+    counterMoved: counterAfter - counterBefore,
+    rowsAddedForCaller: callerRowsAfter - callerRowsBefore,
+  }
+}
+
+/** Close or reopen an account through the real `ADMIN` door. */
+async function setAccountActive(
+  subject: HarnessUser,
+  isActive: boolean
+): Promise<void> {
+  signInAs(CONCIERGE)
+  clearRateLimits()
+
+  const changed = await setUserActive({
+    userId: subject.id,
+    isActive,
+    reason: 'Closed for the duration of an abuse review.',
+  })
+
+  signInAs(null)
+
+  assert.equal(
+    changed.ok,
+    true,
+    `the concierge could not close ${subject.name ?? 'the account'}: ${changed.ok ? '' : changed.error}`
+  )
+}
+
+/** Withdraw one code through its owner's real door. */
+async function withdrawCode(owner: HarnessUser, codeId: string): Promise<void> {
+  signInAs(owner)
+  clearRateLimits()
+
+  const withdrawn = await deactivateReferralCode({ referralCodeId: codeId })
+
+  signInAs(null)
+
+  assert.equal(
+    withdrawn.ok,
+    true,
+    `the owner could not withdraw the code: ${withdrawn.ok ? '' : withdrawn.error}`
+  )
+}
+
+/**
+ * Move a code's expiry into the past.
+ *
+ * Written with the raw client, for the reason `backdateReferralClaim` in
+ * `fixtures/intake-harness.ts` gives about a claim's age: the *data* is moved
+ * rather than the clock, and the shipped comparison
+ * (`expiresAt.getTime() <= Date.now()`) is left to decide on its own. The
+ * amend door cannot do this — `referralCodeUpdateSchema` refuses an expiry that
+ * is not ahead of now, which is a boundary rule of its own and not the one
+ * under test here.
+ */
+async function expireCode(codeId: string, expiresAt: Date): Promise<void> {
+  await prisma.referralCode.update({
+    where: { id: codeId },
+    data: { expiresAt },
+    select: { id: true },
+  })
+}
+
+/** Take one redemption back, through the real `ADMIN` door. */
+async function revokeRedemption(redemptionId: string): Promise<void> {
+  signInAs(CONCIERGE)
+  clearRateLimits()
+
+  const revoked = await updateReferralRedemption({
+    action: 'REVOKE',
+    redemptionId,
+    revokedReason: 'Withdrawn by the abuse review.',
+    reverseLedgerEntry: false,
+  })
+
+  signInAs(null)
+
+  assert.equal(
+    revoked.ok,
+    true,
+    `the concierge could not revoke the redemption: ${revoked.ok ? '' : revoked.error}`
+  )
+}
+
+/** The id of the row joining one household to one code. */
+async function redemptionIdFor(
+  userId: string,
+  referralCodeId: string
+): Promise<string> {
+  const row = await prisma.referralRedemption.findFirstOrThrow({
+    where: { referredUserId: userId, referralCodeId },
+    select: { id: true },
+  })
+
+  return row.id
+}
+
+const HOUR_MS = 60 * 60 * 1_000
+
+/**
+ * `NO_ACCOUNT` — the concierge closes an account, and the question is whose.
+ *
+ * `redeemReferralCode` is `auth: 'SESSION'`, and the session was minted before
+ * the closure: `withAction` reads `getSessionUser()` and never re-reads the row.
+ * That is not a contrivance, it is the ordinary shape of a closure — a session
+ * cookie outlives the decision to close the account it names — and it is
+ * precisely why the predicate re-reads `User.isActive` inside the transaction
+ * that writes rather than trusting what the wrapper handed it.
+ */
+async function probeNoAccount(closed: HarnessUser): Promise<RedeemObservation> {
+  const staged = await stageRefusals(SUBSCRIBER)
+
+  await setAccountActive(closed, false)
+
+  return observeRedeem({
+    caller: NEIGHBOUR,
+    code: CODE,
+    codeId: staged.codeId,
+  })
+}
+
+/** `UNKNOWN_CODE` — the owner withdraws a code, and the question is which. */
+async function probeUnknownCode(
+  withdrawn: 'named' | 'spare'
+): Promise<RedeemObservation> {
+  const staged = await stageRefusals(SUBSCRIBER)
+
+  await withdrawCode(
+    SUBSCRIBER,
+    withdrawn === 'named' ? staged.codeId : staged.spareId
+  )
+
+  return observeRedeem({
+    caller: NEIGHBOUR,
+    code: CODE,
+    codeId: staged.codeId,
+  })
+}
+
+/** `EXPIRED` — an expiry falls behind, and the question is whose. */
+async function probeExpired(
+  expired: 'named' | 'spare'
+): Promise<RedeemObservation> {
+  const staged = await stageRefusals(SUBSCRIBER)
+
+  await expireCode(
+    expired === 'named' ? staged.codeId : staged.spareId,
+    new Date(Date.now() - HOUR_MS)
+  )
+
+  return observeRedeem({
+    caller: NEIGHBOUR,
+    code: CODE,
+    codeId: staged.codeId,
+  })
+}
+
+/**
+ * `OWN_CODE` — both halves mint two codes through the same action; the question
+ * is whose name is on them.
+ *
+ * The caller, the payload and the number of steps are identical. What moves is
+ * `ReferralCode.ownerId`, which is the only column the guard reads.
+ */
+async function probeOwnCode(owner: HarnessUser): Promise<RedeemObservation> {
+  const staged = await stageRefusals(owner)
+
+  return observeRedeem({
+    caller: NEIGHBOUR,
+    code: CODE,
+    codeId: staged.codeId,
+  })
+}
+
+/**
+ * `ALREADY_REFERRED` — the abuse review takes one redemption back, and the
+ * question is whose.
+ *
+ * Both halves: `NEIGHBOUR` accepts `CODE`, `CHEF` accepts `CODE`, the concierge
+ * revokes one of the two, and `NEIGHBOUR` then accepts `SPARE_CODE`. `REVOKED`
+ * is deliberately absent from `LIVE_REDEMPTION_STATUSES` — a redemption taken
+ * back after an abuse review has released the household — so revoking
+ * `NEIGHBOUR`'s frees the slot and revoking `CHEF`'s does not.
+ */
+async function probeAlreadyReferred(
+  released: HarnessUser
+): Promise<RedeemObservation> {
+  const staged = await stageRefusals(SUBSCRIBER)
+
+  await acceptFirstInvitation(staged.codeId)
+  await revokeRedemption(await redemptionIdFor(released.id, staged.codeId))
+
+  return observeRedeem({
+    caller: NEIGHBOUR,
+    code: SPARE_CODE,
+    codeId: staged.spareId,
+  })
+}
+
+/**
+ * `ALREADY_USED` — the identical sequence, and the question is which code the
+ * released household names next.
+ *
+ * `NEIGHBOUR`'s own redemption is revoked in both halves, so the
+ * one-live-redemption rule has nothing to say in either. The only thing left
+ * standing between the household and a second acceptance is whether a
+ * `ReferralRedemption` already joins them to the code they named — which is what
+ * `ALREADY_USED` is, and why it is checked on the pair rather than on the
+ * status.
+ */
+async function probeAlreadyUsed(
+  named: 'same' | 'other'
+): Promise<RedeemObservation> {
+  const staged = await stageRefusals(SUBSCRIBER)
+
+  await acceptFirstInvitation(staged.codeId)
+  await revokeRedemption(await redemptionIdFor(NEIGHBOUR.id, staged.codeId))
+
+  return observeRedeem({
+    caller: NEIGHBOUR,
+    code: named === 'same' ? CODE : SPARE_CODE,
+    codeId: named === 'same' ? staged.codeId : staged.spareId,
+  })
+}
+
+/** Two unrelated households accept `CODE`, through the shipped portal door. */
+async function acceptFirstInvitation(codeId: string): Promise<void> {
+  for (const household of [NEIGHBOUR, CHEF]) {
+    const accepted = await observeRedeem({
+      caller: household,
+      code: CODE,
+      codeId,
+    })
+
+    assert.equal(
+      accepted.verdict,
+      'accepted',
+      `${household.name ?? 'a household'} should have been able to accept ${CODE}: ${accepted.message}`
+    )
+  }
+}
+
+/** One line of the scenario 6 table. */
+interface RefusalPair {
+  readonly reason: string
+  readonly property: string
+  readonly refused: RedeemObservation
+  readonly accepted: RedeemObservation
+  readonly expectedCode: 'VALIDATION' | 'NOT_FOUND'
+  readonly expectedMessage: RegExp
+}
+
+async function scenarioSix(): Promise<readonly RefusalPair[]> {
+  section('6. the six refusals, each against its own contrast')
+
+  const pairs: readonly RefusalPair[] = [
+    {
+      reason: 'NO_ACCOUNT',
+      property: 'which account the concierge closed',
+      refused: await probeNoAccount(NEIGHBOUR),
+      accepted: await probeNoAccount(ALIAS),
+      expectedCode: 'NOT_FOUND',
+      expectedMessage: /could not find that account/,
+    },
+    {
+      reason: 'UNKNOWN_CODE',
+      property: 'which code the owner withdrew',
+      refused: await probeUnknownCode('named'),
+      accepted: await probeUnknownCode('spare'),
+      expectedCode: 'VALIDATION',
+      expectedMessage: /not one we recognise/,
+    },
+    {
+      reason: 'EXPIRED',
+      property: 'which code’s expiry fell behind',
+      refused: await probeExpired('named'),
+      accepted: await probeExpired('spare'),
+      expectedCode: 'VALIDATION',
+      expectedMessage: /has expired/,
+    },
+    {
+      reason: 'OWN_CODE',
+      property: 'whose name is on the code',
+      refused: await probeOwnCode(NEIGHBOUR),
+      accepted: await probeOwnCode(SUBSCRIBER),
+      expectedCode: 'VALIDATION',
+      expectedMessage: /cannot be redeemed by its own owner/,
+    },
+    {
+      reason: 'ALREADY_REFERRED',
+      property: 'whose redemption the abuse review took back',
+      refused: await probeAlreadyReferred(CHEF),
+      accepted: await probeAlreadyReferred(NEIGHBOUR),
+      expectedCode: 'VALIDATION',
+      expectedMessage: /already been accepted on this account/,
+    },
+    {
+      reason: 'ALREADY_USED',
+      property: 'which code the released household named next',
+      refused: await probeAlreadyUsed('same'),
+      accepted: await probeAlreadyUsed('other'),
+      expectedCode: 'VALIDATION',
+      expectedMessage: /already used that invitation code/,
+    },
+  ]
+
+  for (const pair of pairs) {
+    check(`${pair.reason}: the contrast is accepted and written`, () => {
+      assert.equal(pair.accepted.verdict, 'accepted', pair.accepted.message)
+      assert.equal(pair.accepted.rowsAdded, ACCEPTED_AND_WRITTEN.rowsAdded)
+      assert.equal(
+        pair.accepted.counterMoved,
+        ACCEPTED_AND_WRITTEN.counterMoved
+      )
+    })
+
+    check(`${pair.reason}: the refusal says so, in the guest’s words`, () => {
+      assert.equal(pair.refused.verdict, 'refused')
+      assert.equal(pair.refused.failureCode, pair.expectedCode)
+      assert.match(pair.refused.message, pair.expectedMessage)
+    })
+
+    check(`${pair.reason}: and nothing was written on the way out`, () => {
+      assert.equal(pair.refused.rowsAdded, REFUSED_AND_INERT.rowsAdded)
+      assert.equal(pair.refused.counterMoved, REFUSED_AND_INERT.counterMoved)
+    })
+  }
+
+  note('Every pair above ran the same call, from the same session, with the')
+  note('same payload. What differed each time was a row the server holds.')
+
+  return pairs
+}
+
+// =============================================================================
+// 6. Scenario 7 — who a redemption may be written *for*
+// =============================================================================
+
+/**
+ * `redeemReferralCode` accepts an optional `referredUserId`, so that an
+ * administrator can record an acceptance on a household's behalf. The guard
+ * that keeps it from being an open door is four lines long:
+ *
+ * ```ts
+ * const privileged = hasRoleAtLeast(ctx.user.role, 'ADMIN')
+ * const referredUserId = input.referredUserId ?? ctx.user.id
+ * if (!privileged && referredUserId !== ctx.user.id) { … FORBIDDEN … }
+ * ```
+ *
+ * Delete it and every harness here still passed, because nothing had ever sent
+ * the field. Without it any `CLIENT` may write a `PENDING` redemption against
+ * **any** account on the platform: they would consume that household's
+ * one-live-redemption slot with an invitation of the caller's choosing, and
+ * `ALREADY_REFERRED` would then refuse the genuine invitation the household was
+ * actually given. That is CONTRACT.md §5 step 4 — never trust an id from the
+ * client without re-checking whom it belongs to — and it is the reason the
+ * eligibility predicate, which decides everything else, deliberately decides
+ * nothing about this.
+ *
+ * The two halves send the **same payload from the same account**. `CONCIERGE`
+ * is one person with one id and one row; what differs between the halves is the
+ * role their session carries, which is the single thing the guard reads.
+ */
+async function scenarioSeven(): Promise<{
+  readonly asClient: RedeemObservation
+  readonly asAdmin: RedeemObservation
+}> {
+  section('7. a redemption may be written for somebody else, by an ADMIN only')
+
+  const unprivileged: HarnessUser = { ...CONCIERGE, role: 'CLIENT' }
+
+  const stagedForClient = await stageRefusals(SUBSCRIBER)
+  const asClient = await observeRedeem({
+    caller: unprivileged,
+    code: CODE,
+    codeId: stagedForClient.codeId,
+    onBehalfOf: NEIGHBOUR,
+  })
+
+  const stagedForAdmin = await stageRefusals(SUBSCRIBER)
+  const asAdmin = await observeRedeem({
+    caller: CONCIERGE,
+    code: CODE,
+    codeId: stagedForAdmin.codeId,
+    onBehalfOf: NEIGHBOUR,
+  })
+
+  check('an unprivileged caller is refused, by name', () => {
+    assert.equal(asClient.verdict, 'refused')
+    assert.equal(asClient.failureCode, 'FORBIDDEN')
+    assert.match(asClient.message, /only accept an invitation on your own/)
+  })
+
+  check('…and the household they named has no redemption', () => {
+    assert.equal(asClient.rowsAdded, 0)
+    assert.equal(asClient.counterMoved, 0)
+  })
+
+  check('…nor did the refusal quietly fall back to the caller', () => {
+    assert.equal(asClient.rowsAddedForCaller, 0)
+  })
+
+  check('the identical payload from an ADMIN writes the row', () => {
+    assert.equal(asAdmin.verdict, 'accepted', asAdmin.message)
+    assert.equal(asAdmin.rowsAdded, 1)
+    assert.equal(asAdmin.counterMoved, 1)
+  })
+
+  check('…for the household named, and not for the administrator', () => {
+    assert.equal(asAdmin.rowsAddedForCaller, 0)
+  })
+
+  note('One id, one row, one payload. Only the session’s role differs, and')
+  note('that is the whole of what stands between a CLIENT and every account.')
+
+  return { asClient, asAdmin }
+}
+
+function printRefusalReport(
+  pairs: readonly RefusalPair[],
+  ownership: {
+    readonly asClient: RedeemObservation
+    readonly asAdmin: RedeemObservation
+  }
+): void {
+  printTable(
+    'Seven guards, each measured against a contrast that differs by one server-side fact',
+    [
+      ['guard', 'the property that differs', 'refused', 'contrast', 'rows'],
+      ...pairs.map((pair) => [
+        pair.reason,
+        pair.property,
+        pair.refused.failureCode,
+        pair.accepted.verdict,
+        `${String(pair.refused.rowsAdded)} vs ${String(pair.accepted.rowsAdded)}`,
+      ]),
+      [
+        'caller ≠ subject',
+        'the role on the session',
+        ownership.asClient.failureCode,
+        ownership.asAdmin.verdict,
+        `${String(ownership.asClient.rowsAdded)} vs ${String(ownership.asAdmin.rowsAdded)}`,
+      ],
+    ],
+    '  The last column is the one that matters: a refusal that returned the right\n' +
+      '  sentence while writing the row would read identically to a caller and cost\n' +
+      '  the same money as no guard at all.'
+  )
+}
+
+// =============================================================================
+// 7. Entry point
 // =============================================================================
 
 async function main(): Promise<void> {
@@ -628,6 +1258,11 @@ async function main(): Promise<void> {
   await scenarioThree(recorder)
   await scenarioFour(recorder)
   await scenarioFive(recorder)
+
+  const refusals = await scenarioSix()
+  const ownership = await scenarioSeven()
+
+  printRefusalReport(refusals, ownership)
 
   console.log(`\n${checkCount()} assertions passed.`)
 

@@ -234,7 +234,7 @@ function isOverdue(row: InvoiceRow): boolean {
 const NATIVE_CONTROL_CLASS =
   'h-10 w-full rounded-md border border-ash bg-charcoal px-3 font-sans text-sm text-linen ' +
   'transition-colors duration-200 ease-luxe hover:border-stone/60 ' +
-  'focus-visible:border-champagne/60 outline-none focus-visible:ring-2 focus-visible:ring-champagne/40'
+  'focus-visible:border-champagne/60 outline-none focus-visible:ring-2 focus-visible:ring-champagne'
 
 function FilterCheckbox({
   name,
@@ -255,7 +255,7 @@ function FilterCheckbox({
         name={name}
         value="true"
         defaultChecked={defaultChecked}
-        className="size-4 rounded-sm border border-ash bg-charcoal accent-champagne focus-visible:ring-2 focus-visible:ring-champagne/40 focus-visible:outline-none"
+        className="size-4 rounded-sm border border-ash bg-charcoal accent-champagne focus-visible:ring-2 focus-visible:ring-champagne focus-visible:outline-none"
       />
       <Label htmlFor={id} tone="muted" className="text-xs font-normal">
         {label}

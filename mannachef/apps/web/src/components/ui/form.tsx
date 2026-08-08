@@ -239,7 +239,7 @@ export const FormMessage = React.forwardRef<
       ref={ref}
       id={formMessageId}
       role="alert"
-      className={cn('font-sans text-xs leading-relaxed text-claret', className)}
+      className={cn('font-sans text-xs leading-relaxed text-claret-ink', className)}
       {...props}
     >
       {body}

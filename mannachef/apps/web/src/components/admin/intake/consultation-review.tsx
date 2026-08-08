@@ -362,7 +362,7 @@ function AllergyPanel({
         aria-hidden="true"
         className={cn(
           'flex size-11 shrink-0 items-center justify-center rounded-full border-2',
-          hasAllergies ? 'border-claret text-claret' : 'border-sage text-sage'
+          hasAllergies ? 'border-claret text-claret-ink' : 'border-sage text-sage-ink'
         )}
       >
         <AlertTriangle className="size-6" />
@@ -1238,7 +1238,7 @@ function ConversionResultSummary({
       className="flex flex-col gap-1 rounded-md border border-sage/40 bg-sage/8 px-4 py-3"
     >
       <span className="inline-flex items-center gap-2 font-sans text-sm font-medium text-linen">
-        <CheckCircle2 aria-hidden="true" className="size-4 text-sage" />
+        <CheckCircle2 aria-hidden="true" className="size-4 text-sage-ink" />
         {result.alreadyConverted
           ? 'No change — already at this stage.'
           : 'Conversion recorded.'}

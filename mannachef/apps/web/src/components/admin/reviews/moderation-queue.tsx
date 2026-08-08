@@ -28,11 +28,8 @@ import {
 import { useAction } from '@/lib/action-client'
 import { zodResolver } from '@/lib/zod-resolver'
 import { cn } from '@/lib/utils'
-import {
-  bulkModerateReviews,
-  moderateReview,
-  type ModeratedReviewView,
-} from '@/server/actions/review'
+import { bulkModerateReviews, moderateReview } from '@/server/actions/review'
+import type { AdminModeratedReviewView as ModeratedReviewView } from '@/components/admin/view-models'
 
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -1078,7 +1075,7 @@ function UnfeatureForm({
               {fieldState.error?.message !== undefined ? (
                 <p
                   role="alert"
-                  className="font-sans text-xs leading-relaxed text-claret"
+                  className="font-sans text-xs leading-relaxed text-claret-ink"
                 >
                   {fieldState.error.message}
                 </p>

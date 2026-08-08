@@ -51,7 +51,10 @@ import { DateTime } from '@/components/ui/date-time'
 import { EmptyState } from '@/components/ui/empty-state'
 import { Money } from '@/components/ui/money'
 import { Separator } from '@/components/ui/separator'
-import { listSubscriptionPlans, listSubscriptions } from '@/server/actions/billing'
+import {
+  listSubscriptionPlans,
+  listSubscriptions,
+} from '@/server/actions/billing'
 
 export const metadata = {
   title: 'Subscription',
@@ -60,7 +63,11 @@ export const metadata = {
 export default async function PortalSubscriptionPage(): Promise<React.JSX.Element> {
   const [subscriptions, plans] = await Promise.all([
     listSubscriptions({ pageSize: 10 }),
-    listSubscriptionPlans({ pageSize: 25, sortBy: 'PRICE', sortDirection: 'asc' }),
+    listSubscriptionPlans({
+      pageSize: 25,
+      sortBy: 'PRICE',
+      sortDirection: 'asc',
+    }),
   ])
 
   if (!subscriptions.ok) {
@@ -95,10 +102,16 @@ export default async function PortalSubscriptionPage(): Promise<React.JSX.Elemen
             </Button>
           }
           secondaryAction={
+            /*
+             * This said "Book a single engagement" while pointing at
+             * `/portal/menu-selection`, which is the weekly menu composer, not
+             * the diary. Booking an engagement is `/portal/appointments`, so
+             * the label now matches where it goes — the other three
+             * `menu-selection` links in the portal really do mean the composer
+             * and were left pointing at it.
+             */
             <Button asChild variant="ghost">
-              <Link href="/portal/menu-selection">
-                Book a single engagement
-              </Link>
+              <Link href="/portal/appointments">Book a single engagement</Link>
             </Button>
           }
         />
@@ -106,23 +119,22 @@ export default async function PortalSubscriptionPage(): Promise<React.JSX.Elemen
     )
   }
 
-  const planOptions: readonly PlanOption[] =
-    plans.ok
-      ? plans.data.items
-          .filter(
-            (plan) =>
-              plan.id !== subscription.planId &&
-              plan.currency === subscription.plan.currency
-          )
-          .map((plan) => ({
-            id: plan.id,
-            name: plan.name,
-            priceCents: plan.priceCents,
-            currency: plan.currency,
-            mealsPerWeek: plan.mealsPerWeek,
-            servingsPerMeal: plan.servingsPerMeal,
-          }))
-      : []
+  const planOptions: readonly PlanOption[] = plans.ok
+    ? plans.data.items
+        .filter(
+          (plan) =>
+            plan.id !== subscription.planId &&
+            plan.currency === subscription.plan.currency
+        )
+        .map((plan) => ({
+          id: plan.id,
+          name: plan.name,
+          priceCents: plan.priceCents,
+          currency: plan.currency,
+          mealsPerWeek: plan.mealsPerWeek,
+          servingsPerMeal: plan.servingsPerMeal,
+        }))
+    : []
 
   const live = isLiveSubscription(subscription.status)
 
@@ -149,7 +161,7 @@ export default async function PortalSubscriptionPage(): Promise<React.JSX.Elemen
           <div className="flex flex-wrap items-center gap-3">
             <SubscriptionStatusBadge status={subscription.status} />
             {subscription.cancelAtPeriodEnd ? (
-              <span className="font-sans text-xs text-terracotta">
+              <span className="font-sans text-xs text-terracotta-ink">
                 Closing at the end of this period
               </span>
             ) : null}

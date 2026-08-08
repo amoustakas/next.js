@@ -501,11 +501,24 @@ export type MailboxProofRepair =
  * was not: **retried**, **observable**, and **recoverable**.
  *
  *  - *Retried* — {@link MAILBOX_PROOF_ATTEMPTS}, which argues its own numbers.
- *  - *Observable* — a `failed` arm that a caller cannot receive by accident.
- *    It is a distinct variant of a discriminated union, so a caller that stops
- *    handling it stops compiling. That is the part the previous design could
- *    never have: a `catch` block is invisible to the type system, and the way
- *    to notice one had been left empty was to read it.
+ *  - *Observable* — a `failed` arm that arrives as a **value**, in the return
+ *    position, where the ordinary outcomes arrive. A caller has to narrow the
+ *    union before it can read anything off it, so the arm is in front of
+ *    whoever writes the next branch. That is the part the previous design could
+ *    never have: a `catch` block is invisible to the type system, and the only
+ *    way to notice one had been left empty was to read it.
+ *
+ *    An earlier revision of this bullet claimed more than that — "a caller that
+ *    stops handling it stops compiling" — and TypeScript does not give that.
+ *    Union members are not obliged to be handled; exhaustiveness is checked only
+ *    where somebody writes an explicit `never` assertion, as
+ *    `updateReferralRedemption` does over its command union. `reportMailboxProof`
+ *    in `server/auth.ts` is a chain of `if`s over `outcome.kind`, and deleting
+ *    its `failed` branch type-checks perfectly. What the union buys is that the
+ *    failure cannot be *lost* — it is returned rather than thrown past — not
+ *    that the compiler will insist somebody looks at it. Saying otherwise makes
+ *    a reader trust a guarantee no tool is providing, which is the same class of
+ *    mistake as the swallowed `catch` this function replaced.
  *  - *Recoverable* — because `authConfig.callbacks.session` calls this too, on
  *    every authenticated request, and it already reads the row that says
  *    whether there is anything to do. A live session is itself proof that Auth.js
@@ -603,13 +616,33 @@ export type ReferralClaimOutcome =
  * `createReferralRedemption` **inserts the row and then** compare-and-swaps the
  * counter, and its contract is explicit that "the loser's `create` is rolled
  * back with the caller's transaction, which is why this must be called inside
- * one". `redeemReferralCode` honours that by throwing an `ActionError`; the
- * Stripe webhook by letting the delivery fail. Returning `raced` from the
- * transaction callback instead would **commit** the orphan redemption, and the
- * cap would stop binding under concurrency — which is precisely what
- * `verify-intake-referral-cap.ts` scenario 3 caught when this function first
- * did exactly that: four simultaneous sign-ins wrote four redemptions against a
- * code capped at two.
+ * one". Returning `raced` from the transaction callback instead would **commit**
+ * the orphan redemption, and the cap would stop binding under concurrency —
+ * which is precisely what `verify-intake-referral-cap.ts` scenario 3 caught when
+ * this function first did exactly that: four simultaneous sign-ins wrote four
+ * redemptions against a code capped at two.
+ *
+ * `redeemReferralCode` honours the contract the same way this class does, by
+ * throwing from **inside** `ctx.db.$transaction`.
+ *
+ * ## What the Stripe webhook actually does, which is not that
+ *
+ * This docblock used to add "the Stripe webhook by letting the delivery fail",
+ * and that sentence credited a rollback nothing performs.
+ * `recordReferralRedemption` in `app/api/webhooks/stripe/route.ts` *returns* the
+ * `raced` outcome from its transaction callback and throws only afterwards. A
+ * callback that returns normally commits, so by the time the throw runs the
+ * orphan row is already durable, and failing the delivery cannot take it back.
+ * Stripe then redelivers, `resolveRedemptionEligibility` finds that very row and
+ * refuses `ALREADY_USED`, and the redelivery is recorded as handled — so the
+ * code ends up carrying one redemption its `redemptionCount` never counted, and
+ * no retry can repair it.
+ *
+ * That is a defect in the webhook rather than in this class, it is recorded here
+ * rather than described away, and closing it is a one-line move: throw inside
+ * that callback, as both callers on this side of the boundary already do. Until
+ * that happens, "every path rolls the loser back" is true of the two paths in
+ * this module and false of the third.
  *
  * A private class rather than a returned discriminant because the rollback is
  * the point: nothing else in this module may catch it, and nothing outside it

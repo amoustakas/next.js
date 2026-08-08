@@ -132,11 +132,14 @@ import {
   redeemReferralCode,
   settleReferralRedemptions,
 } from '@/server/actions/referral'
+import { setUserActive } from '@/server/actions/user'
 import { prisma } from '@/server/db'
 import {
   CLAIM_WINDOW_DAYS,
+  adoptUnclaimedAccount,
   ensureMailboxProved,
   markMailboxProved,
+  type OAuthAccountLink,
 } from '@/server/referral-claim'
 
 import { asUser, signInAs, type HarnessUser } from './fixtures/harness-state'
@@ -734,10 +737,13 @@ async function sprayedAtAProvedHousehold(): Promise<SprayedWorld> {
   // scenario, so it holds in front of every decision below.
   const anonymous = await acceptAnonymously(SPRAYED_CODE)
 
-  check('and the consent door is closed to the caller who typed the address', () => {
-    assert.equal(anonymous.ok, false)
-    assert.equal(anonymous.ok ? '' : anonymous.code, 'UNAUTHENTICATED')
-  })
+  check(
+    'and the consent door is closed to the caller who typed the address',
+    () => {
+      assert.equal(anonymous.ok, false)
+      assert.equal(anonymous.ok ? '' : anonymous.code, 'UNAUTHENTICATED')
+    }
+  )
 
   // The genuine owner of that mailbox now does what victims do: signs in
   // through their own magic link, and pays us.
@@ -746,9 +752,12 @@ async function sprayedAtAProvedHousehold(): Promise<SprayedWorld> {
 
   const proved = await unclaimedSinceOf(userId)
 
-  check('the sign-in that proved the mailbox clears the placeholder marker', () => {
-    assert.equal(proved, null)
-  })
+  check(
+    'the sign-in that proved the mailbox clears the placeholder marker',
+    () => {
+      assert.equal(proved, null)
+    }
+  )
 
   const household = await sessionFor(HOUSEHOLD_EMAIL)
   const banner = await readBanner(household)
@@ -771,7 +780,9 @@ async function sprayedAtAProvedHousehold(): Promise<SprayedWorld> {
  * is not consent.
  */
 async function scenarioNoConsent(): Promise<SweepRecord> {
-  section('1. sprayed at an address the caller does not control — never answered')
+  section(
+    '1. sprayed at an address the caller does not control — never answered'
+  )
 
   const world = await sprayedAtAProvedHousehold()
 
@@ -782,12 +793,15 @@ async function scenarioNoConsent(): Promise<SweepRecord> {
     assert.equal(world.banner?.assurance, 'unverified')
   })
 
-  check('and the $50.00 is genuinely there to be taken — it is acceptable now', () => {
-    // Not "the claim was already dead". It is live, it names the sprayer's
-    // code, and the household's invoice already clears the floor. The only
-    // thing between the sprayer and the money is a click nobody makes.
-    assert.equal(world.banner?.standing.kind, 'acceptable')
-  })
+  check(
+    'and the $50.00 is genuinely there to be taken — it is acceptable now',
+    () => {
+      // Not "the claim was already dead". It is live, it names the sprayer's
+      // code, and the household's invoice already clears the floor. The only
+      // thing between the sprayer and the money is a click nobody makes.
+      assert.equal(world.banner?.standing.kind, 'acceptable')
+    }
+  )
 
   const swept = await sweep()
 
@@ -862,9 +876,12 @@ async function scenarioDeclined(): Promise<SweepRecord> {
     assert.equal(claim, null)
   })
 
-  check('and a tombstone records that this household said no to this code', () => {
-    assert.deepEqual(answers, [`referral-claim:declined:${SPRAYED_CODE}`])
-  })
+  check(
+    'and a tombstone records that this household said no to this code',
+    () => {
+      assert.deepEqual(answers, [`referral-claim:declined:${SPRAYED_CODE}`])
+    }
+  )
 
   // --- resurrection 1: spray it again --------------------------------------
   await sprayAnonymously(HOUSEHOLD_EMAIL, SPRAYED_CODE)
@@ -890,9 +907,12 @@ async function scenarioDeclined(): Promise<SweepRecord> {
   const forgedBanner = await readBanner(world.household)
   const afterRead = await referralClaimOf(world.clientProfileId)
 
-  check('a forged claim for an answered code is not offered a second time', () => {
-    assert.equal(forgedBanner, null)
-  })
+  check(
+    'a forged claim for an answered code is not offered a second time',
+    () => {
+      assert.equal(forgedBanner, null)
+    }
+  )
 
   check('and the read clears it, so the disagreement does not survive', () => {
     assert.equal(afterRead, null)
@@ -901,10 +921,13 @@ async function scenarioDeclined(): Promise<SweepRecord> {
   // --- resurrection 3: accept it anyway ------------------------------------
   const forced = await acceptAs(world.household, SPRAYED_CODE)
 
-  check('accepting an answered code is an idempotent no-op, not a payment', () => {
-    assert.equal(forced.ok, true)
-    assert.equal(forced.ok ? forced.data.kind : '', 'already-answered')
-  })
+  check(
+    'accepting an answered code is an idempotent no-op, not a payment',
+    () => {
+      assert.equal(forced.ok, true)
+      assert.equal(forced.ok ? forced.data.kind : '', 'already-answered')
+    }
+  )
 
   const swept = await sweep()
 
@@ -958,11 +981,17 @@ async function scenarioAccepted(): Promise<SweepRecord> {
 
   const world = await sprayedAtAProvedHousehold()
 
-  check('the household is told, before deciding, that we do not vouch for it', () => {
-    assert.equal(world.banner?.assurance, 'unverified')
-    assert.match(world.banner?.disclosure ?? '', /have not verified who typed it/)
-    assert.equal(world.banner?.standing.kind, 'acceptable')
-  })
+  check(
+    'the household is told, before deciding, that we do not vouch for it',
+    () => {
+      assert.equal(world.banner?.assurance, 'unverified')
+      assert.match(
+        world.banner?.disclosure ?? '',
+        /have not verified who typed it/
+      )
+      assert.equal(world.banner?.standing.kind, 'acceptable')
+    }
+  )
 
   const accepted = await acceptAs(world.household, SPRAYED_CODE)
 
@@ -970,11 +999,14 @@ async function scenarioAccepted(): Promise<SweepRecord> {
   const claim = await referralClaimOf(world.clientProfileId)
   const answers = await claimAnswersOf(world.clientProfileId)
 
-  check('the acceptance writes one redemption, against the sprayed code', () => {
-    assert.equal(accepted.ok, true)
-    assert.equal(accepted.ok ? accepted.data.kind : '', 'accepted')
-    assert.deepEqual(redemptions, [{ code: SPRAYED_CODE, status: 'PENDING' }])
-  })
+  check(
+    'the acceptance writes one redemption, against the sprayed code',
+    () => {
+      assert.equal(accepted.ok, true)
+      assert.equal(accepted.ok ? accepted.data.kind : '', 'accepted')
+      assert.deepEqual(redemptions, [{ code: SPRAYED_CODE, status: 'PENDING' }])
+    }
+  )
 
   check('the claim is consumed and the acceptance is tombstoned', () => {
     assert.equal(claim, null)
@@ -1171,12 +1203,15 @@ async function runPrecedence(
 
   // The property, stated as a property. Not "the genuine code wins" — that is
   // an artefact of which submission a test author sends second.
-  check('the LAST public submission is what stands, while the row is unproved', () => {
-    assert.notEqual(placeholderBefore, null)
-    assert.notEqual(placeholderAfter, null)
-    assert.equal(standing?.code, last.code)
-    assert.notEqual(standing?.code, first.code)
-  })
+  check(
+    'the LAST public submission is what stands, while the row is unproved',
+    () => {
+      assert.notEqual(placeholderBefore, null)
+      assert.notEqual(placeholderAfter, null)
+      assert.equal(standing?.code, last.code)
+      assert.notEqual(standing?.code, first.code)
+    }
+  )
 
   await magicLinkSignIn(userId)
 
@@ -1184,20 +1219,26 @@ async function runPrecedence(
   const banner = await readBanner(household)
   const attribution = attributionOf(banner?.standing)
 
-  check('the banner offers exactly that submission, and names its owner', () => {
-    assert.equal(banner?.code, last.code)
-    assert.notEqual(attribution, null)
-    assert.equal(attribution?.inviterDisplayName, last.inviter.name)
-  })
+  check(
+    'the banner offers exactly that submission, and names its owner',
+    () => {
+      assert.equal(banner?.code, last.code)
+      assert.notEqual(attribution, null)
+      assert.equal(attribution?.inviterDisplayName, last.inviter.name)
+    }
+  )
 
   // Whoever the named party turns out to be, the card says where the string
   // came from and that nobody has vouched for it. In `genuine-first` this is
   // the only thing standing between a referred household and a stranger's
   // code, which is why it is asserted in both arms rather than in one.
-  check('and states its provenance as what it is: unverified public input', () => {
-    assert.equal(banner?.provenance, 'public-enquiry-form')
-    assert.equal(banner?.assurance, 'unverified')
-  })
+  check(
+    'and states its provenance as what it is: unverified public input',
+    () => {
+      assert.equal(banner?.provenance, 'public-enquiry-form')
+      assert.equal(banner?.assurance, 'unverified')
+    }
+  )
 
   // A prompt rendered against the *other* code must consume nothing. This is
   // the stale-render guard, and it holds in both directions.
@@ -1216,9 +1257,12 @@ async function runPrecedence(
 
   const moneyBeforeConsent = await moneySnapshot(stageIds)
 
-  check('no row carrying money exists in either ordering, before consent', () => {
-    assert.deepEqual(moneyBeforeConsent, NO_MONEY_MOVED)
-  })
+  check(
+    'no row carrying money exists in either ordering, before consent',
+    () => {
+      assert.deepEqual(moneyBeforeConsent, NO_MONEY_MOVED)
+    }
+  )
 
   // ---- the household reaches the invitation it actually holds --------------
   // The household knows one thing the server does not and cannot: their friend
@@ -1252,11 +1296,14 @@ async function runPrecedence(
       assert.equal(redeemed.ok ? redeemed.data.status : '', 'PENDING')
     })
 
-    check('and the stranger’s claim is then cleared, not left on the card', () => {
-      assert.equal(declined.ok, true)
-      assert.equal(declined.ok ? declined.data.kind : '', 'declined')
-      assert.equal(afterDecline, null)
-    })
+    check(
+      'and the stranger’s claim is then cleared, not left on the card',
+      () => {
+        assert.equal(declined.ok, true)
+        assert.equal(declined.ok ? declined.data.kind : '', 'declined')
+        assert.equal(afterDecline, null)
+      }
+    )
   }
 
   await payInvoice(userId, HOUSEHOLD_INVOICE_CENTS)
@@ -1270,14 +1317,19 @@ async function runPrecedence(
   const attackerBalanceCents = await balanceCentsOf(ATTACKER.id)
 
   // The invariant. Identical text, identical values, in both orderings.
-  check('the member who actually invited them is paid, and the sprayer is not', () => {
-    assert.deepEqual(redemptions, [{ code: GENUINE_CODE, status: 'REWARDED' }])
-    assert.equal(genuineCounter, 1)
-    assert.equal(sprayedCounter, 0)
-    assert.deepEqual(swept, ONE_REWARD_SWEPT)
-    assert.equal(patronBalanceCents, REWARD_CENTS)
-    assert.equal(attackerBalanceCents, 0)
-  })
+  check(
+    'the member who actually invited them is paid, and the sprayer is not',
+    () => {
+      assert.deepEqual(redemptions, [
+        { code: GENUINE_CODE, status: 'REWARDED' },
+      ])
+      assert.equal(genuineCounter, 1)
+      assert.equal(sprayedCounter, 0)
+      assert.deepEqual(swept, ONE_REWARD_SWEPT)
+      assert.equal(patronBalanceCents, REWARD_CENTS)
+      assert.equal(attackerBalanceCents, 0)
+    }
+  )
 
   // ---- the lockout, asserted from the other end ---------------------------
   // A household holding a live redemption is refused a second one. Under the
@@ -1288,11 +1340,14 @@ async function runPrecedence(
   const second = await redeemAs(household, SPRAYED_CODE)
   const unchanged = await redemptionsOf(userId)
 
-  check('one live redemption per household still binds — on the right one', () => {
-    assert.equal(second.ok, false)
-    assert.equal(second.ok ? '' : second.code, 'VALIDATION')
-    assert.deepEqual(unchanged, [{ code: GENUINE_CODE, status: 'REWARDED' }])
-  })
+  check(
+    'one live redemption per household still binds — on the right one',
+    () => {
+      assert.equal(second.ok, false)
+      assert.equal(second.ok ? '' : second.code, 'VALIDATION')
+      assert.deepEqual(unchanged, [{ code: GENUINE_CODE, status: 'REWARDED' }])
+    }
+  )
 
   return {
     order,
@@ -1404,10 +1459,13 @@ async function scenarioLegitimate(): Promise<SweepRecord> {
     assert.equal(claimed?.code, GENUINE_CODE)
   })
 
-  check('nothing that carries money exists before the household consents', () => {
-    assert.deepEqual(noRedemptions, [])
-    assert.deepEqual(beforeConsent, NO_MONEY_MOVED)
-  })
+  check(
+    'nothing that carries money exists before the household consents',
+    () => {
+      assert.deepEqual(noRedemptions, [])
+      assert.deepEqual(beforeConsent, NO_MONEY_MOVED)
+    }
+  )
 
   await magicLinkSignIn(userId)
 
@@ -1453,12 +1511,15 @@ async function scenarioLegitimate(): Promise<SweepRecord> {
     assert.deepEqual(second, NOTHING_SWEPT)
   })
 
-  check('and the ledger is unchanged — one entry, one payment, one seat', () => {
-    assert.equal(balanceAfterSecond, REWARD_CENTS)
-    assert.deepEqual(ledgerAfterSecond, ONE_REFERRAL_CREDIT)
-    assert.equal(counter, 1)
-    assert.deepEqual(settled, [{ code: GENUINE_CODE, status: 'REWARDED' }])
-  })
+  check(
+    'and the ledger is unchanged — one entry, one payment, one seat',
+    () => {
+      assert.equal(balanceAfterSecond, REWARD_CENTS)
+      assert.deepEqual(ledgerAfterSecond, ONE_REFERRAL_CREDIT)
+      assert.equal(counter, 1)
+      assert.deepEqual(settled, [{ code: GENUINE_CODE, status: 'REWARDED' }])
+    }
+  )
 
   note('the programme still pays, through the one door that requires consent.')
 
@@ -1828,10 +1889,13 @@ async function scenarioClaimWindow(): Promise<{
   )
 
   // --- then how each of them got there --------------------------------------
-  check('the lapsed claim is shown as lapsed, against the stated window', () => {
-    assert.equal(outside.standing, 'lapsed')
-    assert.equal(outside.windowShownDays, PROMISED_WINDOW_DAYS)
-  })
+  check(
+    'the lapsed claim is shown as lapsed, against the stated window',
+    () => {
+      assert.equal(outside.standing, 'lapsed')
+      assert.equal(outside.windowShownDays, PROMISED_WINDOW_DAYS)
+    }
+  )
 
   check('accepting it answers expired, and consumes the claim anyway', () => {
     assert.equal(outside.acceptance, 'expired')
@@ -1850,7 +1914,9 @@ async function scenarioClaimWindow(): Promise<{
   check('the acceptance settles, and the sweep carries it to REWARDED', () => {
     assert.equal(inside.acceptance, 'accepted')
     assert.equal(inside.claimStillStanding, false)
-    assert.deepEqual(inside.answers, [`referral-claim:accepted:${SPRAYED_CODE}`])
+    assert.deepEqual(inside.answers, [
+      `referral-claim:accepted:${SPRAYED_CODE}`,
+    ])
     assert.deepEqual(inside.redemptionsAtAcceptance, [
       { code: SPRAYED_CODE, status: 'PENDING' },
     ])
@@ -1898,7 +1964,9 @@ async function scenarioClaimWindow(): Promise<{
  * as tightly as it can be, because a harness that leaves a schema mangled on a
  * failed assertion is a harness that makes the *next* failure unreadable.
  */
-async function withoutUnclaimedSinceColumn<T>(run: () => Promise<T>): Promise<T> {
+async function withoutUnclaimedSinceColumn<T>(
+  run: () => Promise<T>
+): Promise<T> {
   await prisma.$executeRawUnsafe(
     'ALTER TABLE "User" RENAME COLUMN "unclaimedSince" TO "unclaimedSince_hidden"'
   )
@@ -1977,9 +2045,12 @@ async function scenarioDegradedPlaceholder(): Promise<void> {
     )
   })
 
-  check('and the household is left signed in, with the stamp still standing', () => {
-    assert.notEqual(stampAfterSignIn, null)
-  })
+  check(
+    'and the household is left signed in, with the stamp still standing',
+    () => {
+      assert.notEqual(stampAfterSignIn, null)
+    }
+  )
 
   // --- what the stamp still permits, stated before it is cleared ------------
   // This is the harm. A second sprayer POSTs at an address whose owner is
@@ -1988,9 +2059,12 @@ async function scenarioDegradedPlaceholder(): Promise<void> {
 
   const reAimed = await referralClaimOf(clientProfileId)
 
-  check('while it stands, the public form can still re-aim a live account', () => {
-    assert.equal(reAimed?.code, GENUINE_CODE)
-  })
+  check(
+    'while it stands, the public form can still re-aim a live account',
+    () => {
+      assert.equal(reAimed?.code, GENUINE_CODE)
+    }
+  )
 
   // --- the repair, as `authConfig.callbacks.session` performs it ------------
   const atSession = await ensureMailboxProved(userId)
@@ -2019,11 +2093,809 @@ async function scenarioDegradedPlaceholder(): Promise<void> {
     assert.equal(afterThirdSpray?.code, GENUINE_CODE)
   })
 
-  note('a swallowed failure was a standing capability; now it is a logged one that heals.')
+  note(
+    'a swallowed failure was a standing capability; now it is a logged one that heals.'
+  )
 }
 
 // =============================================================================
-// 14. The report
+// 14. Scenario 9 — the anchor's clamp (MCV-057)
+// =============================================================================
+
+/**
+ * How far before its own row a redemption's anchor may reach, in days.
+ *
+ * ## Why this is a literal and not an import
+ *
+ * The same reason {@link PROMISED_WINDOW_DAYS} is one. `clampAnchor` computes
+ * its floor from `MAX_ANCHOR_LOOKBACK_DAYS - 1`; a harness that imported either
+ * constant would move with them, backdate a claim to whatever the new figure
+ * happened to be, observe the clamp land on it, and print a pass. The number
+ * has to be written down independently of the value under test or it is a
+ * restatement rather than an expectation.
+ *
+ * Twenty-nine is the *promise* transcribed from the `MAX_ANCHOR_LOOKBACK_DAYS`
+ * docblock: thirty days is what
+ * `ReferralRedemption_qualifyingFromAt_floor_check` enforces, and the writer
+ * clamps one day inside it so that a claim settled at the very edge of its
+ * window is a redemption rather than a constraint violation decided by
+ * milliseconds of clock skew between the application and the database.
+ */
+const PROMISED_CLAMP_DAYS = 29
+
+/**
+ * A claim old enough that the clamp has something to do, and young enough that
+ * {@link CLAIM_WINDOW_DAYS} still admits it.
+ *
+ * The fraction is load-bearing: at 29.9 days the *unclamped* anchor still
+ * satisfies the database's thirty-day `CHECK`, so removing the clamp does not
+ * announce itself as an error. It silently widens what may qualify by nearly a
+ * day — which is the whole reason the clamp is a clamp and not a rejection, and
+ * the reason a harness has to measure the stored value rather than wait for
+ * PostgreSQL to complain.
+ */
+const AGED_CLAIM_DAYS = 29.9
+
+/** An invoice paid inside the day the clamp gives back. Must never qualify. */
+const INVOICE_INSIDE_THE_CLAMP_DAYS = 29.5
+
+/** An invoice paid well after the anchor, either way. Must always qualify. */
+const INVOICE_AFTER_THE_ANCHOR_DAYS = 1
+
+/**
+ * The sweep looked at the redemption and paid nothing.
+ *
+ * Distinct from {@link NOTHING_SWEPT}, and the distinction is the assertion: a
+ * row exists and was `examined`, so the refusal is
+ * `findQualifyingInvoice`'s — the anchor — and not the absence of anything to
+ * settle. A scenario that expected `examined: 0` here would pass just as
+ * happily if the acceptance had never written a redemption at all.
+ */
+const EXAMINED_AND_UNPAID: SweepRecord = {
+  examined: 1,
+  rewarded: 0,
+  creditedCents: 0,
+}
+
+/** A `PAID` invoice stamped at a chosen moment. */
+async function payInvoiceAt(
+  userId: string,
+  cents: number,
+  paidAt: Date
+): Promise<void> {
+  await prisma.invoice.create({
+    data: {
+      userId,
+      amountDueCents: cents,
+      amountPaidCents: cents,
+      amountRemainingCents: 0,
+      subtotalCents: cents,
+      currency: 'CAD',
+      status: 'PAID',
+      issuedAt: paidAt,
+      paidAt,
+    },
+    select: { id: true },
+  })
+}
+
+/** The row the acceptance wrote, and the two dates the clamp sits between. */
+interface AnchoredRedemption {
+  readonly status: string
+  readonly qualifyingFromAt: Date
+  readonly createdAt: Date
+}
+
+async function anchoredRedemptionOf(
+  userId: string
+): Promise<AnchoredRedemption | null> {
+  const row = await prisma.referralRedemption.findFirst({
+    where: { referredUserId: userId },
+    orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
+    select: { status: true, qualifyingFromAt: true, createdAt: true },
+  })
+
+  return row
+}
+
+/** Everything one aged acceptance did, gathered before anything is asserted. */
+interface ClampObservation {
+  readonly invoiceAgeDays: number
+  readonly acceptance: string
+  /** `createdAt − qualifyingFromAt`, in whole days, as stored. */
+  readonly anchorReachDays: number
+  readonly redemptionStatus: string
+  readonly swept: SweepRecord
+  readonly sprayerBalanceCents: number
+}
+
+/**
+ * One household, one claim aged {@link AGED_CLAIM_DAYS}, one paid invoice —
+ * and the only thing that varies between the two runs is when that invoice was
+ * paid.
+ *
+ * The claim's age is held **fixed** on purpose. Both runs therefore write the
+ * same anchor, and the pair does not turn on a number the harness chose: it
+ * turns on whether a real payment landed before or after the moment the anchor
+ * actually reaches. The clamp is what decides where that moment is, and the
+ * money is what reports it.
+ */
+async function observeClampedAnchor(
+  invoiceAgeDays: number
+): Promise<ClampObservation> {
+  await stage()
+
+  await sprayAnonymously(HOUSEHOLD_EMAIL, SPRAYED_CODE)
+
+  const userId = (await userIdForEmail(HOUSEHOLD_EMAIL)) ?? ''
+  const clientProfileId = (await profileIdForEmail(HOUSEHOLD_EMAIL)) ?? ''
+
+  await backdateReferralClaim(clientProfileId, daysAgo(AGED_CLAIM_DAYS))
+  await payInvoiceAt(userId, HOUSEHOLD_INVOICE_CENTS, daysAgo(invoiceAgeDays))
+  await magicLinkSignIn(userId)
+
+  const household = await sessionFor(HOUSEHOLD_EMAIL)
+  const accepted = await acceptAs(household, SPRAYED_CODE)
+  const row = await anchoredRedemptionOf(userId)
+
+  const swept = await sweep()
+  const sprayerBalanceCents = await balanceCentsOf(ATTACKER.id)
+  const settled = await anchoredRedemptionOf(userId)
+
+  return {
+    invoiceAgeDays,
+    acceptance: accepted.ok ? accepted.data.kind : `error:${accepted.code}`,
+    anchorReachDays:
+      row === null ? -1 : daysBetween(row.qualifyingFromAt, row.createdAt),
+    redemptionStatus: settled === null ? '(none)' : settled.status,
+    swept,
+    sprayerBalanceCents,
+  }
+}
+
+/**
+ * The clamp, measured on the stored column and then on the money.
+ *
+ * Both halves accept a claim of the same age through the same door. The stored
+ * anchor is asserted first, because that is the guard's direct output and the
+ * one thing that cannot be reached by any other rule; the settlement is
+ * asserted second, because an anchor nobody spends is not yet a defect.
+ */
+async function scenarioAnchorClamp(): Promise<{
+  readonly insideTheClamp: ClampObservation
+  readonly afterTheAnchor: ClampObservation
+}> {
+  section('9. the anchor’s clamp — where a backdated claim may reach')
+
+  const insideTheClamp = await observeClampedAnchor(
+    INVOICE_INSIDE_THE_CLAMP_DAYS
+  )
+  const afterTheAnchor = await observeClampedAnchor(
+    INVOICE_AFTER_THE_ANCHOR_DAYS
+  )
+
+  check('both acceptances settle, from a claim inside the window', () => {
+    assert.equal(insideTheClamp.acceptance, 'accepted')
+    assert.equal(afterTheAnchor.acceptance, 'accepted')
+  })
+
+  check(
+    `the stored anchor reaches back ${String(PROMISED_CLAMP_DAYS)} days, not ${String(AGED_CLAIM_DAYS)}`,
+    () => {
+      assert.equal(insideTheClamp.anchorReachDays, PROMISED_CLAMP_DAYS)
+      assert.equal(afterTheAnchor.anchorReachDays, PROMISED_CLAMP_DAYS)
+    }
+  )
+
+  check('an invoice paid inside the clamped day qualifies nothing', () => {
+    assert.deepEqual(insideTheClamp.swept, EXAMINED_AND_UNPAID)
+    assert.equal(insideTheClamp.redemptionStatus, 'PENDING')
+    assert.equal(insideTheClamp.sprayerBalanceCents, 0)
+  })
+
+  check('an invoice paid after the anchor pays exactly once', () => {
+    assert.deepEqual(afterTheAnchor.swept, ONE_REWARD_SWEPT)
+    assert.equal(afterTheAnchor.redemptionStatus, 'REWARDED')
+    assert.equal(afterTheAnchor.sprayerBalanceCents, REWARD_CENTS)
+  })
+
+  note('The claim is the same age in both columns. Only the payment moved,')
+  note('and the clamp is what decides which side of the anchor it fell on.')
+
+  return { insideTheClamp, afterTheAnchor }
+}
+
+// =============================================================================
+// 15. Scenario 10 — the claim's compare-and-swap, under a real lock
+// =============================================================================
+
+/**
+ * `settleAcceptedClaim` consumes the claim *before* it decides anything:
+ *
+ * ```ts
+ * const consumed = await tx.clientProfile.updateMany({
+ *   where: { id: profile.id, claimedReferralCode: code },
+ *   data: { claimedReferralCode: null, claimedReferralCodeAt: null },
+ * })
+ * if (consumed.count !== 1) { return { kind: 'raced' } }
+ * ```
+ *
+ * The `WHERE` restates the code the transaction read a statement earlier, so
+ * `count === 0` means somebody else moved that column in between — a concurrent
+ * acceptance, or a household who declined while this request was in flight.
+ * Without the guard the acceptance carries on and settles a claim that is no
+ * longer standing: a `ReferralRedemption` written against an attribution the
+ * household has just refused, which is the single thing the whole of MCV-052
+ * exists to make impossible.
+ *
+ * ## Why this needs a lock and not a `Promise.all`
+ *
+ * Because the window is one statement wide and the claim is what has to change
+ * inside it. Four simultaneous acceptances (scenario 6) do exercise the same
+ * `updateMany`, but they all name the same code, so the losers are refused by
+ * `ALREADY_USED` a moment later and the observable outcome is the same either
+ * way. The interleaving that costs money has to be *built*, and it is built here
+ * out of PostgreSQL's own row lock rather than out of a timer: the holding
+ * transaction takes `FOR UPDATE` on the household's `ClientProfile`, the
+ * acceptance blocks on its own `UPDATE`, and the holder then writes and commits.
+ * Nothing is mocked, no branch is forced, and the ordering is decided by the
+ * database rather than by chance.
+ *
+ * ## The contrast performs the identical interleaving
+ *
+ * The accepting half takes the same lock, waits for the same blocked statement
+ * and issues the same `UPDATE` — against a *different column* of the same row.
+ * So the two halves differ by which columns a concurrent writer touched, and by
+ * nothing else. A contrast that simply skipped the concurrency would be a
+ * contrast separated by an omission.
+ */
+interface RacedAcceptance {
+  readonly acceptance: string
+  readonly redemptions: readonly HouseholdRedemption[]
+  readonly claimAnswers: readonly string[]
+  readonly standingClaim: string | null
+  readonly swept: SweepRecord
+  readonly sprayerBalanceCents: number
+}
+
+/** What the concurrent writer changed while the acceptance was blocked. */
+type ConcurrentWrite = 'the-claim' | 'another-column'
+
+/**
+ * Block until some backend in this database is waiting on a lock.
+ *
+ * Polling `pg_stat_activity` rather than sleeping is what makes the interleaving
+ * a fact instead of a hope: the holder does not write until it can see that the
+ * acceptance has already reached its `UPDATE` and cannot get past it.
+ */
+async function waitForABlockedStatement(): Promise<void> {
+  const deadline = Date.now() + 15_000
+
+  for (;;) {
+    const rows = await prisma.$queryRaw<{ waiting: bigint }[]>`
+      SELECT count(*) AS waiting
+      FROM pg_stat_activity
+      WHERE datname = current_database()
+        AND wait_event_type = 'Lock'
+        AND state = 'active'
+    `
+
+    if (Number(rows[0]?.waiting ?? 0) > 0) {
+      return
+    }
+
+    if (Date.now() > deadline) {
+      throw new Error(
+        'no statement ever blocked on the ClientProfile row — the interleaving this scenario is built on did not happen'
+      )
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, 20))
+  }
+}
+
+async function observeRacedAcceptance(
+  write: ConcurrentWrite
+): Promise<RacedAcceptance> {
+  const world = await sprayedAtAProvedHousehold()
+
+  let locked: () => void = () => {}
+  const lockTaken = new Promise<void>((resolve) => {
+    locked = resolve
+  })
+
+  const holder = prisma.$transaction(
+    async (tx) => {
+      await tx.$executeRaw`
+        SELECT id FROM "ClientProfile" WHERE id = ${world.clientProfileId} FOR UPDATE
+      `
+
+      locked()
+
+      await waitForABlockedStatement()
+
+      if (write === 'the-claim') {
+        // Exactly what `declineReferralClaim` writes, held until the acceptance
+        // is already past its own read of the same columns.
+        await tx.$executeRaw`
+          UPDATE "ClientProfile"
+          SET "claimedReferralCode" = NULL, "claimedReferralCodeAt" = NULL
+          WHERE id = ${world.clientProfileId}
+        `
+      } else {
+        // The same row, the same lock, the same moment — a column the claim does
+        // not live in.
+        await tx.$executeRaw`
+          UPDATE "ClientProfile"
+          SET "preferredName" = 'Household'
+          WHERE id = ${world.clientProfileId}
+        `
+      }
+    },
+    { maxWait: 20_000, timeout: 30_000 }
+  )
+
+  await lockTaken
+
+  const accepted = await acceptAs(world.household, SPRAYED_CODE)
+
+  await holder
+
+  const swept = await sweep()
+
+  return {
+    acceptance: accepted.ok ? accepted.data.kind : `error:${accepted.code}`,
+    redemptions: await redemptionsOf(world.household.id),
+    claimAnswers: await claimAnswersOf(world.clientProfileId),
+    standingClaim: (await referralClaimOf(world.clientProfileId))?.code ?? null,
+    swept,
+    sprayerBalanceCents: await balanceCentsOf(ATTACKER.id),
+  }
+}
+
+async function scenarioClaimSwap(): Promise<{
+  readonly claimCleared: RacedAcceptance
+  readonly claimIntact: RacedAcceptance
+}> {
+  section('10. an acceptance whose claim is taken out from under it')
+
+  const claimCleared = await observeRacedAcceptance('the-claim')
+  const claimIntact = await observeRacedAcceptance('another-column')
+
+  check('the acceptance that lost the swap settles nothing', () => {
+    assert.equal(claimCleared.acceptance, 'already-answered')
+    assert.deepEqual(claimCleared.redemptions, [])
+  })
+
+  check('…writes no tombstone, so the household may try again', () => {
+    assert.deepEqual(claimCleared.claimAnswers, [])
+  })
+
+  check('…and no money follows the invoice the household already paid', () => {
+    assert.deepEqual(claimCleared.swept, NOTHING_SWEPT)
+    assert.equal(claimCleared.sprayerBalanceCents, 0)
+  })
+
+  check('the same interleaving over another column settles normally', () => {
+    assert.equal(claimIntact.acceptance, 'accepted')
+    assert.deepEqual(claimIntact.redemptions, [
+      { code: SPRAYED_CODE, status: 'REWARDED' },
+    ])
+    assert.deepEqual(claimIntact.claimAnswers, [
+      `referral-claim:accepted:${SPRAYED_CODE}`,
+    ])
+  })
+
+  check('…the claim is consumed exactly once, and the reward is paid', () => {
+    assert.equal(claimIntact.standingClaim, null)
+    assert.deepEqual(claimIntact.swept, ONE_REWARD_SWEPT)
+    assert.equal(claimIntact.sprayerBalanceCents, REWARD_CENTS)
+  })
+
+  note('Same household, same code, same blocked statement, same committed')
+  note('writer. Only the columns that writer touched differ.')
+
+  return { claimCleared, claimIntact }
+}
+
+// =============================================================================
+// 16. Scenario 11 — who may read a claim back
+// =============================================================================
+
+/**
+ * `readPendingReferralClaim` is `auth: 'SESSION'`, and its docblock says why:
+ * "a claim read back to an anonymous caller would turn the enquiry form into an
+ * oracle over which addresses we hold". Nothing had ever measured it.
+ *
+ * ## Why the read is a write here
+ *
+ * Because a refusal that returns nothing is indistinguishable from a read that
+ * returns nothing, and this harness does not conclude from return values alone.
+ * The read *does* write, in exactly one circumstance: when the tombstone and the
+ * column disagree, `discardAnsweredClaim` clears the column so the disagreement
+ * does not survive to be found again. So the scenario stages that disagreement
+ * and then asks the same question twice.
+ *
+ * The resurrection is staged with the raw client, and the shipped code says so
+ * itself: "the only way one could arise is a writer that should not exist". It
+ * is not a state any door here can reach, which is the point — it is the state
+ * the tombstone rule exists to survive.
+ *
+ * The two halves make the identical call. The property that separates them is
+ * whether the request carries a session, and the difference is visible in the
+ * column afterwards.
+ */
+interface ClaimReadObservation {
+  readonly refused: boolean
+  readonly failureCode: string
+  readonly view: PendingReferralClaimView | null
+  readonly standingClaim: string | null
+}
+
+/** Put a claim back on a file that has already answered for it. */
+async function resurrectClaim(
+  clientProfileId: string,
+  code: string
+): Promise<void> {
+  await prisma.clientProfile.update({
+    where: { id: clientProfileId },
+    data: { claimedReferralCode: code, claimedReferralCodeAt: new Date() },
+    select: { id: true },
+  })
+}
+
+/** The claim read, driven with or without a session behind it. */
+async function readClaimAs(
+  caller: HarnessUser | null
+): Promise<Awaited<ReturnType<typeof readPendingReferralClaim>>> {
+  signInAs(caller)
+  clearRateLimits()
+
+  const read = await readPendingReferralClaim({})
+
+  signInAs(null)
+
+  return read
+}
+
+async function observeResurrectedClaimRead(
+  caller: 'anonymous' | 'the-household'
+): Promise<ClaimReadObservation> {
+  const world = await sprayedAtAProvedHousehold()
+
+  const declined = await declineAs(world.household, SPRAYED_CODE)
+
+  assert.equal(
+    declined.ok && declined.data.kind,
+    'declined',
+    'the household should have been able to decline the spray'
+  )
+
+  await resurrectClaim(world.clientProfileId, SPRAYED_CODE)
+
+  const read = await readClaimAs(
+    caller === 'anonymous' ? null : world.household
+  )
+
+  return {
+    refused: !read.ok,
+    failureCode: read.ok ? '' : read.code,
+    view: read.ok ? read.data : null,
+    standingClaim: (await referralClaimOf(world.clientProfileId))?.code ?? null,
+  }
+}
+
+async function scenarioClaimReadSession(): Promise<{
+  readonly anonymous: ClaimReadObservation
+  readonly household: ClaimReadObservation
+}> {
+  section('11. the claim read, with and without a session behind it')
+
+  const anonymous = await observeResurrectedClaimRead('anonymous')
+  const household = await observeResurrectedClaimRead('the-household')
+
+  check('an anonymous caller is refused before anything is read', () => {
+    assert.equal(anonymous.refused, true)
+    assert.equal(anonymous.failureCode, 'UNAUTHENTICATED')
+    assert.equal(anonymous.view, null)
+  })
+
+  check('…and the resurrected claim is still exactly where it was', () => {
+    assert.equal(anonymous.standingClaim, SPRAYED_CODE)
+  })
+
+  check('the household’s own read answers, and answers nothing', () => {
+    assert.equal(household.refused, false)
+    assert.equal(household.view, null)
+  })
+
+  check('…having cleared the claim it had already answered for', () => {
+    assert.equal(household.standingClaim, null)
+  })
+
+  note('The same call, against the same row. One of them may touch it.')
+
+  return { anonymous, household }
+}
+
+// =============================================================================
+// 17. Scenario 12 — adoption at an OAuth door
+// =============================================================================
+
+/**
+ * `adoptUnclaimedAccount` is the narrowest possible substitute for
+ * `allowDangerousEmailAccountLinking`, and its whole value is in how narrow it
+ * is. It links a Google identity to an existing `User` row — the one operation
+ * that, done a shade too broadly, hands any account on the platform to anybody
+ * holding a Google account bearing its address.
+ *
+ * Six conditions stand between the call and the `Account` row it writes. None of
+ * them had ever been measured: the function had no harness at all, and deleting
+ * any one of its clauses left the suite green.
+ *
+ * Each case below violates **exactly one** of them, leaves the other five
+ * satisfied, and makes the identical call. The control violates none. Every case
+ * is read back through the same three columns — the placeholder's `Account`
+ * rows, its `emailVerified`, and the claim standing on its file — because "the
+ * outcome said not-applicable" and "no row was written" are different claims and
+ * only the second one is the guard.
+ */
+const GOOGLE_LINK: OAuthAccountLink = {
+  provider: 'google',
+  providerAccountId: 'harness-google-subject-0001',
+  type: 'oauth',
+  access_token: 'harness-access-token-not-a-real-credential',
+  token_type: 'bearer',
+  scope: 'openid email profile',
+}
+
+/** A second Google subject, for the row that is already linked to somebody. */
+const OTHER_GOOGLE_SUBJECT = 'harness-google-subject-0002'
+
+/** The `Account` rows a user holds, as `provider:providerAccountId`. */
+async function accountKeysOf(userId: string): Promise<readonly string[]> {
+  const rows = await prisma.account.findMany({
+    where: { userId },
+    orderBy: [{ provider: 'asc' }, { providerAccountId: 'asc' }],
+    select: { provider: true, providerAccountId: true },
+  })
+
+  return rows.map((row) => `${row.provider}:${row.providerAccountId}`)
+}
+
+async function emailVerifiedOf(userId: string): Promise<Date | null> {
+  const row = await prisma.user.findUnique({
+    where: { id: userId },
+    select: { emailVerified: true },
+  })
+
+  return row?.emailVerified ?? null
+}
+
+/** Write an `Account` row the way the Auth.js Prisma adapter would. */
+async function seedAccountLink(
+  userId: string,
+  provider: string,
+  providerAccountId: string
+): Promise<void> {
+  await prisma.account.create({
+    data: { userId, type: 'oauth', provider, providerAccountId },
+    select: { id: true },
+  })
+}
+
+/** Write a `Session` row the way the adapter would at a magic-link sign-in. */
+async function seedSessionRow(userId: string): Promise<void> {
+  await prisma.session.create({
+    data: {
+      userId,
+      sessionToken: `harness-session-${userId}`,
+      expires: new Date(Date.now() + 30 * MILLISECONDS_PER_DAY),
+    },
+    select: { id: true },
+  })
+}
+
+/** The world an adoption case acts on: a placeholder with a claim on its file. */
+interface PlaceholderWorld extends Stage {
+  readonly userId: string
+  readonly clientProfileId: string
+}
+
+async function sprayedPlaceholder(): Promise<PlaceholderWorld> {
+  const stageIds = await stage()
+
+  await sprayAnonymously(HOUSEHOLD_EMAIL, SPRAYED_CODE)
+
+  const userId = (await userIdForEmail(HOUSEHOLD_EMAIL)) ?? ''
+  const clientProfileId = (await profileIdForEmail(HOUSEHOLD_EMAIL)) ?? ''
+
+  assert.notEqual(userId, '', 'the public form did not open an account')
+
+  return { ...stageIds, userId, clientProfileId }
+}
+
+interface AdoptionObservation {
+  readonly outcome: string
+  readonly accountKeys: readonly string[]
+  readonly emailVerified: boolean
+  readonly standingClaim: string | null
+  readonly redemptions: number
+}
+
+interface AdoptionCase {
+  readonly label: string
+  readonly condition: string
+  /** The one server-side fact this case establishes before the call. */
+  readonly establish: (world: PlaceholderWorld) => Promise<void>
+  readonly expected: 'adopted' | 'not-applicable'
+  /** What the placeholder's `Account` rows must read afterwards. */
+  readonly accountKeys: readonly string[]
+}
+
+async function observeAdoption(
+  probe: AdoptionCase
+): Promise<AdoptionObservation> {
+  const world = await sprayedPlaceholder()
+
+  await probe.establish(world)
+
+  let outcome: string
+
+  try {
+    const adopted = await adoptUnclaimedAccount(HOUSEHOLD_EMAIL, GOOGLE_LINK)
+
+    outcome = adopted.kind
+  } catch (error) {
+    // Reached only by a build in which the already-linked guard is gone: the
+    // `Account` insert then meets its own unique index. Recorded rather than
+    // thrown so the transcript names the case that produced it.
+    outcome = `threw:${error instanceof Error ? error.name : 'unknown'}`
+  }
+
+  return {
+    outcome,
+    accountKeys: await accountKeysOf(world.userId),
+    emailVerified: (await emailVerifiedOf(world.userId)) !== null,
+    standingClaim: (await referralClaimOf(world.clientProfileId))?.code ?? null,
+    redemptions: await prisma.referralRedemption.count({
+      where: { referredUserId: world.userId },
+    }),
+  }
+}
+
+const ADOPTION_CASES: readonly AdoptionCase[] = [
+  {
+    label: 'a placeholder nobody has ever used',
+    condition: '(none — the control)',
+    establish: async () => {},
+    expected: 'adopted',
+    accountKeys: [`google:${GOOGLE_LINK.providerAccountId}`],
+  },
+  {
+    label: 'the Google subject already belongs to somebody',
+    condition: 'no Account holds this provider/subject pair',
+    establish: async () => {
+      await seedAccountLink(
+        PATRON.id,
+        GOOGLE_LINK.provider,
+        GOOGLE_LINK.providerAccountId
+      )
+    },
+    expected: 'not-applicable',
+    accountKeys: [],
+  },
+  {
+    label: 'the account has been closed',
+    condition: 'User.isActive',
+    establish: async (world) => {
+      signInAs(OVERSEER)
+      clearRateLimits()
+
+      const closed = await setUserActive({
+        userId: world.userId,
+        isActive: false,
+        reason: 'Closed while the address was under review.',
+      })
+
+      signInAs(null)
+
+      assert.equal(
+        closed.ok,
+        true,
+        `the concierge could not close the placeholder: ${closed.ok ? '' : closed.error}`
+      )
+    },
+    expected: 'not-applicable',
+    accountKeys: [],
+  },
+  {
+    label: 'the mailbox has already been proved',
+    condition: 'User.unclaimedSince is non-null',
+    establish: async (world) => {
+      const proved = await markMailboxProved(world.userId)
+
+      assert.equal(proved.kind, 'newly-proved')
+    },
+    expected: 'not-applicable',
+    accountKeys: [],
+  },
+  {
+    label: 'somebody has signed in as it before',
+    condition: 'User.lastLoginAt is null',
+    establish: async (world) => {
+      await prisma.user.update({
+        where: { id: world.userId },
+        data: { lastLoginAt: new Date() },
+        select: { id: true },
+      })
+    },
+    expected: 'not-applicable',
+    accountKeys: [],
+  },
+  {
+    label: 'a provider is already linked to it',
+    condition: 'the row has no Account',
+    establish: async (world) => {
+      await seedAccountLink(world.userId, 'google', OTHER_GOOGLE_SUBJECT)
+    },
+    expected: 'not-applicable',
+    accountKeys: [`google:${OTHER_GOOGLE_SUBJECT}`],
+  },
+  {
+    label: 'a session has been opened as it',
+    condition: 'the row has no Session',
+    establish: async (world) => {
+      await seedSessionRow(world.userId)
+    },
+    expected: 'not-applicable',
+    accountKeys: [],
+  },
+]
+
+async function scenarioAdoption(): Promise<
+  readonly (AdoptionCase & { readonly observed: AdoptionObservation })[]
+> {
+  section('12. adoption at an OAuth door — six conditions, one call')
+
+  const results: (AdoptionCase & { readonly observed: AdoptionObservation })[] =
+    []
+
+  for (const probe of ADOPTION_CASES) {
+    results.push({ ...probe, observed: await observeAdoption(probe) })
+  }
+
+  for (const result of results) {
+    const adopting = result.expected === 'adopted'
+
+    check(`${result.label}: the call answers ${result.expected}`, () => {
+      assert.equal(result.observed.outcome, result.expected)
+    })
+
+    check(`${result.label}: the Account rows read back as expected`, () => {
+      assert.deepEqual(result.observed.accountKeys, result.accountKeys)
+    })
+
+    check(`${result.label}: emailVerified is ${String(adopting)}`, () => {
+      assert.equal(result.observed.emailVerified, adopting)
+    })
+  }
+
+  check('and no adoption, refused or not, touches the claim', () => {
+    for (const result of results) {
+      assert.equal(result.observed.standingClaim, SPRAYED_CODE)
+      assert.equal(result.observed.redemptions, 0)
+    }
+  })
+
+  note('Proving a mailbox is not consenting to an attribution. Adoption opens')
+  note('the door; the banner still has to be answered.')
+
+  return results
+}
+
+// =============================================================================
+// 18. The report
 // =============================================================================
 
 function printReport(
@@ -2200,8 +3072,70 @@ function printClaimWindowReport(
   )
 }
 
+/**
+ * The four guards MCV-057 added cover, side by side.
+ *
+ * Each row is a pair that ran the same call from the same position; the two
+ * middle columns are what the database said afterwards. A guard whose two
+ * columns read the same would be a guard the suite cannot see.
+ */
+function printGuardReport(
+  clamp: {
+    readonly insideTheClamp: ClampObservation
+    readonly afterTheAnchor: ClampObservation
+  },
+  swap: {
+    readonly claimCleared: RacedAcceptance
+    readonly claimIntact: RacedAcceptance
+  },
+  read: {
+    readonly anonymous: ClaimReadObservation
+    readonly household: ClaimReadObservation
+  },
+  adoption: readonly (AdoptionCase & {
+    readonly observed: AdoptionObservation
+  })[]
+): void {
+  const adopted = adoption.filter(
+    (row) => row.observed.outcome === 'adopted'
+  ).length
+
+  printTable(
+    'Four guards that were prose until MCV-057, and the rows that now measure them',
+    [
+      ['guard', 'the property that differs', 'refusing half', 'contrast'],
+      [
+        'clampAnchor',
+        'when the invoice was paid',
+        `${money(clamp.insideTheClamp.sprayerBalanceCents)} to the sprayer`,
+        `${money(clamp.afterTheAnchor.sprayerBalanceCents)} to the sprayer`,
+      ],
+      [
+        'claim compare-and-swap',
+        'which columns the concurrent writer touched',
+        `${String(swap.claimCleared.redemptions.length)} redemptions`,
+        `${String(swap.claimIntact.redemptions.length)} redemptions`,
+      ],
+      [
+        'auth: SESSION on the read',
+        'whether the request carries a session',
+        `claim ${read.anonymous.standingClaim ?? '(cleared)'}`,
+        `claim ${read.household.standingClaim ?? '(cleared)'}`,
+      ],
+      [
+        'adoptUnclaimedAccount',
+        'which of six conditions was violated',
+        `${String(adoption.length - adopted)} refused`,
+        `${String(adopted)} adopted`,
+      ],
+    ],
+    '  The anchor column is money: without the clamp the left-hand run pays the\n' +
+      '  sprayer out of an invoice that predates the invitation by half a day.'
+  )
+}
+
 // =============================================================================
-// 15. Entry point
+// 19. Entry point
 // =============================================================================
 
 async function main(): Promise<void> {
@@ -2226,9 +3160,15 @@ async function main(): Promise<void> {
 
   await scenarioDegradedPlaceholder()
 
+  const clamp = await scenarioAnchorClamp()
+  const swap = await scenarioClaimSwap()
+  const claimRead = await scenarioClaimReadSession()
+  const adoption = await scenarioAdoption()
+
   printReport(noConsent, declined, accepted, legitimate)
   printPrecedenceReport(precedence.sprayFirst, precedence.genuineFirst)
   printClaimWindowReport(window.inside, window.outside)
+  printGuardReport(clamp, swap, claimRead, adoption)
 
   console.log(`\nPASS — ${String(checkCount())} assertions, 0 failures.`)
 }

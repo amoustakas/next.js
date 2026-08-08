@@ -97,7 +97,7 @@ export const EmptyState = React.forwardRef<HTMLDivElement, EmptyStateProps>(
             className={cn(
               'mb-1 flex size-11 items-center justify-center rounded-full border',
               tone === 'error'
-                ? 'border-claret/40 text-claret'
+                ? 'border-claret/40 text-claret-ink'
                 : 'border-ash text-stone'
             )}
           >

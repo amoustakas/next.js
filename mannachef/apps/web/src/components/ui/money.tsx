@@ -35,8 +35,8 @@ const moneyVariants = cva('tabular-nums whitespace-nowrap', {
       muted: 'text-parchment',
       subtle: 'text-stone',
       accent: 'text-champagne',
-      positive: 'text-sage',
-      negative: 'text-claret',
+      positive: 'text-sage-ink',
+      negative: 'text-claret-ink',
     },
     weight: {
       normal: 'font-normal',

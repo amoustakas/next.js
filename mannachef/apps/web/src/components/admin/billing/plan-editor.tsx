@@ -1963,7 +1963,7 @@ export function PlanEditor({ plans }: PlanEditorProps) {
                       type="button"
                       variant="ghost"
                       size="icon"
-                      className="text-claret hover:text-claret"
+                      className="text-claret-ink hover:text-claret-ink"
                       onClick={() => setDeleteTarget(plan)}
                       aria-label={`Remove ${plan.name}`}
                     >

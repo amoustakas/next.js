@@ -1158,10 +1158,21 @@ async function recordReferralRedemption(
     }
 
     if (outcome.kind === 'raced') {
-      // The counter moved under us, so somebody else took the seat. The
-      // transaction rolled the row back; throwing leaves `processedAt` null so
-      // Stripe's redelivery runs the whole check again against fresh rows,
-      // which is the only way this resolves correctly.
+      // The counter moved under us, so somebody else took the seat. Throwing
+      // here leaves `processedAt` null, so Stripe's redelivery runs the whole
+      // check again against fresh rows.
+      //
+      // This comment used to add "the transaction rolled the row back", and it
+      // does not: the callback above *returned* the `raced` outcome, so the
+      // transaction committed, and the row `createReferralRedemption` inserted a
+      // statement before the failed swap is already durable when this line runs.
+      // The redelivery therefore meets `ALREADY_USED` against that very row and
+      // is recorded as handled, leaving one redemption the code's
+      // `redemptionCount` never counted. See `RedemptionRacedError` in
+      // `@/server/referral-claim`, which is the shape this needs: throw from
+      // inside the callback so the insert goes back with it. Left as a named
+      // finding rather than changed in passing — it is a behaviour change to a
+      // money path and wants its own harness scenario.
       throw new Error(
         `[stripe-webhook] referral code ${referralCodeId} was taken concurrently; redemption for user ${referredUserId} will be retried.`
       )

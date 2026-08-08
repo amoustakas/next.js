@@ -236,7 +236,7 @@ export default async function PortalOverviewPage(): Promise<React.JSX.Element> {
                   <div className="flex flex-wrap items-center gap-3">
                     <SubscriptionStatusBadge status={subscription.status} />
                     {subscription.cancelAtPeriodEnd ? (
-                      <span className="font-sans text-xs text-terracotta">
+                      <span className="font-sans text-xs text-terracotta-ink">
                         Closing at the end of this period
                       </span>
                     ) : null}

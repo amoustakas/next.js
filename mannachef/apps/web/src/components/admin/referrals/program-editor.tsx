@@ -26,20 +26,27 @@
  *    `SUPER_ADMIN` for the same reason `REWARD` is — it can put credit on a
  *    balance with no earned referral behind it.
  *
- * ## Why some forms below have no `zodResolver`
+ * ## How the strict/union schemas below get a `zodResolver`
  *
  * `referralProgramUpsertSchema` and `rewardAdjustmentSchema` are, respectively,
  * a discriminated union and a schema with five `reason`-keyed cross-field
- * rules. Both are used here in full on submit — the payload handed to
- * `execute()` is built to match whichever branch or rule set applies, so the
- * server validates against the exact shared schema — but neither is wired
- * through React Hook Form's `resolver` for eager, keystroke-level checking.
- * A flat RHF value bag naturally holds keys from every branch at once (both
- * `rewardValueCents` and `rewardValuePercent`, say), which a `.strict()`
- * branch schema rejects on sight; reconciling that would mean re-deriving the
- * branch shape twice. Server-side rejection still lands exactly where it
- * would have client-side: `useAction`'s `fieldErrors` mapping sets the same
- * named field, because the field names here already match the schema's.
+ * rules, and every branch involved is `.strict()`. A flat RHF value bag
+ * naturally holds keys from every branch at once (both `rewardValueCents` and
+ * `rewardValuePercent`, say, or a `revokedReason`-shaped bag missing the
+ * `action`/`redemptionId`/`userId` a command schema requires) — a `.strict()`
+ * schema rejects the former on sight and the latter for want of a required
+ * key. So none of the three forms below hands its schema straight to
+ * `zodResolver`. Each instead runs its existing "build the exact payload"
+ * function (`buildProgramPayload`, `buildRevokePayload`,
+ * `buildAdjustmentPayload` — the same functions `execute()` uses) as a
+ * `z.transform()` in front of the real schema via `.pipe()`, the same
+ * shape-then-validate idiom `availability-editor.tsx` uses for its own
+ * strict/union rule schemas (see `ruleResolverFor` there), and asks for
+ * `raw: true` values so React Hook Form keeps working with the flat,
+ * on-screen field names rather than the transformed/piped shape. Server-side
+ * rejection still lands exactly where it would have client-side: `useAction`'s
+ * `fieldErrors` mapping sets the same named field, because the field names
+ * here already match the schema's.
  */
 
 import * as React from 'react'
@@ -54,13 +61,19 @@ import {
   Pencil,
   Wallet,
 } from 'lucide-react'
-import { useForm } from 'react-hook-form'
+import { useForm, type Resolver } from 'react-hook-form'
+import { z } from 'zod'
 
 import {
   MAX_PROGRAM_EXPIRY_DAYS,
   REFERRAL_PROGRAM_KEY,
+  referralProgramUpsertSchema,
+  referralRedemptionStatusUpdateSchema,
+  rewardAdjustmentSchema,
   type ReferralProgramUpsertRawInput,
   type ReferralRedemptionStatus,
+  type ReferralRedemptionStatusUpdateRawInput,
+  type RewardAdjustmentRawInput,
   type RewardLedgerDirection,
   type RewardLedgerReason,
   type RewardType,
@@ -68,7 +81,13 @@ import {
 
 import { Badge, type BadgeProps } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
+import {
+  Card,
+  CardContent,
+  CardDescription,
+  CardHeader,
+  CardTitle,
+} from '@/components/ui/card'
 import { CheckboxField } from '@/components/ui/checkbox'
 import {
   Dialog,
@@ -110,6 +129,7 @@ import { SwitchField } from '@/components/ui/switch'
 import { Textarea } from '@/components/ui/textarea'
 import { useAction, type DescribedActionFailure } from '@/lib/action-client'
 import { cn } from '@/lib/utils'
+import { zodResolver } from '@/lib/zod-resolver'
 import {
   recomputeRewardBalance,
   recordRewardAdjustment,
@@ -136,7 +156,9 @@ function ActionFailureNotice({
           : 'border-terracotta/60 bg-terracotta/12'
       )}
     >
-      <p className="font-sans text-sm font-semibold text-linen">{failure.title}</p>
+      <p className="font-sans text-sm font-semibold text-linen">
+        {failure.title}
+      </p>
       <p className="mt-1 font-sans text-sm leading-relaxed text-parchment">
         {failure.description}
       </p>
@@ -163,14 +185,19 @@ function GateNotice({ children }: { readonly children: React.ReactNode }) {
  * shared primitive for an editable money field (`<Money>` only renders one),
  * so every screen that edits cents re-states this same small buffer.
  */
-interface DollarsInputProps
-  extends Omit<React.ComponentPropsWithoutRef<'input'>, 'value' | 'onChange' | 'type'> {
+interface DollarsInputProps extends Omit<
+  React.ComponentPropsWithoutRef<'input'>,
+  'value' | 'onChange' | 'type'
+> {
   readonly cents: number
   readonly onCentsChange: (cents: number) => void
 }
 
 const DollarsInput = React.forwardRef<HTMLInputElement, DollarsInputProps>(
-  function DollarsInput({ cents, onCentsChange, className, onBlur, ...rest }, ref) {
+  function DollarsInput(
+    { cents, onCentsChange, className, onBlur, ...rest },
+    ref
+  ) {
     const [text, setText] = React.useState(() => (cents / 100).toFixed(2))
     const lastCommitted = React.useRef(cents)
 
@@ -297,8 +324,8 @@ export function ProgramEditor({ program, canEdit }: ProgramEditorProps) {
             Programme terms
           </CardTitle>
           <CardDescription>
-            The fixed platform terms every referral code copies its reward
-            from. No code owner chooses their own figures.
+            The fixed platform terms every referral code copies its reward from.
+            No code owner chooses their own figures.
           </CardDescription>
         </div>
         {canEdit ? (
@@ -311,8 +338,8 @@ export function ProgramEditor({ program, canEdit }: ProgramEditorProps) {
       <CardContent className="flex flex-col gap-4 p-0">
         {program === null ? (
           <p className="font-sans text-sm text-parchment">
-            No standing offer has ever been configured. Referral codes cannot
-            be minted until one exists.
+            No standing offer has ever been configured. Referral codes cannot be
+            minted until one exists.
           </p>
         ) : (
           <>
@@ -419,15 +446,19 @@ export function ProgramEditor({ program, canEdit }: ProgramEditorProps) {
         {canEdit ? null : (
           <GateNotice>
             Only Super Admins can change what a referral is worth. You&rsquo;re
-            signed in as Admin, so the terms above are visible but not
-            editable — ask a Super Admin to raise your access, or to make the
-            change on your behalf.
+            signed in as Admin, so the terms above are visible but not editable
+            — ask a Super Admin to raise your access, or to make the change on
+            your behalf.
           </GateNotice>
         )}
       </CardContent>
 
       {canEdit ? (
-        <ProgramFormDialog open={open} onOpenChange={setOpen} program={program} />
+        <ProgramFormDialog
+          open={open}
+          onOpenChange={setOpen}
+          program={program}
+        />
       ) : null}
     </Card>
   )
@@ -461,7 +492,9 @@ const PROGRAM_FIELD_PATHS = [
   'isActive',
 ] as const
 
-function defaultProgramFormValues(program: ProgramTerms | null): ProgramFormValues {
+function defaultProgramFormValues(
+  program: ProgramTerms | null
+): ProgramFormValues {
   return {
     rewardType: program?.rewardType ?? 'FIXED_CREDIT',
     rewardValueCents: program?.rewardValueCents ?? 2500,
@@ -472,13 +505,16 @@ function defaultProgramFormValues(program: ProgramTerms | null): ProgramFormValu
     defaultExpiryDays: program?.defaultExpiryDays ?? null,
     minimumQualifyingInvoiceCents: program?.minimumQualifyingInvoiceCents ?? 0,
     allowLossLeader: program?.allowLossLeader ?? false,
-    allowExistingCustomerReferral: program?.allowExistingCustomerReferral ?? false,
+    allowExistingCustomerReferral:
+      program?.allowExistingCustomerReferral ?? false,
     isActive: program?.isActive ?? true,
   }
 }
 
 /** Builds the exact discriminated-union shape `referralProgramUpsertSchema` expects. */
-function buildProgramPayload(values: ProgramFormValues): ReferralProgramUpsertRawInput {
+function buildProgramPayload(
+  values: ProgramFormValues
+): ReferralProgramUpsertRawInput {
   const common = {
     key: REFERRAL_PROGRAM_KEY,
     currency: values.currency,
@@ -506,6 +542,24 @@ function buildProgramPayload(values: ProgramFormValues): ReferralProgramUpsertRa
   }
 }
 
+/**
+ * Validates by projecting through {@link buildProgramPayload} into
+ * `referralProgramUpsertSchema`, then hands RHF back its own flat field names
+ * (`raw: true`) — see the file docblock's "How the strict/union schemas below
+ * get a `zodResolver`" section. The cast narrows the validator's declared
+ * output to the shape `raw: true` actually returns; it changes no behaviour.
+ */
+const programValidator = z
+  .custom<ProgramFormValues>()
+  .transform(buildProgramPayload)
+  .pipe(referralProgramUpsertSchema) as unknown as z.ZodType<
+  ProgramFormValues,
+  ProgramFormValues
+>
+
+const programResolver: Resolver<ProgramFormValues, unknown, ProgramFormValues> =
+  zodResolver(programValidator, { raw: true })
+
 function ProgramFormDialog({
   open,
   onOpenChange,
@@ -517,6 +571,7 @@ function ProgramFormDialog({
 }) {
   const router = useRouter()
   const form = useForm<ProgramFormValues>({
+    resolver: programResolver,
     defaultValues: defaultProgramFormValues(program),
     mode: 'onBlur',
   })
@@ -548,7 +603,10 @@ function ProgramFormDialog({
   }, [open])
 
   return (
-    <Dialog open={open} onOpenChange={(next) => (pending ? undefined : onOpenChange(next))}>
+    <Dialog
+      open={open}
+      onOpenChange={(next) => (pending ? undefined : onOpenChange(next))}
+    >
       <DialogContent className="sm:max-w-2xl">
         <DialogHeader>
           <DialogTitle>Edit the standing offer</DialogTitle>
@@ -578,18 +636,23 @@ function ProgramFormDialog({
                   render={({ field }) => (
                     <FormItem>
                       <FormLabel required>Reward type</FormLabel>
-                      <Select value={field.value} onValueChange={field.onChange}>
+                      <Select
+                        value={field.value}
+                        onValueChange={field.onChange}
+                      >
                         <FormControl>
                           <SelectTrigger>
                             <SelectValue />
                           </SelectTrigger>
                         </FormControl>
                         <SelectContent>
-                          {Object.entries(REWARD_TYPE_LABEL).map(([value, label]) => (
-                            <SelectItem key={value} value={value}>
-                              {label}
-                            </SelectItem>
-                          ))}
+                          {Object.entries(REWARD_TYPE_LABEL).map(
+                            ([value, label]) => (
+                              <SelectItem key={value} value={value}>
+                                {label}
+                              </SelectItem>
+                            )
+                          )}
                         </SelectContent>
                       </Select>
                       <FormMessage />
@@ -824,7 +887,9 @@ function ProgramFormDialog({
                       label="Allow this offer to run at a loss"
                       description="Otherwise the reward may not exceed the qualifying floor."
                       checked={field.value}
-                      onCheckedChange={(checked) => field.onChange(checked === true)}
+                      onCheckedChange={(checked) =>
+                        field.onChange(checked === true)
+                      }
                     />
                   )}
                 />
@@ -836,7 +901,9 @@ function ProgramFormDialog({
                       label="Reward winning back a former customer"
                       description="Otherwise only a household that has never paid us qualifies."
                       checked={field.value}
-                      onCheckedChange={(checked) => field.onChange(checked === true)}
+                      onCheckedChange={(checked) =>
+                        field.onChange(checked === true)
+                      }
                     />
                   )}
                 />
@@ -918,7 +985,10 @@ export interface RedemptionActionsProps {
  * are live or disabled-with-an-explanation; it changes nothing about what the
  * server will actually allow.
  */
-export function RedemptionActions({ redemption, isSuperAdmin }: RedemptionActionsProps) {
+export function RedemptionActions({
+  redemption,
+  isSuperAdmin,
+}: RedemptionActionsProps) {
   const router = useRouter()
   const [revokeOpen, setRevokeOpen] = React.useState(false)
 
@@ -927,7 +997,9 @@ export function RedemptionActions({ redemption, isSuperAdmin }: RedemptionAction
   })
 
   if (redemption.status === 'EXPIRED' || redemption.status === 'REVOKED') {
-    return <span className="font-sans text-xs text-stone">No further action</span>
+    return (
+      <span className="font-sans text-xs text-stone">No further action</span>
+    )
   }
 
   return (
@@ -940,7 +1012,10 @@ export function RedemptionActions({ redemption, isSuperAdmin }: RedemptionAction
             size="sm"
             loading={action.isPending}
             onClick={() =>
-              void action.execute({ action: 'QUALIFY', redemptionId: redemption.id })
+              void action.execute({
+                action: 'QUALIFY',
+                redemptionId: redemption.id,
+              })
             }
           >
             <CheckCircle2 aria-hidden="true" />
@@ -961,7 +1036,10 @@ export function RedemptionActions({ redemption, isSuperAdmin }: RedemptionAction
                 : 'Paying a reward is reserved to a Super Admin.'
             }
             onClick={() =>
-              void action.execute({ action: 'REWARD', redemptionId: redemption.id })
+              void action.execute({
+                action: 'REWARD',
+                redemptionId: redemption.id,
+              })
             }
           >
             <Wallet aria-hidden="true" />
@@ -969,14 +1047,18 @@ export function RedemptionActions({ redemption, isSuperAdmin }: RedemptionAction
           </Button>
         ) : null}
 
-        {redemption.status === 'PENDING' || redemption.status === 'QUALIFIED' ? (
+        {redemption.status === 'PENDING' ||
+        redemption.status === 'QUALIFIED' ? (
           <Button
             type="button"
             variant="outline"
             size="sm"
             loading={action.isPending}
             onClick={() =>
-              void action.execute({ action: 'EXPIRE', redemptionId: redemption.id })
+              void action.execute({
+                action: 'EXPIRE',
+                redemptionId: redemption.id,
+              })
             }
           >
             <Clock3 aria-hidden="true" />
@@ -988,7 +1070,7 @@ export function RedemptionActions({ redemption, isSuperAdmin }: RedemptionAction
           type="button"
           variant="ghost"
           size="sm"
-          className="text-claret hover:text-claret"
+          className="text-claret-ink hover:text-claret-ink"
           onClick={() => setRevokeOpen(true)}
         >
           <Ban aria-hidden="true" />
@@ -997,7 +1079,7 @@ export function RedemptionActions({ redemption, isSuperAdmin }: RedemptionAction
       </div>
 
       {action.failure === null ? null : (
-        <p className="mt-1.5 text-right font-sans text-xs text-claret">
+        <p className="mt-1.5 text-right font-sans text-xs text-claret-ink">
           {action.failure.description}
         </p>
       )}
@@ -1017,6 +1099,42 @@ interface RevokeFormValues {
   reverseLedgerEntry: boolean
 }
 
+/** Builds the exact shape `referralRedemptionStatusUpdateSchema`'s `REVOKE` branch expects. */
+function buildRevokePayload(
+  values: RevokeFormValues,
+  redemptionId: string,
+  isSuperAdmin: boolean
+): ReferralRedemptionStatusUpdateRawInput {
+  return {
+    action: 'REVOKE',
+    redemptionId,
+    revokedReason: values.revokedReason,
+    reverseLedgerEntry: isSuperAdmin ? values.reverseLedgerEntry : false,
+  }
+}
+
+/**
+ * Same shape-then-validate idiom as {@link programResolver}, factored per
+ * dialog instance because `redemptionId` and the `isSuperAdmin` gate on
+ * `reverseLedgerEntry` are only known once the row is.
+ */
+function revokeResolverFor(
+  redemptionId: string,
+  isSuperAdmin: boolean
+): Resolver<RevokeFormValues, unknown, RevokeFormValues> {
+  const validator = z
+    .custom<RevokeFormValues>()
+    .transform((values) =>
+      buildRevokePayload(values, redemptionId, isSuperAdmin)
+    )
+    .pipe(referralRedemptionStatusUpdateSchema) as unknown as z.ZodType<
+    RevokeFormValues,
+    RevokeFormValues
+  >
+
+  return zodResolver(validator, { raw: true })
+}
+
 function RevokeDialog({
   open,
   onOpenChange,
@@ -1032,6 +1150,7 @@ function RevokeDialog({
   const wasRewarded = redemption.status === 'REWARDED'
 
   const form = useForm<RevokeFormValues>({
+    resolver: revokeResolverFor(redemption.id, isSuperAdmin),
     defaultValues: { revokedReason: '', reverseLedgerEntry: false },
   })
 
@@ -1049,7 +1168,10 @@ function RevokeDialog({
   const pending = action.isPending
 
   return (
-    <Dialog open={open} onOpenChange={(next) => (pending ? undefined : onOpenChange(next))}>
+    <Dialog
+      open={open}
+      onOpenChange={(next) => (pending ? undefined : onOpenChange(next))}
+    >
       <DialogContent>
         <DialogHeader>
           <DialogTitle>Revoke this redemption?</DialogTitle>
@@ -1063,12 +1185,9 @@ function RevokeDialog({
           <form
             className="flex flex-col gap-4"
             onSubmit={form.handleSubmit((values) => {
-              void action.execute({
-                action: 'REVOKE',
-                redemptionId: redemption.id,
-                revokedReason: values.revokedReason,
-                reverseLedgerEntry: isSuperAdmin ? values.reverseLedgerEntry : false,
-              })
+              void action.execute(
+                buildRevokePayload(values, redemption.id, isSuperAdmin)
+              )
             })}
             noValidate
           >
@@ -1106,7 +1225,9 @@ function RevokeDialog({
                         }
                         checked={field.value}
                         disabled={!isSuperAdmin}
-                        onCheckedChange={(checked) => field.onChange(checked === true)}
+                        onCheckedChange={(checked) =>
+                          field.onChange(checked === true)
+                        }
                       />
                     </FormItem>
                   )}
@@ -1192,7 +1313,12 @@ export function BalanceTools({ userId, isSuperAdmin }: BalanceToolsProps) {
       </Button>
 
       {isSuperAdmin ? (
-        <Button type="button" variant="outline" size="sm" onClick={() => setAdjustOpen(true)}>
+        <Button
+          type="button"
+          variant="outline"
+          size="sm"
+          onClick={() => setAdjustOpen(true)}
+        >
           <Wallet aria-hidden="true" />
           Manual adjustment
         </Button>
@@ -1202,19 +1328,65 @@ export function BalanceTools({ userId, isSuperAdmin }: BalanceToolsProps) {
         </span>
       )}
 
-      <AdjustmentDialog open={adjustOpen} onOpenChange={setAdjustOpen} userId={userId} />
+      <AdjustmentDialog
+        open={adjustOpen}
+        onOpenChange={setAdjustOpen}
+        userId={userId}
+      />
     </div>
   )
 }
 
 interface AdjustmentFormValues {
   direction: RewardLedgerDirection
-  reason: Exclude<RewardLedgerReason, 'REFERRAL_REWARD' | 'REFERRAL_SIGNUP_BONUS'>
+  reason: Exclude<
+    RewardLedgerReason,
+    'REFERRAL_REWARD' | 'REFERRAL_SIGNUP_BONUS'
+  >
   amountCents: number
   currency: string
   invoiceId: string
   referralRedemptionId: string
   note: string
+}
+
+/** Builds the exact shape `rewardAdjustmentSchema` expects; `userId` is a prop, not a field. */
+function buildAdjustmentPayload(
+  values: AdjustmentFormValues,
+  userId: string
+): RewardAdjustmentRawInput {
+  return {
+    userId,
+    direction: values.direction,
+    reason: values.reason,
+    amountCents: values.amountCents,
+    currency: values.currency,
+    invoiceId:
+      values.invoiceId.trim().length > 0 ? values.invoiceId.trim() : null,
+    referralRedemptionId:
+      values.referralRedemptionId.trim().length > 0
+        ? values.referralRedemptionId.trim()
+        : null,
+    note: values.note,
+  }
+}
+
+/**
+ * Same shape-then-validate idiom as {@link programResolver}, factored per
+ * dialog instance because `userId` is only known once the account is.
+ */
+function adjustmentResolverFor(
+  userId: string
+): Resolver<AdjustmentFormValues, unknown, AdjustmentFormValues> {
+  const validator = z
+    .custom<AdjustmentFormValues>()
+    .transform((values) => buildAdjustmentPayload(values, userId))
+    .pipe(rewardAdjustmentSchema) as unknown as z.ZodType<
+    AdjustmentFormValues,
+    AdjustmentFormValues
+  >
+
+  return zodResolver(validator, { raw: true })
 }
 
 function AdjustmentDialog({
@@ -1228,6 +1400,7 @@ function AdjustmentDialog({
 }) {
   const router = useRouter()
   const form = useForm<AdjustmentFormValues>({
+    resolver: adjustmentResolverFor(userId),
     defaultValues: {
       direction: 'CREDIT',
       reason: 'MANUAL_ADJUSTMENT',
@@ -1261,13 +1434,16 @@ function AdjustmentDialog({
   const pending = action.isPending
 
   return (
-    <Dialog open={open} onOpenChange={(next) => (pending ? undefined : onOpenChange(next))}>
+    <Dialog
+      open={open}
+      onOpenChange={(next) => (pending ? undefined : onOpenChange(next))}
+    >
       <DialogContent>
         <DialogHeader>
           <DialogTitle>Record a manual ledger entry</DialogTitle>
           <DialogDescription>
-            For this account only. The ledger is append-only — this writes a
-            new row, it never edits one already recorded.
+            For this account only. The ledger is append-only — this writes a new
+            row, it never edits one already recorded.
           </DialogDescription>
         </DialogHeader>
 
@@ -1275,19 +1451,7 @@ function AdjustmentDialog({
           <form
             className="flex flex-col gap-4"
             onSubmit={form.handleSubmit((values) => {
-              void action.execute({
-                userId,
-                direction: values.direction,
-                reason: values.reason,
-                amountCents: values.amountCents,
-                currency: values.currency,
-                invoiceId: values.invoiceId.trim().length > 0 ? values.invoiceId.trim() : null,
-                referralRedemptionId:
-                  values.referralRedemptionId.trim().length > 0
-                    ? values.referralRedemptionId.trim()
-                    : null,
-                note: values.note,
-              })
+              void action.execute(buildAdjustmentPayload(values, userId))
             })}
             noValidate
           >
@@ -1303,18 +1467,23 @@ function AdjustmentDialog({
                   render={({ field }) => (
                     <FormItem>
                       <FormLabel required>Reason</FormLabel>
-                      <Select value={field.value} onValueChange={field.onChange}>
+                      <Select
+                        value={field.value}
+                        onValueChange={field.onChange}
+                      >
                         <FormControl>
                           <SelectTrigger>
                             <SelectValue />
                           </SelectTrigger>
                         </FormControl>
                         <SelectContent>
-                          {Object.entries(ADJUSTMENT_REASON_LABEL).map(([value, label]) => (
-                            <SelectItem key={value} value={value}>
-                              {label}
-                            </SelectItem>
-                          ))}
+                          {Object.entries(ADJUSTMENT_REASON_LABEL).map(
+                            ([value, label]) => (
+                              <SelectItem key={value} value={value}>
+                                {label}
+                              </SelectItem>
+                            )
+                          )}
                         </SelectContent>
                       </Select>
                       <FormMessage />
@@ -1327,7 +1496,10 @@ function AdjustmentDialog({
                   render={({ field }) => (
                     <FormItem>
                       <FormLabel required>Direction</FormLabel>
-                      <Select value={field.value} onValueChange={field.onChange}>
+                      <Select
+                        value={field.value}
+                        onValueChange={field.onChange}
+                      >
                         <FormControl>
                           <SelectTrigger>
                             <SelectValue />
@@ -1335,7 +1507,9 @@ function AdjustmentDialog({
                         </FormControl>
                         <SelectContent>
                           <SelectItem value="CREDIT">Credit — adds</SelectItem>
-                          <SelectItem value="DEBIT">Debit — subtracts</SelectItem>
+                          <SelectItem value="DEBIT">
+                            Debit — subtracts
+                          </SelectItem>
                         </SelectContent>
                       </Select>
                       <FormMessage />
@@ -1391,7 +1565,10 @@ function AdjustmentDialog({
                     <FormItem>
                       <FormLabel>Invoice ID</FormLabel>
                       <FormControl>
-                        <Input placeholder="Required for a spent credit" {...field} />
+                        <Input
+                          placeholder="Required for a spent credit"
+                          {...field}
+                        />
                       </FormControl>
                       <FormMessage />
                     </FormItem>
@@ -1404,7 +1581,10 @@ function AdjustmentDialog({
                     <FormItem>
                       <FormLabel>Redemption ID</FormLabel>
                       <FormControl>
-                        <Input placeholder="Required for a reversal" {...field} />
+                        <Input
+                          placeholder="Required for a reversal"
+                          {...field}
+                        />
                       </FormControl>
                       <FormMessage />
                     </FormItem>
@@ -1444,7 +1624,12 @@ function AdjustmentDialog({
                 >
                   Cancel
                 </Button>
-                <Button type="submit" variant="champagne" loading={pending} loadingLabel="Recording…">
+                <Button
+                  type="submit"
+                  variant="champagne"
+                  loading={pending}
+                  loadingLabel="Recording…"
+                >
                   Record entry
                 </Button>
               </DialogFooter>
@@ -1462,9 +1647,15 @@ function AdjustmentDialog({
 
 export const REDEMPTION_STATUS_META: Record<
   ReferralRedemptionStatus,
-  { readonly label: string; readonly variant: NonNullable<BadgeProps['variant']> }
+  {
+    readonly label: string
+    readonly variant: NonNullable<BadgeProps['variant']>
+  }
 > = {
-  PENDING: { label: 'Pending — awaiting qualifying invoice', variant: 'outline' },
+  PENDING: {
+    label: 'Pending — awaiting qualifying invoice',
+    variant: 'outline',
+  },
   QUALIFIED: { label: 'Qualified — ready to reward', variant: 'champagne' },
   REWARDED: { label: 'Rewarded', variant: 'success' },
   EXPIRED: { label: 'Expired', variant: 'muted' },

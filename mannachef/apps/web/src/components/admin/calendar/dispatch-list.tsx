@@ -421,7 +421,7 @@ function DispatchStop({
             aria-hidden="true"
             className={cn(
               'mt-0.5 size-4 shrink-0',
-              isCriticalConflict ? 'text-claret' : 'text-terracotta'
+              isCriticalConflict ? 'text-claret-ink' : 'text-terracotta-ink'
             )}
           />
           <p>

@@ -31,6 +31,7 @@ import type {
   SpiceLevel,
   TagKind,
 } from '@mannachef/validators'
+import type { ReviewView, StaffProfileSummary } from '@mannachef/api-contract'
 
 // =============================================================================
 // 1. The operator
@@ -118,11 +119,22 @@ export interface AdminMediaUsage {
 }
 
 /**
- * One asset in the library.
+ * The curation half of an asset, as much of it as the browser needs.
+ *
+ * Mirrors `MediaLibraryDetailView` (`src/server/actions/media.ts`), minus
+ * `provider`, `providerFileKey`, `bytes`, `checksum`, `uploadedById` and
+ * `uploadedByName`: a storage handle and an uploader's identity are
+ * infrastructure, and no admin screen renders one — see the file docblock.
+ */
+export interface AdminMediaLibraryDetailView {
+  readonly usage: AdminMediaUsage
+}
+
+/**
+ * One asset in the library, exactly as the media grid renders it.
  *
  * `providerFileKey`, `checksum` and the uploader's id are deliberately absent:
  * a storage handle is infrastructure, and no admin screen renders one.
- * `uploadedByName` is here because the library grid credits the photographer.
  */
 export interface AdminMediaAssetView {
   readonly id: string
@@ -136,12 +148,16 @@ export interface AdminMediaAssetView {
   readonly height: number | null
   readonly blurData: string | null
   readonly mimeType: string
-  readonly bytes: number | null
   readonly createdAt: Date
-  readonly uploadedByName: string | null
   readonly tags: readonly AdminTagChip[]
   /** `null` for a viewer below `CHEF_STAFF`, which the admin shell excludes. */
-  readonly usage: AdminMediaUsage | null
+  readonly library: AdminMediaLibraryDetailView | null
+}
+
+/** A page of the library, exactly as the media grid renders it. */
+export interface AdminMediaAssetListView {
+  readonly items: readonly AdminMediaAssetView[]
+  readonly meta: AdminPageMeta
 }
 
 // =============================================================================
@@ -278,7 +294,50 @@ export function formatBytes(bytes: number | null): string {
   }
 
   const unit = units[unitIndex] ?? 'B'
-  const rounded = value >= 10 || unitIndex === 0 ? Math.round(value) : Math.round(value * 10) / 10
+  const rounded =
+    value >= 10 || unitIndex === 0
+      ? Math.round(value)
+      : Math.round(value * 10) / 10
 
   return `${String(rounded)} ${unit}`
+}
+
+// =============================================================================
+// 6. Reviews
+// =============================================================================
+
+/**
+ * A review with its moderation columns, as the queue table renders it.
+ *
+ * `ReviewView` itself is already client-safe — it comes from
+ * `@mannachef/api-contract`, not a `'use server'` module — so only the
+ * moderation-only columns need restating here. Mirrors `ModeratedReviewView`
+ * in `src/server/actions/review.ts`.
+ */
+export interface AdminModeratedReviewView extends ReviewView {
+  readonly moderatedById: string | null
+  readonly moderatedByName: string | null
+  readonly moderatedAt: Date | null
+  readonly moderationNote: string | null
+  readonly menuItemName: string | null
+  readonly menuItemSlug: string | null
+  readonly staffName: string | null
+  readonly updatedAt: Date
+}
+
+// =============================================================================
+// 7. Staff
+// =============================================================================
+
+/**
+ * A chef's profile with the account columns joined on, as the roster form
+ * renders it. Mirrors `StaffRosterView` in `src/server/actions/staff.ts`;
+ * `StaffProfileSummary` is already client-safe (`@mannachef/api-contract`).
+ */
+export interface AdminStaffRosterView extends StaffProfileSummary {
+  readonly accountName: string | null
+  readonly accountEmail: string | null
+  readonly accountRole: Role
+  readonly isAccountActive: boolean
+  readonly updatedAt: Date
 }

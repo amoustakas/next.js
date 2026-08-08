@@ -1065,7 +1065,7 @@ export function MenuTable({
             aria-pressed={filters.seasonalOnly}
             onClick={toggleSeasonalOnly}
             className={
-              filters.seasonalOnly ? 'border-sage/60 text-sage' : undefined
+              filters.seasonalOnly ? 'border-sage/60 text-sage-ink' : undefined
             }
           >
             {filters.seasonalOnly ? (
@@ -1081,7 +1081,7 @@ export function MenuTable({
             aria-pressed={filters.signatureOnly}
             onClick={toggleSignatureOnly}
             className={
-              filters.signatureOnly ? 'border-sage/60 text-sage' : undefined
+              filters.signatureOnly ? 'border-sage/60 text-sage-ink' : undefined
             }
           >
             {filters.signatureOnly ? (
@@ -1299,7 +1299,7 @@ export function MenuTable({
 
           {bulkDialogAction === 'DELETE' ? (
             <div className="flex flex-col gap-3">
-              <DialogDescription className="text-claret">
+              <DialogDescription className="text-claret-ink">
                 Removing a dish cannot be undone once it is gone.
               </DialogDescription>
               <CheckboxField

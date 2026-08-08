@@ -133,7 +133,7 @@ export function ReferralShare({
             }}
           >
             {copied === 'code' ? (
-              <Check aria-hidden="true" className="size-4 text-sage" />
+              <Check aria-hidden="true" className="size-4 text-sage-ink" />
             ) : (
               <Copy aria-hidden="true" className="size-4" />
             )}
@@ -161,7 +161,7 @@ export function ReferralShare({
             }}
           >
             {copied === 'link' ? (
-              <Check aria-hidden="true" className="size-4 text-sage" />
+              <Check aria-hidden="true" className="size-4 text-sage-ink" />
             ) : (
               <Copy aria-hidden="true" className="size-4" />
             )}

@@ -473,7 +473,7 @@ function BillingDashboardSection({
                 <p className="mt-1 font-sans text-xs text-stone">
                   {outstanding.invoiceCount} outstanding
                   {outstanding.overdueInvoiceCount > 0 ? (
-                    <span className="text-claret">
+                    <span className="text-claret-ink">
                       {' '}
                       · {outstanding.overdueInvoiceCount} overdue
                     </span>

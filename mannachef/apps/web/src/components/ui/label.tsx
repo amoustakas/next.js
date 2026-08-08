@@ -19,7 +19,7 @@ const labelVariants = cva(
       tone: {
         default: 'text-linen',
         muted: 'text-parchment',
-        invalid: 'text-claret',
+        invalid: 'text-claret-ink',
       },
     },
     defaultVariants: {

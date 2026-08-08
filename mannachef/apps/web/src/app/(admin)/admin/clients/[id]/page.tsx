@@ -660,7 +660,7 @@ function ProfileHeader({
 
         {profile.status === 'CHURNED' && profile.churnReason !== null ? (
           <div className="rounded-md border border-claret/50 bg-claret/10 p-4">
-            <p className="font-sans text-xs font-medium tracking-wide text-claret uppercase">
+            <p className="font-sans text-xs font-medium tracking-wide text-claret-ink uppercase">
               Churned{' '}
               {profile.churnedAt === null ? null : (
                 <DateTime

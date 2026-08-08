@@ -26,8 +26,8 @@ const badgeVariants = cva(
       variant: {
         default: 'border-ash bg-charcoal text-parchment',
         champagne: 'border-gold/50 bg-champagne/10 text-champagne',
-        success: 'border-sage/50 bg-sage/12 text-sage',
-        warning: 'border-terracotta/50 bg-terracotta/12 text-terracotta',
+        success: 'border-sage/50 bg-sage/12 text-sage-ink',
+        warning: 'border-terracotta/50 bg-terracotta/12 text-terracotta-ink',
         destructive: 'border-claret/60 bg-claret/15 text-linen',
         muted: 'border-ash/70 bg-transparent text-stone',
         outline: 'border-stone/50 bg-transparent text-parchment',

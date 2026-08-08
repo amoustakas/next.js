@@ -26,6 +26,7 @@ import { RatingStars } from '@/components/marketing/rating-stars'
 import { ReadFailure } from '@/components/marketing/read-failure'
 import { getMenuItem, listMenuItems } from '@/server/actions/menu'
 import { listPublishedReviews } from '@/server/actions/review'
+import { readAsGuest } from '@/server/guards'
 
 /**
  * One dish.
@@ -38,12 +39,17 @@ import { listPublishedReviews } from '@/server/actions/review'
  * (`true`), so a dish published *after* the build is rendered on demand and then
  * cached — the menu is not frozen to whatever existed at deploy time.
  *
- * The enumeration is wrapped in a `try`/`catch` that falls back to `[]`. It is
- * not defensive decoration: `withAction` resolves the session through
- * `auth()` before it runs a handler, and there is no request — and therefore no
- * cookie store — during `generateStaticParams`. If that throws, the correct
- * outcome is a build that succeeds with every dish rendered on demand, not a
- * build that fails.
+ * Until MCV-072 that paragraph was a description of code that did not run. The
+ * enumeration was wrapped in a `try`/`catch` falling back to `[]`, and the
+ * fallback was not the unlikely branch — it was the only branch. `withAction`
+ * resolved a session through `auth()` before every handler, `auth()` reads the
+ * session cookie, and there is no cookie store during `generateStaticParams`,
+ * so the read failed on every build and the function returned an empty array
+ * every single time. The build reported `● /menu/[slug]` and prerendered
+ * nothing. `readAsGuest` removes the cookie read rather than catching its
+ * consequences, so the enumeration now actually enumerates and the `try`/`catch`
+ * is gone with it: a database that is genuinely unreachable at build time is a
+ * build that should fail loudly, not one that silently ships zero dish pages.
  *
  * ## Revalidation
  *
@@ -59,6 +65,15 @@ import { listPublishedReviews } from '@/server/actions/review'
  * `<Suspense>` boundary: moderation happens on a different clock from menu
  * editing, and `server/actions/review.ts` revalidates `/menu` on every
  * moderation pass.
+ *
+ * Like the enumeration above, the hour only started meaning anything with
+ * MCV-072. All three reads on this route — the dish, its reviews, and the slug
+ * list — go through `readAsGuest`, so nothing here reads a cookie and the route
+ * prerenders. A dish page has no viewer-dependent content to lose by that:
+ * the price, the story and the ingredients are the same for a signed-in guest,
+ * and the only role-sensitive field `getMenuItem` has — the draft dish an
+ * editor may read — is reached from `/admin/menu`, which does not use this
+ * page.
  */
 export const revalidate = 3600
 
@@ -75,27 +90,45 @@ interface DishPageProps {
  * `<title>` and the `<h1>` would come from two separate queries that could, in
  * principle, disagree.
  */
-const loadDish = cache(async (slug: string) => getMenuItem({ slug }))
+const loadDish = cache(async (slug: string) =>
+  readAsGuest(getMenuItem, { slug })
+)
 
+/**
+ * Every published dish, as a build-time path.
+ *
+ * `readAsGuest` is load-bearing twice over. It is what lets this run at all —
+ * there is no request scope during a build, so the session read this used to
+ * perform could only fail — and it is what makes the answer *correct*: the
+ * pages generated here are served to strangers, so they must be built from the
+ * stranger's view of the menu and nothing wider.
+ *
+ * A read failure is thrown rather than swallowed. `withAction` has already
+ * turned a Prisma error into a value by this point, so the only way to reach
+ * this branch is a database that genuinely could not answer, and a menu site
+ * built against a database that could not answer should stop the build rather
+ * than ship a `/menu/[slug]` segment with nothing behind it. That silent `[]`
+ * is precisely the failure this ticket exists to remove.
+ *
+ * `pageSize: 100` is the schema's ceiling. Past a hundred dishes the tail is
+ * rendered on first visit and then cached, which `dynamicParams` already
+ * covers — it is a cold-start cost on the least-visited pages, not a gap.
+ */
 export async function generateStaticParams(): Promise<Array<{ slug: string }>> {
-  try {
-    const result = await listMenuItems({
-      page: 1,
-      pageSize: 100,
-      sortBy: 'CURATED',
-      sortDirection: 'asc',
-    })
+  const result = await readAsGuest(listMenuItems, {
+    page: 1,
+    pageSize: 100,
+    sortBy: 'CURATED',
+    sortDirection: 'asc',
+  })
 
-    if (!result.ok) {
-      return []
-    }
-
-    return result.data.items.map((dish) => ({ slug: dish.slug }))
-  } catch {
-    // No request scope at build time means no session to resolve. Every dish
-    // is still reachable; it is simply rendered on first visit instead.
-    return []
+  if (!result.ok) {
+    throw new Error(
+      `generateStaticParams could not read the menu (${result.code}): ${result.error}`
+    )
   }
+
+  return result.data.items.map((dish) => ({ slug: dish.slug }))
 }
 
 export async function generateMetadata({
@@ -464,6 +497,11 @@ function Gallery({ dish }: { readonly dish: MenuItemDetail }): React.JSX.Element
  * A failed read renders nothing rather than an error box: reviews are an
  * embellishment on a dish page, and a claret panel where a button should be
  * would be a louder failure than the thing it is failing at.
+ *
+ * `readAsGuest` because the handler never consults `ctx.user` — the published
+ * statuses are pinned for every caller — so the session it used to resolve
+ * could not have changed a single row, and resolving it was the last cookie
+ * read standing between this route and a real prerender.
  */
 async function ReviewsAction({
   dishId,
@@ -472,7 +510,7 @@ async function ReviewsAction({
   readonly dishId: string
   readonly dishName: string
 }): Promise<React.JSX.Element | null> {
-  const result = await listPublishedReviews({
+  const result = await readAsGuest(listPublishedReviews, {
     menuItemId: dishId,
     statuses: ['APPROVED', 'FEATURED'],
     page: 1,
