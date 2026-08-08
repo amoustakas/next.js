@@ -117,8 +117,23 @@ migration that introduced the column it constrains:
 - **`0003_mcv043_referral_economics_and_requote`** — the range on
   `ChefAppointment.quotedGuestCount`, a one-off backfill, and
   `ReferralProgram_reward_economics_check` (MCV-043).
+- **`0004_mcv050_referral_claim`** — `ClientProfile.claimedReferralCode` /
+  `.claimedReferralCodeAt`, `User.unclaimedSince`, and
+  `ClientProfile_claimed_referral_pairing_check`, which keeps a claimed code and
+  the date it was claimed non-null together (MCV-050). The pairing is in SQL
+  because the date is not decoration: `settleFirstAuthenticatedSession` refuses a
+  claim older than its window, and a claim with no date could not be aged out.
+  An attribution that never lapses is the one part of that mechanism with a cost.
+- **`0005_mcv051_referral_new_money`** — `ReferralRedemption.qualifyingFromAt`
+  and `ReferralProgram.allowExistingCustomerReferral`, plus a backfill, a
+  `SET NOT NULL`, and `ReferralRedemption_qualifyingFromAt_floor_check`
+  (MCV-051). This is the only migration whose _column_ section is hand-sequenced
+  rather than verbatim `prisma migrate diff` output: `qualifyingFromAt` is
+  `NOT NULL` with no default, which cannot be added to a populated table in one
+  statement, so it arrives nullable, is backfilled from `createdAt`, and is then
+  tightened. See below for what the column is for.
 
-The last of those is the only `CHECK` in the history that is _arithmetic across
+`ReferralProgram_reward_economics_check` is the only `CHECK` in the history that is _arithmetic across
 several columns_ rather than a range on one, so it is worth saying what it
 encodes. Nothing bounds the aggregate cost of the referral programme — every
 other ceiling is per redemption — so the only thing that can keep it from being
@@ -147,6 +162,40 @@ nothing. Such rows are marked `allowLossLeader = true` rather than repaired: the
 alternatives were to raise the floor or lower the reward, and both silently
 change what an offer already in circulation pays out. Setting the flag changes
 no behaviour and states something true of the row.
+
+### The premise that constraint rests on (MCV-051)
+
+`ReferralProgram_reward_economics_check` compares what an offer pays out against
+`minimumQualifyingInvoiceCents`, and the whole argument for that being a _cost_
+is the sentence "the cost of manufacturing one referred household is a single
+PAID invoice on a **new** account". Nothing enforced the word _new_ until
+MCV-051. `findQualifyingInvoice` searched a household's entire billing history
+with no lower bound, and `resolveRedemptionEligibility` had no rule against an
+existing customer, so a two-year subscriber could accept an invitation today and
+have it settled against a bill paid long before the code existed. The invoice
+side of the inequality was then revenue the house had already booked, the cost
+of manufacturing a referred household was zero for everybody already on the
+books, and the constraint's arithmetic held while its premise did not.
+
+`ReferralRedemption.qualifyingFromAt` is that premise made checkable. It records
+the moment an invitation was accepted, and two rules hang off it: the settlement
+query bounds `paidAt` below by it, and the eligibility predicate refuses a
+household that had already paid us before it. `ReferralRedemption_qualifyingFromAt_floor_check`
+bounds how far back the anchor may reach — thirty days, matching
+`CLAIM_WINDOW_DAYS`, which is the longest an MCV-050 claim may precede the
+sign-in that settles it. There is deliberately no upper bound: an anchor later
+than `createdAt` can only refuse an invoice, never admit one, so it carries no
+money risk, and such a check would compare the application's clock against the
+database's and fail on the first millisecond of skew.
+
+`ReferralProgram.allowExistingCustomerReferral` is the way to say a win-back is
+intended, on the same terms as `allowLossLeader`: off by default, so the
+permissive branch is never chosen by a missing key. It widens who may be
+referred and never what pays for them — the anchor still bounds the qualifying
+invoice. `apps/web`'s `verify:mcv051` asserts every one of these, including the
+`CHECK` by writing around the application with the raw client, and produces its
+"before" column by running the pre-fix query out of
+`scripts/fixtures/referral-legacy.ts`.
 
 ### Regenerating or extending
 

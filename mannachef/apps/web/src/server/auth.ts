@@ -43,6 +43,27 @@
  * a role change or a deactivation takes effect on the very next request rather
  * than whenever the session happens to expire.
  *
+ * ## Signing in is the platform's only proof that a mailbox is somebody's
+ *
+ * Every other module treats an email address as a *claim*: `actions/intake.ts`
+ * takes one from an anonymous form, and `@/server/referral-eligibility` reasons
+ * about the mailbox two accounts appear to share. This file is where that claim
+ * is settled — a verified magic link or a completed OAuth exchange is the one
+ * event on the platform that says the caller controls the address.
+ *
+ * Two consequences hang off the `signIn` callback and the `signIn` event, and
+ * both are MCV-050 (see `@/server/referral-claim`):
+ *
+ *  - A `User` opened by the public intake path is marked `unclaimedSince` and has
+ *    no `Account`. Since `allowDangerousEmailAccountLinking` is `false`, Google
+ *    sign-in for that address would fail with `OAuthAccountNotLinked` for ever —
+ *    so an anonymous enquiry could deny registration to any mailbox. The `signIn`
+ *    **callback** adopts such a placeholder instead, and only such a placeholder.
+ *  - A referral code typed into a public form is stored as a string with no
+ *    financial meaning. The `signIn` **event** is where it becomes a
+ *    `ReferralRedemption`, once, through the same canonical writer every other
+ *    path uses — because until this file has run, nobody has proved anything.
+ *
  * ## Environment
  *
  * | Variable              | Effect                                            |
@@ -65,6 +86,11 @@ import { roleSchema, type Role } from '@mannachef/validators'
 import { z } from 'zod'
 
 import { prisma } from '@/server/db'
+import {
+  adoptUnclaimedAccount,
+  settleFirstAuthenticatedSession,
+  type OAuthAccountLink,
+} from '@/server/referral-claim'
 
 // =============================================================================
 // 1. The session user
@@ -253,7 +279,87 @@ function anonymousExpiredSession(): DefaultSession {
 }
 
 // =============================================================================
-// 5. Configuration
+// 5. Accounts opened for addresses nobody had proved (MCV-050)
+//
+// Both helpers are three lines of mapping onto `@/server/referral-claim`, and
+// that is on purpose. This module cannot be imported outside a Next.js runtime —
+// `next-auth` reaches `next/server` — so nothing testable may live here. The
+// decisions are in the plain server module, where `verify-referral-preemption.ts`
+// drives them against a real PostgreSQL.
+// =============================================================================
+
+/**
+ * Narrow Auth.js's `account` to the columns {@link adoptUnclaimedAccount} writes.
+ *
+ * Auth.js types `Account`'s OAuth columns as `unknown`-ish optionals carrying
+ * whatever the provider returned, so each is checked rather than asserted;
+ * anything that is not the expected primitive is simply not stored, which is the
+ * same thing the adapter would have done with it.
+ */
+function toOAuthAccountLink(account: {
+  provider: string
+  providerAccountId: string
+  type: string
+  access_token?: unknown
+  refresh_token?: unknown
+  expires_at?: unknown
+  token_type?: unknown
+  scope?: unknown
+  id_token?: unknown
+  session_state?: unknown
+}): OAuthAccountLink {
+  const text = (value: unknown): string | undefined =>
+    typeof value === 'string' ? value : undefined
+
+  return {
+    provider: account.provider,
+    providerAccountId: account.providerAccountId,
+    type: account.type,
+    access_token: text(account.access_token),
+    refresh_token: text(account.refresh_token),
+    expires_at:
+      typeof account.expires_at === 'number' ? account.expires_at : undefined,
+    token_type: text(account.token_type),
+    scope: text(account.scope),
+    id_token: text(account.id_token),
+    session_state: text(account.session_state),
+  }
+}
+
+/**
+ * Adopt an unclaimed placeholder instead of refusing the sign-in, when the
+ * caller is arriving by OAuth at an address the public intake path opened.
+ *
+ * See {@link adoptUnclaimedAccount} for what "unclaimed" has to mean before this
+ * is safe, and why it is narrower than `allowDangerousEmailAccountLinking`.
+ * Failures are swallowed: the worst case of *not* adopting is the
+ * `OAuthAccountNotLinked` page the caller would have seen anyway.
+ */
+async function adoptForOAuthSignIn(
+  email: string | null,
+  account: Parameters<typeof toOAuthAccountLink>[0] | null | undefined
+): Promise<void> {
+  if (email === null || account === null || account === undefined) {
+    return
+  }
+
+  if (account.type !== 'oauth' && account.type !== 'oidc') {
+    return
+  }
+
+  try {
+    await adoptUnclaimedAccount(email, toOAuthAccountLink(account))
+  } catch (error) {
+    console.error('[auth] failed to adopt an unclaimed account', {
+      email,
+      provider: account.provider,
+      error: error instanceof Error ? error.message : 'unknown',
+    })
+  }
+}
+
+// =============================================================================
+// 6. Configuration
 // =============================================================================
 
 export const authConfig = {
@@ -278,9 +384,18 @@ export const authConfig = {
      * Returning `true` for an unknown user is correct and not a hole: it is the
      * sign-up path, and the adapter creates the row immediately afterwards with
      * the schema default of `isActive = true`.
+     *
+     * It is also where an unclaimed placeholder is adopted (MCV-050). This
+     * callback runs *before* Auth.js's own account-linking check, so writing the
+     * `Account` row here is what turns a permanent `OAuthAccountNotLinked` — the
+     * denial of Google registration an anonymous enquiry could otherwise inflict
+     * on any address — into an ordinary sign-in. It happens after the
+     * deactivation check, so a deactivated placeholder is refused rather than
+     * adopted.
      */
-    async signIn({ user }) {
+    async signIn({ user, account }) {
       const userId = typeof user.id === 'string' ? user.id : null
+      const email = typeof user.email === 'string' ? user.email : null
 
       if (userId !== null) {
         const byId = await prisma.user.findUnique({
@@ -288,11 +403,16 @@ export const authConfig = {
           select: { isActive: true },
         })
 
-        // `null` is the sign-up path — no row yet.
-        return byId === null ? true : byId.isActive
-      }
+        // `null` is the sign-up path — no row yet. An OAuth caller reaching it
+        // may still be arriving at a placeholder somebody else's enquiry opened,
+        // which is exactly the case `adoptForOAuthSignIn` answers.
+        if (byId === null) {
+          await adoptForOAuthSignIn(email, account)
+          return true
+        }
 
-      const email = typeof user.email === 'string' ? user.email : null
+        return byId.isActive
+      }
 
       if (email === null) {
         return true
@@ -303,7 +423,17 @@ export const authConfig = {
         select: { isActive: true },
       })
 
-      return byEmail === null ? true : byEmail.isActive
+      if (byEmail === null) {
+        return true
+      }
+
+      if (!byEmail.isActive) {
+        return false
+      }
+
+      await adoptForOAuthSignIn(email, account)
+
+      return true
     },
 
     /**
@@ -361,23 +491,54 @@ export const authConfig = {
 
   events: {
     /**
-     * Stamp `User.lastLoginAt`. Purely informational — the CRM sorts dormant
-     * households by it — so a failure is logged and swallowed rather than
-     * allowed to break a sign-in that has otherwise succeeded.
+     * The moment a mailbox has been proved.
+     *
+     * This event fires after Auth.js has verified a magic link or completed an
+     * OAuth exchange, which makes it the earliest point at which the platform
+     * knows the caller controls the address — the property MCV-050 is about, and
+     * the one the `created | matched` discriminant in `actions/intake.ts` was
+     * mistaken for. Two things happen:
+     *
+     *  1. `User.lastLoginAt` is stamped. Purely informational — the CRM sorts
+     *     dormant households by it.
+     *  2. {@link settleFirstAuthenticatedSession} clears `unclaimedSince` and
+     *     settles whatever referral *claim* the household's public enquiry
+     *     recorded, by re-running the canonical eligibility predicate now and
+     *     writing through `createReferralRedemption`. A claim is a string until
+     *     it gets here; this is the only place it becomes money, and it can
+     *     become money at most once because the claim is consumed by a
+     *     compare-and-swap.
+     *
+     * Both failures are logged and swallowed rather than allowed to break a
+     * sign-in that has otherwise succeeded. A household must never be shown "try
+     * again" — which reads as a rejected sign-in — because an attribution could
+     * not be settled. The claim survives an aborted transaction, so the next
+     * sign-in settles it instead of it being silently spent.
      */
     async signIn({ user }) {
       if (typeof user.id !== 'string') {
         return
       }
 
+      const userId = user.id
+
       try {
         await prisma.user.update({
-          where: { id: user.id },
+          where: { id: userId },
           data: { lastLoginAt: new Date() },
         })
       } catch (error) {
         console.error('[auth] failed to stamp lastLoginAt', {
-          userId: user.id,
+          userId,
+          error: error instanceof Error ? error.message : 'unknown',
+        })
+      }
+
+      try {
+        await settleFirstAuthenticatedSession(userId)
+      } catch (error) {
+        console.error('[auth] failed to settle a referral claim', {
+          userId,
           error: error instanceof Error ? error.message : 'unknown',
         })
       }
@@ -392,7 +553,7 @@ export const authConfig = {
 export const { handlers, auth, signIn, signOut } = NextAuth(authConfig)
 
 // =============================================================================
-// 6. Reading the session
+// 7. Reading the session
 // =============================================================================
 
 /**

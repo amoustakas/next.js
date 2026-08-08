@@ -35,12 +35,28 @@
  *  3. `resolveIdentity` matches the victim's real `User` and returns it;
  *  4. `attachReferral` writes a `PENDING` `ReferralRedemption` naming the victim
  *     as the referred party;
- *  5. the victim already has a genuine `PAID` invoice clearing the programme's
- *     floor, so `findQualifyingInvoice` succeeds on the very next sweep and
- *     `settleReferralRedemptions` credits the attacker.
+ *  5. the victim pays a genuine `PAID` invoice clearing the programme's floor —
+ *     they are a subscriber, so this is simply their next bill — and
+ *     `findQualifyingInvoice` succeeds on the following sweep, crediting the
+ *     attacker.
  *
- * Nothing in that sequence needs the victim to do anything at all. They had
- * already paid.
+ * Nothing in that sequence needs the victim to do anything they were not
+ * already going to do.
+ *
+ * ## Step 5 used to need even less than that (MCV-051)
+ *
+ * As originally found, step 5 did not wait for a new bill: the victim's
+ * *existing* invoice, paid months before the attacker had ever heard of them,
+ * qualified the redemption, because `findQualifyingInvoice` searched the whole
+ * of a household's billing history with no lower bound. MCV-051 put that bound
+ * in — `ReferralRedemption.qualifyingFromAt` — so scenario 1 now seeds the
+ * victim's *next* invoice to reach the payout, and asserts first that the
+ * historical one alone no longer does.
+ *
+ * That is defence in depth and not a reason to relax anything here. MCV-051
+ * refuses the *money*; finding A is about the *row*, which a stranger could
+ * still cause to be written against somebody else's household, and which would
+ * still be paid the moment that household paid us again.
  *
  * ## Why the file docblock did not catch it
  *
@@ -52,6 +68,21 @@
  * written down — gives `resolveIdentity` a `'created' | 'matched'` discriminant
  * and makes `attachReferral` take the whole identity, so there is no way to
  * spell a call to it that does not carry the provenance along.
+ *
+ * ## What MCV-050 then did to the same door
+ *
+ * The `created` discriminant turned out to answer the wrong question — see
+ * `verify-referral-preemption.ts`, which is the regression for that — so the
+ * public path no longer writes a `ReferralRedemption` under **any**
+ * discriminant. It records `ClientProfile.claimedReferralCode`, a string, and
+ * `settleFirstAuthenticatedSession` writes the redemption at the household's
+ * first sign-in.
+ *
+ * This harness is unaffected in what it claims and changed in one place: a
+ * genuine newcomer (scenario 4) now proves their mailbox before the redemption
+ * appears. Every assertion about the *victim* stands exactly as it was, which is
+ * the point of keeping it — finding A must stay dead independently of the fix
+ * that came after it.
  *
  * ## How the two columns are produced
  *
@@ -72,8 +103,8 @@
  * | 1 | the exploit, pre-fix source                       | $50.00 to an unauthenticated stranger  |
  * | 2 | the exploit, shipped `requestConsultation`        | no redemption, no credit               |
  * | 3 | the exploit, shipped `submitProspectIntake`       | the second entry point is closed too   |
- * | 4 | an unknown address, shipped action                | the programme still works, and the     |
- * |   |                                                   | legacy transcription still matches     |
+ * | 4 | an unknown address, shipped action + sign-in      | the programme still works, and the     |
+ * |   |                                                   | legacy transcription still stakes      |
  * | 5 | a signed-in caller quoting a code                 | referrals go through `redeemReferralCode` |
  */
 
@@ -89,6 +120,7 @@ import {
 } from '@/server/actions/referral'
 import type { ActionResult } from '@/server/actions/types'
 import { prisma } from '@/server/db'
+import { settleFirstAuthenticatedSession } from '@/server/referral-claim'
 
 import { legacyRequestConsultation } from './fixtures/intake-legacy'
 import { signInAs } from './fixtures/harness-state'
@@ -112,9 +144,11 @@ import {
   redemptionsForCode,
   resetDatabase,
   section,
+  referralClaimOf,
   seedBareUser,
   seedHousehold,
   seedProgram,
+  userIdForEmail,
 } from './fixtures/intake-harness'
 
 // =============================================================================
@@ -255,10 +289,40 @@ async function scenarioLegacy(): Promise<ExploitOutcome> {
     assert.equal(attached[0]?.status, 'PENDING')
   })
 
+  // MCV-051. The patron's historical invoice — `PATRON_INVOICE_CENTS`, well
+  // over the floor, paid long before this hijack — no longer qualifies
+  // anything, because `findQualifyingInvoice` will not look at an invoice paid
+  // before the redemption's own `qualifyingFromAt`. Asserted before the payout
+  // rather than instead of it: this is the second lock, and finding A is about
+  // the row rather than the money.
+  const staleSweepCents = await sweep()
+  const balanceOnStaleRevenue = await balanceCentsOf(ATTACKER.id)
+
+  check('the household’s existing revenue does not pay the attacker', () => {
+    assert.equal(staleSweepCents, 0)
+    assert.equal(balanceOnStaleRevenue, 0)
+  })
+
+  // The patron does the one thing a subscriber does: they pay their next bill.
+  await prisma.invoice.create({
+    data: {
+      userId: PATRON.id,
+      amountDueCents: PATRON_INVOICE_CENTS,
+      amountPaidCents: PATRON_INVOICE_CENTS,
+      amountRemainingCents: 0,
+      subtotalCents: PATRON_INVOICE_CENTS,
+      currency: 'CAD',
+      status: 'PAID',
+      issuedAt: new Date(),
+      paidAt: new Date(),
+    },
+    select: { id: true },
+  })
+
   const creditedCents = await sweep()
   const attackerBalanceCents = await balanceCentsOf(ATTACKER.id)
 
-  check('the sweep qualifies it on the patron’s own invoice', () => {
+  check('the sweep qualifies it on the patron’s next invoice', () => {
     assert.equal(creditedCents, REWARD_CENTS)
   })
 
@@ -381,7 +445,9 @@ async function scenarioFixedProspectIntake(): Promise<void> {
     assert.equal(attackerBalanceCents, 0)
   })
 
-  note('both public call sites hand attachReferral the identity, not the id.')
+  note(
+    'both public call sites hand attachReferralClaim the identity, not the id.'
+  )
 }
 
 // =============================================================================
@@ -397,10 +463,17 @@ const NEWCOMER_EMAIL = 'iris.calloway@example.org'
  * scenarios 2 and 3 and would have quietly removed the feature. So this asks
  * for the opposite result and insists on it.
  *
+ * Since MCV-050 the "opposite result" arrives one step later: the enquiry
+ * records the code as attribution, and the redemption is written when the
+ * newcomer proves the mailbox by signing in. Both halves are asserted, because
+ * a fix that recorded the claim and then never settled it would have removed
+ * the feature just as thoroughly, only more quietly.
+ *
  * It also does the transcription check the legacy fixture's docblock promises:
- * the same enquiry is put through the pre-fix path and the shipped action, and
- * the redemption rows they write are compared. If they ever stop matching, the
- * "before" column of scenario 1 has stopped describing this codebase.
+ * the same enquiry is put through the pre-fix path, and the row it writes at
+ * claim time is compared with the row the shipped path writes at sign-in time.
+ * If the legacy path ever stops staking one, the "before" column of scenario 1
+ * has stopped describing the defect.
  */
 async function scenarioNoFalseRefusal(): Promise<void> {
   section('4. an unknown address — the programme still works')
@@ -411,23 +484,36 @@ async function scenarioNoFalseRefusal(): Promise<void> {
     consultationPayload({ email: NEWCOMER_EMAIL, referralCode: CODE })
   )
 
-  const shipped = await redemptionsForCode(shippedCodeId)
+  const atClaimTime = await redemptionsForCode(shippedCodeId)
+
+  const newcomer = await prisma.user.findUniqueOrThrow({
+    where: { email: NEWCOMER_EMAIL },
+    select: { id: true, clientProfile: { select: { id: true } } },
+  })
+
+  const claim = await referralClaimOf(newcomer.clientProfile?.id ?? '')
 
   check('the enquiry is accepted', () => {
     assert.equal(codeOf(posted), 'ok')
   })
 
-  check('a PENDING redemption IS written for the newcomer', () => {
+  check('the code is recorded as attribution, and nothing more', () => {
+    assert.deepEqual(atClaimTime, [])
+    assert.equal(claim?.code, CODE)
+  })
+
+  // The newcomer clicks the magic link in their own inbox. `events.signIn`
+  // calls exactly this.
+  await settleFirstAuthenticatedSession(newcomer.id)
+
+  const shipped = await redemptionsForCode(shippedCodeId)
+
+  check('a PENDING redemption IS written once they prove the mailbox', () => {
     assert.equal(shipped.length, 1)
     assert.equal(shipped[0]?.status, 'PENDING')
   })
 
-  const newcomer = await prisma.user.findUniqueOrThrow({
-    where: { email: NEWCOMER_EMAIL },
-    select: { id: true },
-  })
-
-  check('and it names the account this very call opened', () => {
+  check('and it names the account the enquiry opened', () => {
     assert.equal(shipped[0]?.referredUserId, newcomer.id)
   })
 
@@ -468,18 +554,23 @@ async function scenarioNoFalseRefusal(): Promise<void> {
   })
 
   const legacy = await redemptionsForCode(legacyCodeId)
+  const legacyUserId = await userIdForEmail(NEWCOMER_EMAIL)
 
   check(
-    'the pre-fix transcription still writes the same row for a new address',
+    'the pre-fix transcription still stakes the row at claim time, unprompted',
     () => {
       assert.equal(legacy.length, shipped.length)
       assert.equal(legacy[0]?.status, shipped[0]?.status)
       assert.equal(legacy[0]?.rewardCents, shipped[0]?.rewardCents)
+      assert.equal(legacy[0]?.referredUserId, legacyUserId)
     }
   )
 
   note(
-    'so scenario 1 is measuring the defect, not a fixture that has drifted away from it.'
+    'the same row, from one anonymous request and with no mailbox proved — so'
+  )
+  note(
+    'scenario 1 is measuring the defect, not a fixture that has drifted away from it.'
   )
 }
 

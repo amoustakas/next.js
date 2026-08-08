@@ -165,6 +165,13 @@ export const updateReferralProgram = withAction(
       // `ReferralProgram_reward_economics_check` refuses the write if they do
       // and it is false. See the economics note on the `ReferralProgram` model.
       allowLossLeader: input.allowLossLeader,
+      // Likewise the operator's statement, and likewise defaulted to the strict
+      // branch by the schema (MCV-051). It says this offer will reward a
+      // referral of a household that had already paid us; nothing else in this
+      // action reads it, because the rule it feeds is
+      // `resolveRedemptionEligibility`'s and stating it twice is how the two
+      // would drift.
+      allowExistingCustomerReferral: input.allowExistingCustomerReferral,
       isActive: input.isActive,
       // From the session, never from the payload.
       updatedById: ctx.user.id,

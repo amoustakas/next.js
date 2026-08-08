@@ -49,12 +49,38 @@
  * `qualifiedAt` of "now" and had consulted neither the invoice nor the floor.
  * Crediting at signup is how a referral programme becomes a faucet, and
  * stamping `QUALIFIED` at signup is the same faucet one status further along.
+ *
+ * ## What this module *does* decide, since MCV-051
+ *
+ * Whether the household is one a referral can acquire at all. That is an
+ * eligibility question and it belongs here, but it is asked against the same
+ * moment qualification is later measured from, so the two rules are duals rather
+ * than two opinions:
+ *
+ *  - here, at acceptance: a household that had *already* paid us before
+ *    {@link RedemptionEligibilityOptions.establishedAt} is refused with
+ *    `ALREADY_A_CUSTOMER`, unless the standing offer says a win-back is the
+ *    point (`ReferralProgram.allowExistingCustomerReferral`, off by default);
+ *  - later, at settlement: `findQualifyingInvoice` will not look at an invoice
+ *    paid before that same moment, which
+ *    {@link createReferralRedemption} persists as
+ *    `ReferralRedemption.qualifyingFromAt`.
+ *
+ * Neither rule existed before MCV-051, and their absence was one finding rather
+ * than two: an ACTIVE_SUBSCRIBER of two years' standing could accept an
+ * invitation minted this morning, and the settlement sweep — searching the whole
+ * of their billing history with no lower bound and taking the *earliest*
+ * qualifying invoice — would settle it against a bill paid long before the code
+ * existed. The reward was real money and the revenue behind it was money the
+ * house had already booked. Two existing customers redeeming each other's codes
+ * were both paid; the customer base could be farmed once each.
  */
 
 import { sharesEmailIdentity } from '@mannachef/validators'
 import type { ReferralRedemptionStatus } from '@mannachef/validators'
 
 import { Prisma } from '@/server/db'
+import { readExistingCustomerReferralAllowed } from '@/server/referral-program'
 
 // =============================================================================
 // 1. The rules, as values
@@ -89,6 +115,11 @@ export type RedemptionRefusal =
   | 'ALREADY_USED'
   /** This guest already has a live redemption of some other code. */
   | 'ALREADY_REFERRED'
+  /**
+   * This household had already paid us before the invitation was accepted, and
+   * the standing offer does not reward a win-back (MCV-051).
+   */
+  | 'ALREADY_A_CUSTOMER'
 
 /**
  * What a guest is told, and how the failure is classified.
@@ -139,6 +170,11 @@ export const REDEMPTION_REFUSALS: Readonly<
     code: 'VALIDATION',
     message: 'An invitation has already been accepted on this account.',
   },
+  ALREADY_A_CUSTOMER: {
+    code: 'VALIDATION',
+    message:
+      'Invitations are for households new to us, and this account has already ordered with us.',
+  },
 }
 
 // =============================================================================
@@ -176,12 +212,61 @@ export interface RedemptionEligibilityOptions {
    * deliberately the *only* rule privilege can switch off, and it is
    * deliberately not defaulted: an unprivileged path that forgot to pass it
    * would otherwise silently become the checkout route again.
+   *
+   * Note what it is not: an escape hatch for `ALREADY_A_CUSTOMER`. That rule is
+   * about the *offer*, not about a guess at who somebody is, so the only thing
+   * that switches it off is the offer saying so —
+   * `ReferralProgram.allowExistingCustomerReferral`. An administrator who wants
+   * to pay an inviter for a household that was already ours has
+   * `recordRewardAdjustment`, which is `SUPER_ADMIN` and requires a note.
    */
   readonly applyHouseholdHeuristic: boolean
+  /**
+   * The moment this invitation was accepted (MCV-051).
+   *
+   * Two things are measured against it and they have to be the same instant, or
+   * the rule that admits a household and the rule that pays it would be
+   * answering slightly different questions:
+   *
+   *  - `ALREADY_A_CUSTOMER` below asks whether anything was paid *before* it;
+   *  - {@link createReferralRedemption} persists it as
+   *    `ReferralRedemption.qualifyingFromAt`, and `findQualifyingInvoice` will
+   *    later look at nothing paid before it.
+   *
+   * It is usually simply `new Date()`, and it is required rather than defaulted
+   * to one because the two paths where it is *not* now are the two that matter.
+   * The Stripe webhook writes the redemption after the payment it is reacting
+   * to, racing the `invoice.paid` delivery that records that payment, so its
+   * anchor is the moment the Checkout session was opened. The MCV-050 claim
+   * settlement writes it at the first proved sign-in, so its anchor is when the
+   * code was typed into the enquiry form. A `new Date()` default would have
+   * quietly given both of them the wrong instant, and the Checkout one would
+   * have refused the ordinary new-customer referral about half the time.
+   *
+   * An anchor earlier than the truth widens what may qualify, so it is the
+   * direction that costs money; `createReferralRedemption` clamps how far back
+   * it may reach, and the database restates that bound.
+   */
+  readonly establishedAt: Date
+}
+
+/**
+ * An invitation this household may accept, and the moment it was accepted.
+ *
+ * The anchor travels with the verdict rather than being passed to the writer
+ * separately, so the row {@link createReferralRedemption} writes is anchored to
+ * the same instant the predicate judged it against. Handing the writer its own
+ * copy would be two statements of one fact, which is the shape this whole module
+ * exists to remove.
+ */
+export interface EligibleRedemption {
+  readonly kind: 'eligible'
+  readonly code: EligibleReferralCode
+  readonly qualifyingFromAt: Date
 }
 
 export type RedemptionEligibility =
-  | { readonly kind: 'eligible'; readonly code: EligibleReferralCode }
+  | EligibleRedemption
   | { readonly kind: 'refused'; readonly reason: RedemptionRefusal }
 
 /**
@@ -289,7 +374,56 @@ export async function resolveRedemptionEligibility(
     return refused('ALREADY_REFERRED')
   }
 
-  return { kind: 'eligible', code }
+  // Last, and last on purpose. It is the only rule that reads a table other
+  // than the three this predicate is about, and the only one whose answer
+  // depends on the standing offer rather than on the code, so a guest reaches
+  // it having already been told anything simpler that was wrong. It is also the
+  // one rule below that the *pre-flight* in `actions/billing.ts` and the webhook
+  // must agree on across a payment — see `establishedAt`.
+  if (await hasPriorCustom(tx, account.id, options.establishedAt)) {
+    if (!(await readExistingCustomerReferralAllowed(tx))) {
+      return refused('ALREADY_A_CUSTOMER')
+    }
+  }
+
+  return {
+    kind: 'eligible',
+    code,
+    qualifyingFromAt: options.establishedAt,
+  }
+}
+
+/**
+ * Had this household paid us anything before `before`?
+ *
+ * The same three conditions `findQualifyingInvoice` calls a real payment —
+ * `status = 'PAID'`, a stamped `paidAt`, and a non-zero `amountPaidCents` —
+ * because the two functions have to agree about what an invoice is or the pair
+ * of rules stops being a pair. `paidAt < before` implies the column is not null,
+ * so the `not: null` the sibling query carries would be noise here.
+ *
+ * `amountPaidCents > 0` is load-bearing rather than tidy. Stripe issues a
+ * genuine `paid` invoice for `0` at a trial start and for a fully discounted
+ * bill, and a household holding one of those has paid us nothing at all: they
+ * are exactly the new customer a referral is for, and counting that invoice as
+ * prior custom would refuse the ordinary case in the name of the hostile one.
+ */
+async function hasPriorCustom(
+  tx: Prisma.TransactionClient,
+  userId: string,
+  before: Date
+): Promise<boolean> {
+  const paid = await tx.invoice.findFirst({
+    where: {
+      userId,
+      status: 'PAID',
+      paidAt: { lt: before },
+      amountPaidCents: { gt: 0 },
+    },
+    select: { id: true },
+  })
+
+  return paid !== null
 }
 
 // =============================================================================
@@ -315,6 +449,46 @@ export type RedemptionWriteOutcome =
   | { readonly kind: 'raced' }
 
 /**
+ * How far before the redemption row its anchor may reach, in days (MCV-051).
+ *
+ * The three legitimate anchors precede the row by: nothing (the portal form),
+ * up to 24 hours (a Stripe Checkout session, which is as long as one can stay
+ * open), and up to `CLAIM_WINDOW_DAYS` (an MCV-050 claim typed into an enquiry
+ * form and settled at the first proved sign-in). Thirty days covers all three
+ * and is the figure `ReferralRedemption_qualifyingFromAt_floor_check` enforces.
+ *
+ * {@link clampAnchor} clamps to **twenty-nine**, one day inside the constraint,
+ * because the constraint compares the anchor against `createdAt` — a `now()`
+ * from the *database's* clock, evaluated a round trip after the application read
+ * its own. A claim settled at the very edge of its window would otherwise be a
+ * constraint violation rather than a redemption, decided by milliseconds of
+ * skew. The day of slack is only reachable by an anchor that is already at the
+ * outer limit of what any path produces.
+ */
+export const MAX_ANCHOR_LOOKBACK_DAYS = 30
+
+const ANCHOR_CLAMP_DAYS = MAX_ANCHOR_LOOKBACK_DAYS - 1
+
+const MILLISECONDS_PER_DAY = 24 * 60 * 60 * 1_000
+
+/**
+ * The anchor, brought forward if it reaches further back than a redemption's
+ * anchor may.
+ *
+ * Only ever moves *forward*, which is the direction that refuses invoices
+ * rather than admitting them — so a caller passing something absurd loses a
+ * payout it may have been owed and can never gain one it was not. That
+ * asymmetry is why this is a clamp and not a rejection: the alternative is
+ * throwing out of the one writer every path funnels through, over a value no
+ * guest supplied.
+ */
+function clampAnchor(anchor: Date, now: Date): Date {
+  const floor = now.getTime() - ANCHOR_CLAMP_DAYS * MILLISECONDS_PER_DAY
+
+  return anchor.getTime() < floor ? new Date(floor) : anchor
+}
+
+/**
  * Write the `PENDING` redemption and count it against the code.
  *
  * ## `PENDING`, from every path
@@ -326,6 +500,15 @@ export type RedemptionWriteOutcome =
  * null for the same reason: it is a *denormalised snapshot of the reward
  * actually paid out*, per the schema comment, and nothing has been paid out.
  *
+ * ## `qualifyingFromAt`, from every path (MCV-051)
+ *
+ * It is taken from the verdict rather than from a separate argument, so the row
+ * cannot be anchored to a moment other than the one the predicate measured
+ * prior custom against. That pairing is the whole fix: `ALREADY_A_CUSTOMER`
+ * refuses a household that had paid before this instant, and
+ * `findQualifyingInvoice` refuses an invoice paid before it, so between them
+ * every cent a referral is settled against arrived after the invitation did.
+ *
  * ## The counter
  *
  * `redemptionCount` is bumped with `updateMany` guarded on its prior value — a
@@ -335,15 +518,18 @@ export type RedemptionWriteOutcome =
  */
 export async function createReferralRedemption(
   tx: Prisma.TransactionClient,
-  code: EligibleReferralCode,
+  eligible: EligibleRedemption,
   referredUserId: string
 ): Promise<RedemptionWriteOutcome> {
+  const { code } = eligible
+
   const created = await tx.referralRedemption.create({
     data: {
       referralCodeId: code.id,
       referredUserId,
       status: 'PENDING',
       currency: code.currency,
+      qualifyingFromAt: clampAnchor(eligible.qualifyingFromAt, new Date()),
     },
     select: { id: true, status: true, currency: true },
   })

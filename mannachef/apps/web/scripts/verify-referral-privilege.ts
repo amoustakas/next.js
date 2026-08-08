@@ -700,13 +700,23 @@ async function scenarioSelfReferralAndFloor(): Promise<void> {
 
   assert.ok(redemption !== undefined, 'the redemption was not written')
 
+  // Both invoices below are dated from the redemption's own anchor rather than
+  // from a literal (MCV-051). `findQualifyingInvoice` will not look at an
+  // invoice paid before `qualifyingFromAt`, so a fixed calendar date would make
+  // this scenario stop being about the floor the moment it fell into the past —
+  // and the $1 invoice in particular has to be refused *on its amount*, which
+  // it can only demonstrate by clearing the date bound.
+  const anchor = redemption['qualifyingFromAt']
+
+  assert.ok(anchor instanceof Date, 'the redemption carries no anchor')
+
   store.invoices.push({
     id: 'cinvoicetrivial000000001',
     userId: STRANGER.id,
     status: 'PAID',
     amountPaidCents: 100,
     currency: 'CAD',
-    paidAt: new Date('2026-01-05T12:00:00Z'),
+    paidAt: new Date(anchor.getTime() + 1_000),
   })
 
   signInAs(ADMIN)
@@ -738,9 +748,14 @@ async function scenarioSelfReferralAndFloor(): Promise<void> {
       gte: PROGRAM.minimumQualifyingInvoiceCents,
       gt: 0,
     })
+    // MCV-051's half of the same shape: the lower bound on `paidAt` is the
+    // redemption's own anchor, in the WHERE clause. Asserted here for the same
+    // reason the two amount conditions are — this is the one place that reads
+    // the whole predicate.
+    assert.deepEqual((where as Row)['paidAt'], { not: null, gte: anchor })
   })
 
-  const qualifyingPaidAt = new Date('2026-02-14T19:30:00Z')
+  const qualifyingPaidAt = new Date(anchor.getTime() + 2_000)
 
   store.invoices.push({
     id: 'cinvoicedinner0000000002',

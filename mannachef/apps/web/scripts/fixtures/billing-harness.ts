@@ -261,6 +261,11 @@ export async function seedPaidInvoice(
 export interface SeedProgram {
   readonly rewardValueCents: number
   readonly minimumQualifyingInvoiceCents: number
+  /**
+   * MCV-051's win-back switch. Omitted is `false`, which is the column's
+   * default and the strict reading: an offer that pays only for acquisitions.
+   */
+  readonly allowExistingCustomerReferral?: boolean | undefined
 }
 
 export async function seedProgram(seed: SeedProgram): Promise<void> {
@@ -275,6 +280,8 @@ export async function seedProgram(seed: SeedProgram): Promise<void> {
       defaultMaxRedemptions: null,
       defaultExpiryDays: null,
       minimumQualifyingInvoiceCents: seed.minimumQualifyingInvoiceCents,
+      allowExistingCustomerReferral:
+        seed.allowExistingCustomerReferral ?? false,
       isActive: true,
     },
     select: { id: true },

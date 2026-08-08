@@ -395,6 +395,102 @@ export async function accountSnapshot(
   }
 }
 
+/**
+ * The referral attribution standing on a household's file, if any.
+ *
+ * Read straight off the columns rather than through
+ * `readPendingReferralClaim`, because a harness asserting that the public path
+ * wrote *a string and nothing else* should look at the string.
+ */
+export interface ReferralClaimSnapshot {
+  readonly code: string
+  readonly claimedAt: Date
+}
+
+export async function referralClaimOf(
+  clientProfileId: string
+): Promise<ReferralClaimSnapshot | null> {
+  const row = await prisma.clientProfile.findUnique({
+    where: { id: clientProfileId },
+    select: { claimedReferralCode: true, claimedReferralCodeAt: true },
+  })
+
+  if (
+    row === null ||
+    row.claimedReferralCode === null ||
+    row.claimedReferralCodeAt === null
+  ) {
+    return null
+  }
+
+  return { code: row.claimedReferralCode, claimedAt: row.claimedReferralCodeAt }
+}
+
+/** The `ClientProfile.id` of the household holding an address, or `null`. */
+export async function profileIdForEmail(email: string): Promise<string | null> {
+  const row = await prisma.user.findUnique({
+    where: { email },
+    select: { clientProfile: { select: { id: true } } },
+  })
+
+  return row?.clientProfile?.id ?? null
+}
+
+/** The `User.id` behind an address, or `null` when no account was opened. */
+export async function userIdForEmail(email: string): Promise<string | null> {
+  const row = await prisma.user.findUnique({
+    where: { email },
+    select: { id: true },
+  })
+
+  return row?.id ?? null
+}
+
+/**
+ * `User.unclaimedSince` — non-null while an account is a placeholder nobody has
+ * ever signed into.
+ */
+export async function unclaimedSinceOf(userId: string): Promise<Date | null> {
+  const row = await prisma.user.findUnique({
+    where: { id: userId },
+    select: { unclaimedSince: true },
+  })
+
+  return row?.unclaimedSince ?? null
+}
+
+/**
+ * Age a claim, so the lapse window can be crossed without waiting a month.
+ *
+ * The column is moved rather than the clock, because
+ * `settleFirstAuthenticatedSession` takes `now` as an argument and a harness
+ * that passed a future date would be testing its own arithmetic. This moves the
+ * *data* into the past and lets the real default `now` decide.
+ */
+export async function backdateReferralClaim(
+  clientProfileId: string,
+  claimedAt: Date
+): Promise<void> {
+  await prisma.clientProfile.update({
+    where: { id: clientProfileId },
+    data: { claimedReferralCodeAt: claimedAt },
+    select: { id: true },
+  })
+}
+
+/** How many `Account` rows a user has, and which providers they name. */
+export async function linkedProvidersOf(
+  userId: string
+): Promise<readonly string[]> {
+  const rows = await prisma.account.findMany({
+    where: { userId },
+    orderBy: [{ provider: 'asc' }],
+    select: { provider: true },
+  })
+
+  return rows.map((row) => row.provider)
+}
+
 /** The stage a household's onboarding ladder is standing on. */
 export async function onboardingStageOf(
   clientProfileId: string

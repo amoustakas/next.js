@@ -67,6 +67,7 @@ export const REFERRAL_PROGRAM_SELECT = {
   defaultExpiryDays: true,
   minimumQualifyingInvoiceCents: true,
   allowLossLeader: true,
+  allowExistingCustomerReferral: true,
   isActive: true,
   updatedById: true,
   updatedAt: true,
@@ -95,6 +96,14 @@ export interface ReferralProgramView {
    * be hiding the one field that explains them.
    */
   readonly allowLossLeader: boolean
+  /**
+   * Somebody has said, on this row, that this offer pays for winning a former
+   * customer back as well as for a new acquisition (MCV-051). Surfaced for the
+   * same reason `allowLossLeader` is: it is an acknowledgement, and a screen
+   * that hid it would be hiding the reason an existing customer's redemption
+   * was accepted.
+   */
+  readonly allowExistingCustomerReferral: boolean
   readonly isActive: boolean
   readonly updatedById: string | null
   readonly updatedAt: Date
@@ -123,6 +132,7 @@ export function toReferralProgramView(
     defaultExpiryDays: row.defaultExpiryDays,
     minimumQualifyingInvoiceCents: row.minimumQualifyingInvoiceCents,
     allowLossLeader: row.allowLossLeader,
+    allowExistingCustomerReferral: row.allowExistingCustomerReferral,
     isActive: row.isActive,
     updatedById: row.updatedById,
     updatedAt: row.updatedAt,
@@ -296,4 +306,40 @@ export async function readQualifyingFloorCents(
   })
 
   return program?.minimumQualifyingInvoiceCents ?? 0
+}
+
+// =============================================================================
+// 4. The win-back switch (MCV-051)
+// =============================================================================
+
+/**
+ * Whether this offer will reward the referral of a household that had already
+ * paid us before the invitation was accepted.
+ *
+ * `false` when no programme row exists at all, which is the same answer the
+ * column defaults to and the same direction `isActive` and `allowLossLeader`
+ * fail in: the permissive branch of a money rule is not something a missing row
+ * gets to choose. `resolveRedemptionEligibility` refuses such a household with
+ * `ALREADY_A_CUSTOMER` unless this says otherwise, on every path.
+ *
+ * Read from the row **whether or not the offer is active**, for the reason given
+ * on {@link readReferralProgramRow} and on {@link readQualifyingFloorCents}:
+ * withdrawing the offer stops new codes being minted, it does not change the
+ * terms the codes already in circulation are settled under.
+ *
+ * What it does *not* widen is what may be counted. `ReferralRedemption.
+ * qualifyingFromAt` still bounds the qualifying invoice below on every
+ * redemption, so a win-back is paid out of the invoice that won the household
+ * back and never out of the ones it paid the first time round.
+ */
+export async function readExistingCustomerReferralAllowed(
+  db: Prisma.TransactionClient,
+  key: ReferralProgramKey = REFERRAL_PROGRAM_KEY
+): Promise<boolean> {
+  const program = await db.referralProgram.findUnique({
+    where: { key },
+    select: { allowExistingCustomerReferral: true },
+  })
+
+  return program?.allowExistingCustomerReferral ?? false
 }

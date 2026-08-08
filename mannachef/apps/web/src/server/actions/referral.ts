@@ -61,6 +61,16 @@
  * | `maxRedemptions`             | `redemptionCount` may not pass it             |
  * | `expiresAt`                  | an expired invitation is not an invitation    |
  * | `isActive`                   | a withdrawn code is not redeemable            |
+ * | already a paying customer    | a referral buys an acquisition (MCV-051)      |
+ *
+ * That last row is the one that closes MCV-051's half of the finding: a
+ * household that had already paid us before the invitation was accepted is
+ * refused, because a referral rewards bringing somebody new in and not an
+ * existing customer changing hands. It is the only rule on the table an `ADMIN`
+ * cannot switch off — a win-back is a decision about the *offer*, so the only
+ * thing that permits one is `ReferralProgram.allowExistingCustomerReferral`,
+ * which is off by default. See {@link findQualifyingInvoice} for the settlement
+ * half, which refuses the money rather than the household.
  *
  * That table is not implemented here. It is
  * `resolveRedemptionEligibility` in `@/server/referral-eligibility`, which the
@@ -718,17 +728,72 @@ interface QualifyingInvoice {
 }
 
 /**
- * The referred person's **first genuinely paid, genuinely qualifying** invoice,
- * or `null`.
+ * The referred person's **first genuinely paid, genuinely qualifying** invoice
+ * *of this referral's*, or `null`.
  *
  * `status = 'PAID'` and `paidAt IS NOT NULL` together, because an invoice can
  * be marked paid by a webhook that has not yet stamped the moment, and the
- * moment is what a qualification is dated by. Ordered ascending so a household
- * with a long billing history qualifies on the invoice that actually converted
- * them rather than on their most recent one.
+ * moment is what a qualification is dated by.
  *
  * This function is the whole of the "not at signup" rule. Every path that
  * credits a referral calls it, and none of them takes the caller's word for it.
+ *
+ * ## The lower bound, and what its absence cost (MCV-051)
+ *
+ * `qualifyingFromAt` is the moment the redemption's own invitation was
+ * accepted, and it is in the `WHERE` clause: an invoice paid before it is not
+ * merely deprioritised, it is unreachable.
+ *
+ * This paragraph used to say the opposite. It argued that the ascending order
+ * was there so that "a household with a long billing history qualifies on the
+ * invoice that actually converted them rather than on their most recent one" —
+ * which is exactly backwards for a household that had already been converted,
+ * because for them the earliest invoice is the one furthest from having
+ * anything to do with the referral. With no lower bound, the query as written
+ * *searched for* the oldest revenue it could find and paid the reward against
+ * that.
+ *
+ * The exploit needed nothing hostile. An `ACTIVE_SUBSCRIBER` whose only invoice
+ * was paid two years ago signs in, calls `redeemReferralCode` with a code minted
+ * this morning, and the next sweep reports `{examined:1, qualified:1,
+ * rewarded:1, creditedCents:5000}` against that two-year-old invoice. Two
+ * existing customers redeeming each other's codes were both paid; the whole
+ * customer base could be farmed once each, out of revenue the house had already
+ * booked. Nothing in the repository acknowledged the gap, and both halves of
+ * MCV-043's economics invariant — `programEconomicsBalance` and the
+ * `ReferralProgram_reward_economics_check` constraint — rest on the qualifying
+ * invoice being money the referral brought in.
+ *
+ * The ordering survives, and now means what the old sentence claimed: among the
+ * invoices this referral could possibly have caused, the earliest is the one it
+ * converted them on. `{ id: 'asc' }` still breaks a tie so two invoices stamped
+ * the same millisecond settle deterministically.
+ *
+ * ## Why `paidAt` and not `Invoice.createdAt`
+ *
+ * Because `paidAt` is when the money arrived and `createdAt` is when a row about
+ * it was written, and the thing being bounded is revenue. The distinction is not
+ * academic: `handleInvoiceChanged` writes `paidAt` from Stripe's
+ * `status_transitions.paid_at`, so the row for a payment can be inserted minutes
+ * or (on a webhook redelivery) days after the payment itself, and `createdAt`
+ * would date a referral by our own ingestion lag. It would also be trivially
+ * loosenable — a support re-sync that recreated an invoice row would move it
+ * forward and make an ancient payment newly claimable.
+ *
+ * `paidAt` bounded below has the mirror-image risk, that a genuine conversion
+ * paid seconds *before* the redemption row exists is refused, and that case is
+ * real: the Checkout webhook writes the redemption after the payment. It is
+ * handled where it arises rather than by loosening the rule here — the anchor
+ * that path stores is the moment the Checkout session was opened, not the moment
+ * the row was written. See `ReferralRedemption.qualifyingFromAt` in
+ * `schema.prisma`.
+ *
+ * ## An old redemption cannot be re-anchored
+ *
+ * `qualifyingFromAt` is written once, by `createReferralRedemption`, and nothing
+ * updates it. A redemption that has sat `PENDING` for a year is still measured
+ * against the day its invitation was accepted, so waiting does not turn old
+ * revenue into new.
  *
  * ## The floor (MCV-030)
  *
@@ -772,13 +837,18 @@ interface QualifyingInvoice {
 async function findQualifyingInvoice(
   tx: Prisma.TransactionClient,
   referredUserId: string,
-  minimumQualifyingInvoiceCents: number
+  minimumQualifyingInvoiceCents: number,
+  qualifyingFromAt: Date
 ): Promise<QualifyingInvoice | null> {
   const invoice = await tx.invoice.findFirst({
     where: {
       userId: referredUserId,
       status: 'PAID',
-      paidAt: { not: null },
+      // `gte` and not `gt`: the boundary belongs to the referral. An invoice
+      // paid in the same instant the invitation was accepted is the Checkout
+      // conversion, which is the case this whole mechanism exists to keep
+      // paying.
+      paidAt: { not: null, gte: qualifyingFromAt },
       amountPaidCents: { gte: minimumQualifyingInvoiceCents, gt: 0 },
     },
     orderBy: [{ paidAt: 'asc' }, { id: 'asc' }],
@@ -1592,9 +1662,16 @@ export const redeemReferralCode = withAction(
         tx,
         { kind: 'code', code: input.code },
         referredUserId,
-        // `ADMIN` and above are the escape hatch when the household heuristic
-        // is simply wrong about two members of one family.
-        { applyHouseholdHeuristic: !privileged }
+        {
+          // `ADMIN` and above are the escape hatch when the household heuristic
+          // is simply wrong about two members of one family. Note that it is
+          // the only rule they can switch off: `ALREADY_A_CUSTOMER` answers to
+          // the standing offer, not to the caller's role.
+          applyHouseholdHeuristic: !privileged,
+          // The portal form is the one path where the invitation is accepted at
+          // the moment the row is written, so the anchor is simply now.
+          establishedAt: new Date(),
+        }
       )
 
       if (eligibility.kind === 'refused') {
@@ -1611,7 +1688,11 @@ export const redeemReferralCode = withAction(
       }
 
       const { code } = eligibility
-      const written = await createReferralRedemption(tx, code, referredUserId)
+      const written = await createReferralRedemption(
+        tx,
+        eligibility,
+        referredUserId
+      )
 
       if (written.kind === 'raced') {
         throw new ActionError(
@@ -1697,6 +1778,7 @@ export const settleReferralRedemptions = withAction(
             id: true,
             status: true,
             referredUserId: true,
+            qualifyingFromAt: true,
             referralCode: { select: REFERRAL_CODE_SELECT },
           },
         })
@@ -1708,7 +1790,8 @@ export const settleReferralRedemptions = withAction(
         const invoice = await findQualifyingInvoice(
           tx,
           redemption.referredUserId,
-          floorCents
+          floorCents,
+          redemption.qualifyingFromAt
         )
 
         if (invoice === null) {
@@ -1859,6 +1942,7 @@ export const updateReferralRedemption = withAction(
           id: true,
           status: true,
           referredUserId: true,
+          qualifyingFromAt: true,
           currency: true,
           rewardCents: true,
           referralCode: { select: REFERRAL_CODE_SELECT },
@@ -1884,7 +1968,8 @@ export const updateReferralRedemption = withAction(
           const invoice = await findQualifyingInvoice(
             tx,
             redemption.referredUserId,
-            floorCents
+            floorCents,
+            redemption.qualifyingFromAt
           )
 
           if (invoice === null) {
@@ -1923,7 +2008,8 @@ export const updateReferralRedemption = withAction(
           const invoice = await findQualifyingInvoice(
             tx,
             redemption.referredUserId,
-            floorCents
+            floorCents,
+            redemption.qualifyingFromAt
           )
 
           if (invoice === null) {
@@ -2260,6 +2346,7 @@ export const payReferralReward = withAction(
           id: true,
           status: true,
           referredUserId: true,
+          qualifyingFromAt: true,
           referralCode: { select: { id: true, code: true, ownerId: true } },
         },
       })
@@ -2285,7 +2372,8 @@ export const payReferralReward = withAction(
       const invoice = await findQualifyingInvoice(
         tx,
         redemption.referredUserId,
-        await readQualifyingFloorCents(tx)
+        await readQualifyingFloorCents(tx),
+        redemption.qualifyingFromAt
       )
 
       if (invoice === null) {

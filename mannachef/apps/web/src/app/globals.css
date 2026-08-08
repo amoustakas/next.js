@@ -75,6 +75,182 @@
   --duration-slow: 250ms;
 }
 
+/*
+ * Motion primitives (MCV-060).
+ *
+ * Radix drives every overlay from a `data-state` attribute, so each overlay
+ * primitive needs a named enter/exit animation rather than a transition. These
+ * live in their own `@theme` block — Tailwind merges multiple blocks — so the
+ * palette above stays exactly as the contract wrote it.
+ *
+ * Every duration is inside the 150–250 ms band from CONTRACT.md §3 and every
+ * curve is `--ease-luxe`. The `prefers-reduced-motion` block at the foot of this
+ * file collapses all of them to ~0 ms, so no component has to opt out by hand.
+ */
+@theme {
+  --animate-fade-in: mc-fade-in var(--duration-base) var(--ease-luxe);
+  --animate-fade-out: mc-fade-out var(--duration-fast) var(--ease-luxe);
+  --animate-scale-in: mc-scale-in var(--duration-base) var(--ease-luxe);
+  --animate-scale-out: mc-scale-out var(--duration-fast) var(--ease-luxe);
+  --animate-slide-in-right: mc-slide-in-right var(--duration-slow)
+    var(--ease-luxe);
+  --animate-slide-out-right: mc-slide-out-right var(--duration-base)
+    var(--ease-luxe);
+  --animate-slide-in-left: mc-slide-in-left var(--duration-slow)
+    var(--ease-luxe);
+  --animate-slide-out-left: mc-slide-out-left var(--duration-base)
+    var(--ease-luxe);
+  --animate-slide-in-top: mc-slide-in-top var(--duration-slow) var(--ease-luxe);
+  --animate-slide-out-top: mc-slide-out-top var(--duration-base)
+    var(--ease-luxe);
+  --animate-slide-in-bottom: mc-slide-in-bottom var(--duration-slow)
+    var(--ease-luxe);
+  --animate-slide-out-bottom: mc-slide-out-bottom var(--duration-base)
+    var(--ease-luxe);
+  --animate-accordion-down: mc-accordion-down var(--duration-base)
+    var(--ease-luxe);
+  --animate-accordion-up: mc-accordion-up var(--duration-base) var(--ease-luxe);
+  --animate-shimmer: mc-shimmer 1.6s var(--ease-luxe) infinite;
+  --animate-spin-slow: mc-spin 700ms linear infinite;
+
+  @keyframes mc-fade-in {
+    from {
+      opacity: 0;
+    }
+    to {
+      opacity: 1;
+    }
+  }
+  @keyframes mc-fade-out {
+    from {
+      opacity: 1;
+    }
+    to {
+      opacity: 0;
+    }
+  }
+  @keyframes mc-scale-in {
+    from {
+      opacity: 0;
+      transform: scale(0.97) translateY(-2px);
+    }
+    to {
+      opacity: 1;
+      transform: scale(1) translateY(0);
+    }
+  }
+  @keyframes mc-scale-out {
+    from {
+      opacity: 1;
+      transform: scale(1) translateY(0);
+    }
+    to {
+      opacity: 0;
+      transform: scale(0.97) translateY(-2px);
+    }
+  }
+  @keyframes mc-slide-in-right {
+    from {
+      transform: translateX(100%);
+    }
+    to {
+      transform: translateX(0);
+    }
+  }
+  @keyframes mc-slide-out-right {
+    from {
+      transform: translateX(0);
+    }
+    to {
+      transform: translateX(100%);
+    }
+  }
+  @keyframes mc-slide-in-left {
+    from {
+      transform: translateX(-100%);
+    }
+    to {
+      transform: translateX(0);
+    }
+  }
+  @keyframes mc-slide-out-left {
+    from {
+      transform: translateX(0);
+    }
+    to {
+      transform: translateX(-100%);
+    }
+  }
+  @keyframes mc-slide-in-top {
+    from {
+      transform: translateY(-100%);
+    }
+    to {
+      transform: translateY(0);
+    }
+  }
+  @keyframes mc-slide-out-top {
+    from {
+      transform: translateY(0);
+    }
+    to {
+      transform: translateY(-100%);
+    }
+  }
+  @keyframes mc-slide-in-bottom {
+    from {
+      transform: translateY(100%);
+    }
+    to {
+      transform: translateY(0);
+    }
+  }
+  @keyframes mc-slide-out-bottom {
+    from {
+      transform: translateY(0);
+    }
+    to {
+      transform: translateY(100%);
+    }
+  }
+  @keyframes mc-accordion-down {
+    from {
+      height: 0;
+      opacity: 0;
+    }
+    to {
+      height: var(--radix-accordion-content-height);
+      opacity: 1;
+    }
+  }
+  @keyframes mc-accordion-up {
+    from {
+      height: var(--radix-accordion-content-height);
+      opacity: 1;
+    }
+    to {
+      height: 0;
+      opacity: 0;
+    }
+  }
+  @keyframes mc-shimmer {
+    0% {
+      opacity: 0.45;
+    }
+    50% {
+      opacity: 0.8;
+    }
+    100% {
+      opacity: 0.45;
+    }
+  }
+  @keyframes mc-spin {
+    to {
+      transform: rotate(360deg);
+    }
+  }
+}
+
 @layer base {
   * {
     border-color: var(--color-border);

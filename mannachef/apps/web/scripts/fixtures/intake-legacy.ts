@@ -208,7 +208,15 @@ async function legacyAttachReferral(
   }
 
   await tx.referralRedemption.create({
-    data: { referralCodeId: referral.id, referredUserId, status: 'PENDING' },
+    data: {
+      referralCodeId: referral.id,
+      referredUserId,
+      status: 'PENDING',
+      // Not part of the reproduction — see the same note in `billing-legacy.ts`.
+      // The column is NOT NULL since MCV-051 and the code reproduced here
+      // predates it; without a value the row would not insert at all.
+      qualifyingFromAt: new Date(),
+    },
     select: { id: true },
   })
 }

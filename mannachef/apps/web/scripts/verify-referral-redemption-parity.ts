@@ -494,11 +494,14 @@ async function scenarioFour(
   const codeId = await stage()
 
   await deliverCheckoutCompleted(recorder, NEIGHBOUR, codeId)
-  await seedPaidInvoice(
-    NEIGHBOUR.id,
-    TRIVIAL_INVOICE_CENTS,
-    new Date('2026-03-02T12:00:00.000Z')
-  )
+
+  // Both invoices below are paid *after* the redemption the delivery above
+  // wrote, because since MCV-051 `findQualifyingInvoice` will not look at one
+  // paid before it. A fixed calendar date would make this scenario stop being
+  // about the floor the moment it fell into the past — and the trivial invoice
+  // in particular has to be refused *on its amount*, which it can only
+  // demonstrate by clearing the date bound first.
+  await seedPaidInvoice(NEIGHBOUR.id, TRIVIAL_INVOICE_CENTS, new Date())
 
   signInAs(CONCIERGE)
   clearRateLimits()
@@ -523,11 +526,9 @@ async function scenarioFour(
     assert.equal(unearned, 0)
   })
 
-  await seedPaidInvoice(
-    NEIGHBOUR.id,
-    REAL_INVOICE_CENTS,
-    new Date('2026-03-09T12:00:00.000Z')
-  )
+  const qualifyingPaidAt = new Date()
+
+  await seedPaidInvoice(NEIGHBOUR.id, REAL_INVOICE_CENTS, qualifyingPaidAt)
 
   clearRateLimits()
 
@@ -556,7 +557,7 @@ async function scenarioFour(
       assert.equal(settled?.status, 'REWARDED')
       assert.equal(
         settled?.qualifiedAt?.toISOString(),
-        '2026-03-09T12:00:00.000Z'
+        qualifyingPaidAt.toISOString()
       )
     }
   )

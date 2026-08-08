@@ -33,13 +33,26 @@
  * whether it `created` the `User` it returned or merely `matched` one that was
  * already ours.
  *
- * The enumeration below is deliberately phrased over **columns and rows both**.
- * An earlier version of this note promised only that "not one of their columns
- * is written", and {@link attachReferral} walked straight through that promise
- * by inserting a *new row* — a `ReferralRedemption` naming the matched
- * household as somebody's referee — which is money, and which an unauthenticated
- * caller could aim at any address they could guess (MCV-040 finding A). A
- * protection stated over the wrong noun is not a protection.
+ * The enumeration below is deliberately phrased over **rows and columns both**,
+ * and over **every household, including one this call opened**. Getting either
+ * of those halves wrong has cost an audit round apiece:
+ *
+ *  - An early version promised only that "not one of their columns is written".
+ *    `attachReferral` walked straight through that by inserting a *new row* — a
+ *    `ReferralRedemption` naming the matched household as somebody's referee,
+ *    which is money — aimed at any address a caller could guess (MCV-040 finding
+ *    A). A protection stated over the wrong noun is not a protection.
+ *  - The repair narrowed that row to households the same call had *created*, and
+ *    the enumeration went on describing the danger as belonging to households
+ *    that were "already ours". It does not. An address that is not ours **yet**
+ *    is somebody's mailbox all the same, and its owner may register tomorrow by
+ *    magic link and bind to the very row a stranger's enquiry opened. That is how
+ *    an anonymous caller was paid $50 for a household they had never met
+ *    (MCV-050). No public write is protected by the fact that the account is new.
+ *
+ * So the enumeration is now over what a public caller may write **at all**,
+ * whether the household is old or a second old, and the only thing that opens
+ * the door to money is a session.
  *
  *  - When the caller is signed in, the payload's email is ignored entirely for
  *    identity and the session's own `User` is used. A signed-in caller can
@@ -58,11 +71,16 @@
  *    {@link convertProspect} promoted) is the *more* fragile case, because a
  *    stranger's answers would arrive stamped `submittedAt` and would then be
  *    the allergen list a chef cooks against (MCV-040 finding D).
- *  - When the caller is anonymous and the identity is `matched`, **no row that
- *    carries money may name them**. {@link attachReferral} refuses any identity
- *    it did not just create, and takes the whole {@link ResolvedIdentity} rather
- *    than a bare id so that the refusal cannot be bypassed by a call site that
- *    forgot to ask.
+ *  - **No anonymous caller may cause a row that carries money to be written at
+ *    all** — not against a household that was already ours, and not against one
+ *    this call opened a moment ago. There is no `ReferralRedemption` on this
+ *    path any more, under any discriminant. {@link attachReferralClaim} writes
+ *    the code the prospect typed as a *string* on their own `ClientProfile`, and
+ *    `@/server/referral-claim` turns that string into a redemption at the first
+ *    sign-in that proves the mailbox, through the same canonical writer
+ *    `redeemReferralCode` uses. It still takes the whole
+ *    {@link ResolvedIdentity} rather than a bare id, because the *column* is
+ *    still somebody's and a call site must not be able to forget whose.
  *  - Row identifiers are withheld from anonymous callers — {@link
  *    ConsultationReceipt} and {@link ProspectIntakeReceipt} both carry `null`
  *    ids for them — and neither the response shape *nor its values* vary with
@@ -117,6 +135,7 @@ import {
   withAction,
   type AuthenticatedUser,
 } from '@/server/guards'
+import { recordReferralClaim } from '@/server/referral-claim'
 
 // =============================================================================
 // 0. Constants
@@ -523,19 +542,43 @@ interface ProspectContact {
  * Two answers rather than one field, and modelled as a discriminated union for
  * the reason the Stripe webhook's `Attribution` is: the difference between "we
  * opened this account a moment ago" and "this account was already ours" decides
- * whether a caller who has proved nothing may cause a row to be written naming
- * it, and a shape that could only report an id made that question invisible at
- * every call site. It stayed invisible long enough for {@link attachReferral} to
- * hand an unauthenticated stranger a paying household's referral (MCV-040
- * finding A).
+ * whether a caller who has proved nothing may write to it, and a shape that
+ * could only report an id made that question invisible at every call site.
  *
- * `clientProfileId` accompanies both, because every caller needs it; the `kind`
- * is what they must branch on before writing anything that is not theirs.
+ * ## What this discriminant is, and what it is not (MCV-050)
+ *
+ * It is a statement about **rows**: whether this transaction inserted the `User`,
+ * or found one. It is therefore the right question to ask before writing a
+ * *column* — a stranger must not scribble on a household that was already ours,
+ * and that is the promise the file docblock makes.
+ *
+ * It is **not** a statement about **consent**, and for one audit round it was
+ * read as one. The note that used to sit on `created` said: *"Nobody else has
+ * ever held this account, so there is nothing of anybody's to damage and no
+ * consent to forge."* Both halves are false. Nobody has held it **yet** — the
+ * address belongs to a person who has simply not registered with us, and who may
+ * do so tomorrow through the ordinary magic link, binding to this very row.
+ * `attachReferral` trusted that sentence and wrote a money-bearing
+ * `ReferralRedemption` against addresses nobody had proved, which is how an
+ * anonymous caller was paid $50 when a stranger they had never met signed up and
+ * settled an invoice.
+ *
+ * So nothing that carries money branches on this any more. The question that
+ * decides money is *"has this caller proved control of this mailbox?"*, it is
+ * answered by a session and not by a row count, and it is asked in
+ * `@/server/referral-claim` at the first authenticated sign-in.
+ *
+ * `clientProfileId` accompanies both, because every caller needs it.
  */
 type ResolvedIdentity =
   /**
-   * This call inserted the `User` row. Nobody else has ever held this account,
-   * so there is nothing of anybody's to damage and no consent to forge.
+   * This call inserted the `User` row, and marked it `unclaimedSince`.
+   *
+   * The account is new **to us**; the mailbox is not thereby the caller's. What
+   * follows is exactly this: no household's existing columns can be damaged,
+   * because there was no household. Nothing about ownership, consent, or the
+   * right to earn money against this address follows, and code that needs one of
+   * those must ask `@/server/referral-claim` instead.
    */
   | {
       readonly kind: 'created'
@@ -569,11 +612,48 @@ type ResolvedIdentity =
  * {@link createProspectUser} covers two submissions racing for the same
  * brand-new address — reporting `matched`, because the loser of that race read
  * a row it did not write.
+ *
+ * ## The `User` this opens is marked as a placeholder (MCV-050)
+ *
+ * `unclaimedSince` is stamped on every account this function creates, and is
+ * cleared by `settleFirstAuthenticatedSession` at the first sign-in that proves
+ * the mailbox. It is what makes "an account nobody has ever authenticated into"
+ * a thing the platform can *see* rather than infer, and two decisions turn on it:
+ * such a row may be adopted by an OAuth sign-in instead of colliding with it
+ * (`adoptUnclaimedAccount` — see below), and it is the account state in which a
+ * referral claim is still only a string.
+ *
+ * ## Why a `User` is opened at all for an address nobody has proved
+ *
+ * It was reconsidered for MCV-050, because opening one has a cost: a placeholder
+ * has no `Account`, `allowDangerousEmailAccountLinking` is `false`, and Auth.js
+ * therefore refuses a later Google sign-in for that address with
+ * `OAuthAccountNotLinked` — so typing an address into a public form could deny
+ * its owner registration, permanently.
+ *
+ * Holding the prospect without a `User` would be structurally cleaner, and it is
+ * not affordable here: `User` is this schema's identity spine. `Invoice`,
+ * `UserSubscription`, `PaymentHistory`, `RewardBalance`, `Review` and
+ * `ReferralRedemption` are all keyed on `User`, not on `ClientProfile`, and
+ * {@link convertProspect} promotes a prospect *into* those tables. Making
+ * `ClientProfile.userId` nullable to defer it would put a nullable identity
+ * behind ~225 references across ten server modules and nine `user: { select … }`
+ * traversals, every one of which would have to answer "and what if this
+ * household has no account yet" — a far larger surface than the harm being
+ * removed, and one no test in this repository covers.
+ *
+ * So the row is opened, and the harm is closed where it actually lands:
+ * `adoptUnclaimedAccount` in `@/server/referral-claim` links the OAuth account to
+ * a placeholder that has no `Account`, no `Session` and no `lastLoginAt`, instead
+ * of refusing it. That is narrower than the provider flag by exactly the property
+ * that makes the flag dangerous — it applies only to rows no human has ever
+ * exercised.
  */
 async function resolveIdentity(
   tx: Prisma.TransactionClient,
   sessionUserId: string | null,
-  contact: ProspectContact
+  contact: ProspectContact,
+  now: Date
 ): Promise<ResolvedIdentity> {
   const existingUser =
     sessionUserId !== null
@@ -600,7 +680,7 @@ async function resolveIdentity(
       return { kind, userId, clientProfileId: existingUser.clientProfile.id }
     }
   } else {
-    const opened = await createProspectUser(tx, contact)
+    const opened = await createProspectUser(tx, contact, now)
 
     userId = opened.userId
     kind = opened.kind
@@ -637,7 +717,8 @@ interface OpenedProspectUser {
 
 async function createProspectUser(
   tx: Prisma.TransactionClient,
-  contact: ProspectContact
+  contact: ProspectContact,
+  now: Date
 ): Promise<OpenedProspectUser> {
   try {
     const created = await tx.user.create({
@@ -647,6 +728,11 @@ async function createProspectUser(
         // A prospect is a `CLIENT`. Nothing on the public path mints a role.
         role: 'CLIENT',
         phone: contact.phone ?? null,
+        // Nobody has proved this mailbox. See `unclaimedSince` in
+        // `schema.prisma` and `resolveIdentity`'s note above: this is the
+        // difference between an account and a placeholder, and it is what a
+        // later real sign-in adopts.
+        unclaimedSince: now,
       },
       select: { id: true },
     })
@@ -1010,75 +1096,72 @@ async function logEnquiry(
 }
 
 /**
- * Attach the code the prospect typed, when it is one that is genuinely open
- * **and the household it would name is one this very call opened**.
+ * Record the code the prospect typed, as **attribution and not as money**
+ * (MCV-050).
  *
- * ## Why the identity, and not an id (MCV-040 finding A)
+ * ## What used to be here, and why it kept being a finding
  *
- * This function inserts a `ReferralRedemption`, and a `ReferralRedemption` is
- * money: `settleReferralRedemptions` credits the code's owner as soon as the
- * named household has a paid invoice clearing the programme's floor. Both
- * callers are `auth: 'PUBLIC'`, and both reach here with whatever
- * {@link resolveIdentity} made of an *unproved* email address.
+ * `attachReferral`. It inserted a `ReferralRedemption`, which is money: the
+ * settlement sweep credits the code's owner as soon as the named household has a
+ * paid invoice clearing the programme's floor. Both callers are `auth: 'PUBLIC'`,
+ * so an unauthenticated stranger reached it with nothing but an email address
+ * they had typed.
  *
- * So a `CLIENT` could mint one code, and then — with no session, no password
- * and no access to the mailbox — post the public consultation form carrying a
- * paying household's address and their own code. The victim was `matched`, the
- * redemption was written naming the victim as referee, the victim's own genuine
- * invoice qualified it, and the next settlement sweep paid the attacker. The
- * enumeration at the head of this file promised that nothing of a matched
- * household's is written; it said *columns*, and this wrote a *row*.
+ * It was guarded twice, and both guards were the same mistake in different
+ * clothes:
  *
- * The refusal therefore lives here rather than at the two call sites, and the
- * parameter is the whole {@link ResolvedIdentity} rather than a `userId`: there
- * is no way to spell a call to this function that does not carry the provenance
- * with it, so a third caller added later cannot forget to check.
+ *  - It first took a bare `userId`, so nothing at the call site said whose
+ *    account it was. A `CLIENT` could mint a code and post a *paying household's*
+ *    address with it; the victim's own invoice qualified the redemption and the
+ *    next sweep paid the attacker (MCV-040 finding A).
+ *  - It was then narrowed to identities of kind `created` — accounts the same
+ *    transaction had inserted. So the attacker named an address that **did not
+ *    exist yet**. `resolveIdentity` created it, reported `created`, the guard was
+ *    satisfied, and the money arrived when the real owner of that mailbox signed
+ *    up through the ordinary magic link and paid.
  *
- * A signed-in caller is refused too, and that is deliberate rather than
- * incidental. Their identity is `matched` — a session proves they own the
- * account, not that it is new — and the *audited* way for an account that
- * already exists to accept an invitation is `redeemReferralCode`, which applies
- * six rules this path has none of: expiry with a reason, the owner-identity
- * check, `sharesEmailIdentity` against plus-addressed aliases, one live
- * redemption per account, and an honest error when any of them refuses. A
- * silent second door into the same table is worth less than that door.
+ * Both guards ask about **rows**. Neither asks the question that decides money,
+ * which is whether the caller has **proved control of the mailbox**. Narrowing a
+ * guard that asks the wrong question produces a narrower wrong answer.
+ *
+ * ## What happens instead
+ *
+ * The public path writes a string. `ClientProfile.claimedReferralCode` sits
+ * beside `source` and `sourceDetail` — the other two columns recording where a
+ * household says it came from — and carries no redemption, no ledger entry and no
+ * movement of `ReferralCode.redemptionCount`. It becomes a `ReferralRedemption`
+ * in `settleFirstAuthenticatedSession`, at the first sign-in that proves the
+ * mailbox, through the one canonical writer. `@/server/referral-claim` is where
+ * that is argued, including what it does not buy.
+ *
+ * ## There is no cap, expiry or owner check here, on purpose
+ *
+ * `attachReferral` carried all three. Every one of them is gone rather than
+ * disabled, because a check whose outcome cannot change anything is the exact
+ * shape MCV-040 finding B was: `attachReferral` compared `redemptionCount`
+ * against `maxRedemptions` and then wrote the redemption **without moving the
+ * counter**, so the comparison was against zero for every caller, for ever — and
+ * it read as a cap for two audits. Nothing is written here that a cap could
+ * bound, an expiry could stale, or an owner could be wronged by; the settlement
+ * asks all three at the one moment their answers bind.
  *
  * ## Nothing about the outcome reaches the caller
  *
- * A code that is expired, spent, refused or simply not ours produces no
- * redemption and no message. Telling a stranger which codes are live would turn
- * the enquiry form into a way to harvest them.
+ * Unchanged, and for the unchanged reason. The claim is recorded silently
+ * whatever the code turns out to be: telling a stranger which codes are live
+ * would turn the enquiry form into a way to harvest them.
  *
- * ## The cap binds (MCV-040 finding B)
+ * ## Only for a household this call opened
  *
- * `redemptionCount` is incremented here, by the same compare-and-swap
- * `redeemReferralCode` uses and inside the same transaction as the insert.
- * Before that it was only ever *read*: `maxRedemptions` was compared against a
- * counter this path never moved, so a code capped at five accepted an unbounded
- * number of redemptions through the public form while its counter sat at zero.
- * A comparison against a number nobody updates is not a cap.
- *
- * The bump is taken **before** the insert, so a lost compare-and-swap costs a
- * refused referral rather than a counter that disagrees with the rows. It is
- * conditioned on the exact value that was read, so two enquiries racing for a
- * code's last place cannot both take it.
- *
- * `status` stays `PENDING`: qualification is the growth ledger's transition to
- * make, and it makes it against a paid invoice.
- *
- * ## Two checks that are now belt-and-braces, and are labelled as such
- *
- * `ownerId: { not: referredUserId }` and the `existing` lookup were both live
- * controls when this function could be pointed at any account. Once the
- * identity must be one this transaction opened, neither can fire: an account
- * created seconds ago owns no codes and has redeemed nothing. They are kept
- * because they cost one indexed read and would matter again the moment somebody
- * widens the guard above — but they are *not* what makes this function safe,
- * and nobody reading it should think they are. The cap is different: fresh
- * email addresses are free, so it is still load-bearing, which is why it was
- * repaired rather than deleted.
+ * The identity, not a bare id, and `created` only — not because a claim is
+ * dangerous, but because a column on a `ClientProfile` belongs to that
+ * `ClientProfile`. The rule at the head of this file is that a public submission
+ * writes neither a row nor a column of a household that was already ours, and an
+ * attribution column is a column. A signed-in caller is refused for the reason
+ * they always were: the audited door for an account that already exists is
+ * `redeemReferralCode`.
  */
-async function attachReferral(
+async function attachReferralClaim(
   tx: Prisma.TransactionClient,
   identity: ResolvedIdentity,
   code: string,
@@ -1088,70 +1171,7 @@ async function attachReferral(
     return
   }
 
-  const referredUserId = identity.userId
-
-  const referral = await tx.referralCode.findFirst({
-    where: {
-      code,
-      isActive: true,
-      ownerId: { not: referredUserId },
-      OR: [{ expiresAt: null }, { expiresAt: { gt: now } }],
-    },
-    select: {
-      id: true,
-      currency: true,
-      maxRedemptions: true,
-      redemptionCount: true,
-    },
-  })
-
-  if (referral === null) {
-    return
-  }
-
-  if (
-    referral.maxRedemptions !== null &&
-    referral.redemptionCount >= referral.maxRedemptions
-  ) {
-    return
-  }
-
-  const existing = await tx.referralRedemption.findUnique({
-    where: {
-      referralCodeId_referredUserId: {
-        referralCodeId: referral.id,
-        referredUserId,
-      },
-    },
-    select: { id: true },
-  })
-
-  if (existing !== null) {
-    return
-  }
-
-  // Compare-and-swap on the counter's prior value, exactly as
-  // `redeemReferralCode` does. A concurrent enquiry that took the same place
-  // leaves `count` at zero here, and this enquiry attaches nothing — silently,
-  // because silence is this function's whole contract with the caller.
-  const bumped = await tx.referralCode.updateMany({
-    where: { id: referral.id, redemptionCount: referral.redemptionCount },
-    data: { redemptionCount: { increment: 1 } },
-  })
-
-  if (bumped.count !== 1) {
-    return
-  }
-
-  await tx.referralRedemption.create({
-    data: {
-      referralCodeId: referral.id,
-      referredUserId,
-      status: 'PENDING',
-      currency: referral.currency,
-    },
-    select: { id: true },
-  })
+  await recordReferralClaim(tx, identity.clientProfileId, code, now)
 }
 
 /** The earliest of the times the prospect offered. */
@@ -1214,12 +1234,16 @@ async function requireHouseholdAccess(
  * Ask for a consultation. No account required.
  *
  * Writes, in one transaction: the `User` and `ClientProfile` **only if they do
- * not already exist**, an `OnboardingFlow` moved to `CONSULTATION_SCHEDULED`
- * when the ladder permits it, a `ConsultationInterview` for the earliest time
+ * not already exist** — and if they did not, the `User` is marked
+ * `unclaimedSince` — an `OnboardingFlow` moved to `CONSULTATION_SCHEDULED` when
+ * the ladder permits it, a `ConsultationInterview` for the earliest time
  * offered, an `InteractionLog` recording the enquiry and the consent that came
- * with it, and — silently, when the code is live **and this call is what opened
- * the account** — a pending `ReferralRedemption`. {@link attachReferral} says
- * why that last condition is not negotiable.
+ * with it, and — silently, on a profile this call opened — the referral code as
+ * an *attribution string*.
+ *
+ * It writes **no `ReferralRedemption`**, which is the whole of MCV-050.
+ * {@link attachReferralClaim} says why a public form may not, whatever it knows
+ * about the account.
  *
  * See the note at the head of this file for why an anonymous caller receives no
  * row identifiers and why the reply does not vary with whether we already knew
@@ -1249,14 +1273,19 @@ export const requestConsultation = withAction(
     }
 
     const receipt = await ctx.db.$transaction(async (tx) => {
-      const identity = await resolveIdentity(tx, sessionUserId, {
-        fullName: input.fullName,
-        email: input.email,
-        phone: input.phone,
-        preferredContactMethod: input.preferredContactMethod,
-        source: input.source,
-        sourceDetail: input.sourceDetail,
-      })
+      const identity = await resolveIdentity(
+        tx,
+        sessionUserId,
+        {
+          fullName: input.fullName,
+          email: input.email,
+          phone: input.phone,
+          preferredContactMethod: input.preferredContactMethod,
+          source: input.source,
+          sourceDetail: input.sourceDetail,
+        },
+        now
+      )
 
       const consultation = await openConsultation(
         tx,
@@ -1284,9 +1313,11 @@ export const requestConsultation = withAction(
       )
 
       if (input.referralCode !== undefined) {
-        // The identity, not the id: {@link attachReferral} refuses anything it
-        // did not just create, and it is handed the evidence to decide with.
-        await attachReferral(tx, identity, input.referralCode, now)
+        // A string on this household's own file, and nothing else. No
+        // redemption, no counter, no ledger — see {@link attachReferralClaim}
+        // and `@/server/referral-claim`. The identity rather than the id,
+        // because the column belongs to whoever the profile does.
+        await attachReferralClaim(tx, identity, input.referralCode, now)
       }
 
       return consultation
@@ -1375,14 +1406,19 @@ export const submitProspectIntake = withAction(
     }
 
     const outcome = await ctx.db.$transaction(async (tx) => {
-      const identity = await resolveIdentity(tx, sessionUserId, {
-        fullName: input.contact.fullName,
-        email: input.contact.email,
-        phone: input.contact.phone,
-        preferredContactMethod: input.contact.preferredContactMethod,
-        source: input.contact.source,
-        sourceDetail: input.contact.sourceDetail,
-      })
+      const identity = await resolveIdentity(
+        tx,
+        sessionUserId,
+        {
+          fullName: input.contact.fullName,
+          email: input.contact.email,
+          phone: input.contact.phone,
+          preferredContactMethod: input.contact.preferredContactMethod,
+          source: input.contact.source,
+          sourceDetail: input.contact.sourceDetail,
+        },
+        now
+      )
 
       const onFile = await tx.clientIntakeForm.findUnique({
         where: { clientProfileId: identity.clientProfileId },
@@ -1471,12 +1507,13 @@ export const submitProspectIntake = withAction(
       )
 
       if (input.contact.referralCode !== undefined) {
-        // The identity, not the id — see {@link attachReferral}. Reaching this
-        // statement does not by itself mean the identity is new: a signed-in
-        // caller writes their own questionnaire here and is `matched`, and the
-        // refusal that keeps their referral on the audited path lives inside
-        // the callee rather than in a condition somebody has to remember.
-        await attachReferral(tx, identity, input.contact.referralCode, now)
+        // The identity, not the id — see {@link attachReferralClaim}. Reaching
+        // this statement does not by itself mean the identity is new: a
+        // signed-in caller writes their own questionnaire here and is
+        // `matched`, and the refusal that keeps their referral on the audited
+        // path lives inside the callee rather than in a condition somebody has
+        // to remember.
+        await attachReferralClaim(tx, identity, input.contact.referralCode, now)
       }
 
       return {

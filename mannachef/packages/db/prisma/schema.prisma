@@ -84,6 +84,29 @@ model User {
   lastLoginAt   DateTime?
   deactivatedAt DateTime?
 
+  /// Set when this row was opened by the **public intake path** for an address
+  /// whose owner had not proved control of it, and cleared the first time a real
+  /// sign-in binds to it (MCV-050).
+  ///
+  /// Non-null means *placeholder*: a stranger typed this address into the
+  /// consultation form, so an account exists that nobody has ever authenticated
+  /// into. Two things read it.
+  ///
+  ///  1. `adoptUnclaimedAccount` in `apps/web/src/server/referral-claim.ts`.
+  ///     Because a placeholder has no `Account` row and
+  ///     `allowDangerousEmailAccountLinking` is `false`, the genuine owner
+  ///     arriving by Google OAuth would otherwise meet `OAuthAccountNotLinked`
+  ///     for ever — an anonymous caller could deny Google registration to any
+  ///     address on earth. A row nobody has ever signed into holds nothing of
+  ///     anybody's, so it is safe (and only then) to link the OAuth account to
+  ///     it rather than refuse.
+  ///  2. `settleFirstAuthenticatedSession`, which treats the transition from
+  ///     non-null to null as "this mailbox has now been proved".
+  ///
+  /// It is deliberately a timestamp rather than a boolean: how long an account
+  /// has sat unclaimed is what an operator needs in order to sweep them up.
+  unclaimedSince DateTime?
+
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
@@ -129,6 +152,7 @@ model User {
 
   @@index([role, isActive])
   @@index([createdAt])
+  @@index([unclaimedSince])
 }
 
 /// Auth.js v5 Prisma adapter model — field names are dictated by the adapter
@@ -216,6 +240,34 @@ model ClientProfile {
 
   preferredContactMethod ContactMethod @default(EMAIL)
 
+  /// The invitation code somebody typed into a **public** form, held as plain
+  /// attribution (MCV-050).
+  ///
+  /// This is a string, not money. It has no row in `ReferralRedemption`, no
+  /// entry in `RewardLedgerEntry`, and it moves no `ReferralCode.redemptionCount`
+  /// — so writing it costs nobody anything and a caller who has proved nothing
+  /// cannot make it cost anybody anything. It sits beside `source` and
+  /// `sourceDetail`, which are the other two columns recording where a household
+  /// said it came from, and it is exactly as load-bearing as they are.
+  ///
+  /// It becomes a `ReferralRedemption` only in `settleFirstAuthenticatedSession`
+  /// (`apps/web/src/server/referral-claim.ts`), at the first sign-in that proves
+  /// this mailbox, through the same `resolveRedemptionEligibility` +
+  /// `createReferralRedemption` pair every other path uses. That function
+  /// **consumes** the claim — it compare-and-swaps both columns back to `NULL` —
+  /// so a claim can be settled at most once.
+  ///
+  /// Only the intake path that *opened* this profile ever writes it: a public
+  /// form may not put a column on a household that was already ours, which is
+  /// the rule the intake file docblock states over rows and columns both.
+  claimedReferralCode String? @db.VarChar(40)
+
+  /// When {@link claimedReferralCode} was typed. Non-null exactly when the code
+  /// is (`ClientProfile_claimed_referral_pairing_check`), because a claim with no
+  /// date could not be aged out and a stale attribution is the part of this
+  /// mechanism with a cost.
+  claimedReferralCodeAt DateTime?
+
   lifetimeValueCents Int    @default(0)
   currency           String @default("CAD") @db.VarChar(3)
 
@@ -242,6 +294,7 @@ model ClientProfile {
   @@index([status, lastContactedAt])
   @@index([source])
   @@index([createdAt])
+  @@index([claimedReferralCode])
 }
 
 /// A chef / culinary staff member who can be booked.
@@ -1044,6 +1097,34 @@ enum RewardLedgerReason {
 /// cheapest form of the abuse, because the column *defaults* to 0 — an offer
 /// switched on before anybody thought about the floor paid out real money for
 /// an invoice of nothing. It is now either refused, or acknowledged.
+///
+/// ## What the inequality above silently assumed (MCV-051)
+///
+/// "The whole cost of manufacturing one is a single PAID invoice on a new
+/// account" is the premise of every line above, and until MCV-051 nothing
+/// enforced the words *new account*. `findQualifyingInvoice` searched the
+/// referred household's whole billing history with no lower bound, and
+/// `resolveRedemptionEligibility` had no rule against an existing customer, so
+/// an ACTIVE_SUBSCRIBER of two years' standing could accept an invitation today
+/// and the sweep would settle it against an invoice paid long before the code
+/// existed. The invoice side of the inequality was then not a cost at all — it
+/// was revenue the house had already booked — and the cost of manufacturing a
+/// referred household was zero for every household already on the books. Two
+/// existing customers redeeming each other's codes were both paid out of money
+/// neither of them had just spent.
+///
+/// Two rules close it, and they are duals of one another around a single
+/// moment — `ReferralRedemption.qualifyingFromAt`, the instant the invitation
+/// was accepted:
+///
+///   - nothing paid *before* that moment may qualify the referral
+///     (`findQualifyingInvoice`), and
+///   - a household that had already paid us *before* that moment may not accept
+///     the invitation at all (`resolveRedemptionEligibility`), unless
+///     `allowExistingCustomerReferral` says a win-back is the point.
+///
+/// Together they restore the premise: every cent on the invoice side of the
+/// inequality arrived after the referral existed.
 model ReferralProgram {
   id  String @id @default(cuid())
   key String @unique @default("default") @db.VarChar(40)
@@ -1081,6 +1162,28 @@ model ReferralProgram {
   /// records that somebody chose it: a loss leader is a legitimate way to buy
   /// growth, and the point of this column is that it can never be an accident.
   allowLossLeader Boolean @default(false)
+
+  /// Whether this offer will reward the referral of a household that has
+  /// already paid us (MCV-051). False — the default — refuses the redemption
+  /// outright, with ALREADY_A_CUSTOMER, on every path: a referral buys an
+  /// acquisition, and an existing customer changing hands is not one.
+  ///
+  /// True is the win-back offer: a household that lapsed and was brought back
+  /// by somebody's invitation is a real acquisition of real revenue, and a
+  /// business may legitimately want to pay for it. Dormancy is deliberately not
+  /// measured — there is no "lapsed" state on ClientProfile that means the same
+  /// thing to everybody — so this column says only that prior custom is not
+  /// disqualifying, and the operator who ticks it is saying they know that.
+  ///
+  /// It never widens what may be *counted*. `qualifyingFromAt` still bounds the
+  /// qualifying invoice below on every redemption, win-back or not, so even an
+  /// offer with this set is paid out of money that arrived after the invitation
+  /// was accepted. The flag decides who may be referred, never what pays for it.
+  ///
+  /// Off by default for the same reason `isActive` and `allowLossLeader` are:
+  /// the permissive branch of a money rule is not something a missing key
+  /// should choose.
+  allowExistingCustomerReferral Boolean @default(false)
 
   /// Off by default: an unconfigured platform makes no standing offer, and a
   /// CLIENT asking for a code while it is off is refused rather than given
@@ -1130,10 +1233,48 @@ model ReferralCode {
   @@index([isActive, expiresAt])
 }
 
+/// One household's acceptance of one invitation code.
+///
+/// ## `qualifyingFromAt` — the moment the referral started existing (MCV-051)
+///
+/// The earliest `Invoice.paidAt` that may qualify this redemption.
+/// `findQualifyingInvoice` puts it in the WHERE clause, so an invoice paid
+/// before it is not merely unpreferred, it is unreachable — which is the point:
+/// until MCV-051 the search had no lower bound at all, and a customer of long
+/// standing could accept an invitation today and have it settled against an
+/// invoice paid years ago. A referral is paid on money the invitation brought
+/// in, and this column is the line between that money and the money the house
+/// already had.
+///
+/// It is *not* `createdAt`, and the difference is the Checkout path. There the
+/// row is written by the `checkout.session.completed` webhook, which arrives
+/// after the payment it is telling us about and races the `invoice.paid`
+/// delivery that records it; anchoring on `createdAt` would refuse the ordinary
+/// new-customer referral roughly half the time, depending on which webhook won.
+/// So each writer states the moment the invitation was actually accepted:
+///
+///   - the portal form (`redeemReferralCode`) — now, the redemption instant;
+///   - the Checkout webhook — `session.created`, when the guest opened the
+///     session carrying the code, which is before any money moved;
+///   - the MCV-050 claim settlement — `ClientProfile.claimedReferralCodeAt`,
+///     when the code was typed into the enquiry form.
+///
+/// Required rather than defaulted, so a future writer has to say which moment
+/// it means. `ReferralRedemption_qualifyingFromAt_floor_check` in the
+/// `0005_mcv051_referral_new_money` migration bounds it below at 30 days before
+/// `createdAt` — the MCV-050 claim window, which is the longest any of the three
+/// moments can legitimately precede the row. There is deliberately no upper
+/// bound: an anchor in the future can only ever refuse an invoice, never admit
+/// one, so it carries no money risk and a constraint on it would be a clock-skew
+/// failure waiting to happen.
 model ReferralRedemption {
   id             String @id @default(cuid())
   referralCodeId String
   referredUserId String
+
+  /// The moment this invitation was accepted; see the note on the model. No
+  /// invoice paid before it may qualify this redemption.
+  qualifyingFromAt DateTime
 
   status        ReferralRedemptionStatus @default(PENDING)
   qualifiedAt   DateTime?

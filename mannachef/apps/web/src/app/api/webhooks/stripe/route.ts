@@ -1032,10 +1032,46 @@ async function handleCheckoutCompleted(
     referralCodeId.length > 0 &&
     session.payment_status !== 'unpaid'
   ) {
-    await recordReferralRedemption(referralCodeId, userId)
+    await recordReferralRedemption(
+      referralCodeId,
+      userId,
+      checkoutOpenedAt(session, eventCreatedAt)
+    )
   }
 
   return HANDLED
+}
+
+/**
+ * When the guest committed to this invitation code — the moment the Checkout
+ * session carrying it was opened (MCV-051).
+ *
+ * This is the anchor `resolveRedemptionEligibility` measures prior custom
+ * against and `createReferralRedemption` stores as
+ * `ReferralRedemption.qualifyingFromAt`, and on this path it must *not* be
+ * "now". This handler runs after the payment it is reacting to, and it races
+ * the `invoice.paid` delivery that records that payment: anchoring to the
+ * redemption's own creation would make the invoice that *is* the conversion
+ * look like revenue predating the referral, roughly half the time, depending on
+ * which webhook happened to arrive first. `session.created` is before any money
+ * moved and is therefore the honest answer for both rules.
+ *
+ * Clamped to `eventCreatedAt` — never later than the event that carried it —
+ * so that a malformed or absent timestamp degrades to the strict reading rather
+ * than a permissive one. A session may stay open for at most 24 hours, so this
+ * is always far inside the lookback `createReferralRedemption` allows.
+ */
+function checkoutOpenedAt(
+  session: Stripe.Checkout.Session,
+  eventCreatedAt: Date
+): Date {
+  if (!Number.isFinite(session.created)) {
+    return eventCreatedAt
+  }
+
+  const opened = new Date(session.created * 1_000)
+
+  return opened.getTime() < eventCreatedAt.getTime() ? opened : eventCreatedAt
 }
 
 /**
@@ -1085,7 +1121,8 @@ async function handleCheckoutCompleted(
  */
 async function recordReferralRedemption(
   referralCodeId: string,
-  referredUserId: string
+  referredUserId: string,
+  establishedAt: Date
 ): Promise<void> {
   try {
     const outcome = await prisma.$transaction(async (tx) => {
@@ -1093,14 +1130,20 @@ async function recordReferralRedemption(
         tx,
         { kind: 'id', referralCodeId },
         referredUserId,
-        { applyHouseholdHeuristic: true }
+        {
+          applyHouseholdHeuristic: true,
+          // See {@link checkoutOpenedAt}: the moment the session was opened,
+          // not the moment this delivery arrived. `ALREADY_A_CUSTOMER` would
+          // otherwise be decided by whether `invoice.paid` beat us here.
+          establishedAt,
+        }
       )
 
       if (eligibility.kind === 'refused') {
         return { kind: 'refused' as const, reason: eligibility.reason }
       }
 
-      return createReferralRedemption(tx, eligibility.code, referredUserId)
+      return createReferralRedemption(tx, eligibility, referredUserId)
     })
 
     if (outcome.kind === 'refused') {

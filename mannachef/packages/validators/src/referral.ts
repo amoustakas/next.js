@@ -698,6 +698,29 @@ const referralProgramCommonShape = {
     })
     .default(false),
   /**
+   * Whether this offer rewards the referral of a household that had already
+   * paid us before the invitation was accepted — a win-back (MCV-051).
+   *
+   * Defaulted to `false` on the same grounds as `allowLossLeader`: a default is
+   * only doing the deciding when it picks the permissive branch, and this one
+   * picks the strict branch. An operator who omits it gets an offer that pays
+   * for acquisitions only, and the sole way to reach the permissive branch is
+   * to type the word.
+   *
+   * It is not part of {@link programEconomicsBalance}, and deliberately so.
+   * The economics rule compares a reward against the invoice that earns it, and
+   * `ReferralRedemption.qualifyingFromAt` bounds that invoice below whether or
+   * not this is set — so a win-back is still settled against the bill that won
+   * the household back, never against the ones it paid before. This column
+   * widens who may be referred; it does not widen what pays for them.
+   */
+  allowExistingCustomerReferral: z
+    .boolean({
+      error:
+        'Please say whether this offer rewards winning a former customer back.',
+    })
+    .default(false),
+  /**
    * Whether the offer is being made at all.
    *
    * Required for the same reason, and it is the more consequential of the two:

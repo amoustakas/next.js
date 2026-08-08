@@ -97,6 +97,7 @@ pnpm --filter=@mannachef/web typecheck
 pnpm --filter=@mannachef/web test              # unit tests under src/**/*.test.ts
 pnpm --filter=@mannachef/web verify:referral   # the MCV-030 privilege regression
 pnpm --filter=@mannachef/web verify:intake     # the three MCV-040 intake regressions
+pnpm --filter=@mannachef/web verify:preemption # the MCV-050 referral pre-emption regression
 pnpm --filter=@mannachef/web verify:media      # the MCV-042 media upload regression
 pnpm --filter=@mannachef/web verify:billing    # the two MCV-041 billing regressions
 pnpm --filter=@mannachef/web verify:mcv043     # the re-quote marker and the referral economics
@@ -120,13 +121,24 @@ before/after table:
 | `verify:intake-cap`       | a code's redemption cap binds, sequentially and under concurrency |
 | `verify:intake-allergens` | a public questionnaire is never written for a household we hold   |
 
+Since MCV-050 the public enquiry writes no `ReferralRedemption` at all, so
+`verify:intake-cap` drives the enquiry **and** the sign-in that settles it: the
+cap moved with the write, which is the only place a cap can be enforced. Its
+concurrency scenario is four simultaneous first sign-ins rather than four
+simultaneous enquiries, which is what four guests accepting one invitation
+actually looks like.
+
 ```bash
 createdb mannachef_harness
 DATABASE_URL='postgresql://…@localhost:5432/mannachef_harness' \
-  pnpm --filter=@mannachef/db exec prisma db push
+  pnpm --filter=@mannachef/db exec prisma migrate deploy
 DATABASE_URL='postgresql://…@localhost:5432/mannachef_harness' \
   pnpm --filter=@mannachef/web verify:intake
 ```
+
+`migrate deploy` rather than `db push`: several migrations carry hand-written
+`CHECK` constraints that a schema push does not reproduce, and two harnesses
+assert against them by name.
 
 These need a database for the same kind of reason `verify:superadmin` does: two
 of the three claims are about what PostgreSQL does — a compare-and-swap under
@@ -139,6 +151,36 @@ asserts that reproduction still matches the shipped code where the two are
 supposed to agree, so a transcript cannot quietly stop describing this codebase.
 See the docblocks at the head of the three `apps/web/scripts/verify-intake-*.ts`
 files.
+
+`verify:preemption` is the MCV-050 regression, and it is the fourth round on the
+same door. `verify:intake-hijack` asserts that a referral cannot name a household
+the caller merely guessed; this asserts the harder half — that it cannot name an
+address **nobody has registered yet** either. An anonymous caller was staking a
+`ReferralRedemption` against a mailbox they had only typed, and being paid $50
+when its genuine owner later signed up and settled an invoice, because the guard
+asked "did this call insert the `User` row?" rather than "has this caller proved
+control of this mailbox?".
+
+The public path now writes `ClientProfile.claimedReferralCode` — a string with no
+ledger row and no financial meaning — and the redemption is written by
+`settleFirstAuthenticatedSession` at the first sign-in that proves the mailbox,
+through `createReferralRedemption`, the one canonical writer. The harness asserts
+both directions: the pre-emption is refused _and_ a genuine referral is still paid
+end to end. It also covers the second, quieter harm of the same call — a
+placeholder account with no `Account` row would have denied its owner Google
+registration for ever with `OAuthAccountNotLinked`.
+
+```bash
+DATABASE_URL='postgresql://…@localhost:5432/mannachef_harness' \
+  pnpm --filter=@mannachef/web verify:preemption
+```
+
+It needs the same database as `verify:intake`, applied from `prisma/migrations`
+rather than `db push` — `0004_mcv050_referral_claim` carries a hand-written
+`CHECK`. See the docblocks at the head of
+`apps/web/scripts/verify-referral-preemption.ts` and
+`apps/web/src/server/referral-claim.ts`; the second states what the fix does
+**not** buy as plainly as what it does.
 
 `verify:media` drives the real `completeMediaUpload` Server Action against a
 real PostgreSQL **built from `prisma/migrations`**, and both halves of that

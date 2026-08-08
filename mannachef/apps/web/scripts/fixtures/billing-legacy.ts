@@ -141,6 +141,12 @@ export async function legacyRecordReferralRedemption(
           qualifiedAt: new Date(),
           rewardCents: code.rewardValueCents,
           currency: code.currency,
+          // Not part of the reproduction. `qualifyingFromAt` is NOT NULL since
+          // MCV-051 and the code being reproduced predates it entirely, so the
+          // row simply would not insert without a value; `new Date()` is what
+          // this path would have stored had it existed. Nothing in the MCV-041
+          // scenarios reads it.
+          qualifyingFromAt: new Date(),
         },
       })
 

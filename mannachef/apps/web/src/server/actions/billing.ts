@@ -1771,7 +1771,16 @@ async function resolveReferralCode(
     db,
     { kind: 'code', code },
     userId,
-    { applyHouseholdHeuristic: true }
+    {
+      applyHouseholdHeuristic: true,
+      // Now, because nothing has been paid yet: this runs while the session is
+      // being opened. The webhook that eventually writes the redemption anchors
+      // it to `session.created`, which is this same moment give or take the
+      // round trip to Stripe — deliberately, so the invoice this session is
+      // about does not read as prior custom to the rule that judged it here.
+      // See `RedemptionEligibilityOptions.establishedAt`.
+      establishedAt: new Date(),
+    }
   )
 
   if (eligibility.kind === 'refused') {

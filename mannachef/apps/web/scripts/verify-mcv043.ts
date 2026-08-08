@@ -586,11 +586,12 @@ async function scenarioZeroAmountInvoice(): Promise<void> {
   // Exactly what `handleInvoiceChanged` writes for a Stripe trial start or a
   // 100%-off promotion: `status: 'PAID'` from `invoiceStatusFor`,
   // `amountPaidCents: invoice.amount_paid` — zero — and a real `paid_at`.
-  const trialInvoiceId = await seedPaidInvoice(
-    NEIGHBOUR.id,
-    0,
-    new Date(Date.now() - 2 * DAY_MS)
-  )
+  //
+  // Both invoices in this scenario are paid *after* the redemption above, since
+  // MCV-051 bounds `findQualifyingInvoice` below by the redemption's own
+  // `qualifyingFromAt`. Dating them into the past would make this scenario stop
+  // being about the amount, which is what it is here to be about.
+  const trialInvoiceId = await seedPaidInvoice(NEIGHBOUR.id, 0, new Date())
 
   signInAs(CONCIERGE)
   const firstSweep = expectOk(await settleReferralRedemptions({}))
@@ -624,7 +625,7 @@ async function scenarioZeroAmountInvoice(): Promise<void> {
   )
 
   // One cent is enough. The rule is not a floor in disguise.
-  await seedPaidInvoice(NEIGHBOUR.id, 1, new Date(Date.now() - HOUR_MS))
+  await seedPaidInvoice(NEIGHBOUR.id, 1, new Date())
 
   const secondSweep = expectOk(await settleReferralRedemptions({}))
   const afterPenny = await prisma.referralRedemption.findFirstOrThrow({
