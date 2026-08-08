@@ -616,12 +616,13 @@ type ResolvedIdentity =
  * ## The `User` this opens is marked as a placeholder (MCV-050)
  *
  * `unclaimedSince` is stamped on every account this function creates, and is
- * cleared by `settleFirstAuthenticatedSession` at the first sign-in that proves
- * the mailbox. It is what makes "an account nobody has ever authenticated into"
- * a thing the platform can *see* rather than infer, and two decisions turn on it:
- * such a row may be adopted by an OAuth sign-in instead of colliding with it
- * (`adoptUnclaimedAccount` — see below), and it is the account state in which a
- * referral claim is still only a string.
+ * cleared by `markMailboxProved` at the first sign-in that proves the mailbox.
+ * It is what makes "an account nobody has ever authenticated into" a thing the
+ * platform can *see* rather than infer, and three decisions turn on it: such a
+ * row may be adopted by an OAuth sign-in instead of colliding with it
+ * (`adoptUnclaimedAccount` — see below), it is the account state in which a
+ * referral claim is still only a string, and it is the only state in which
+ * {@link attachReferralClaim} will refresh that string.
  *
  * ## Why a `User` is opened at all for an address nobody has proved
  *
@@ -1130,9 +1131,16 @@ async function logEnquiry(
  * beside `source` and `sourceDetail` — the other two columns recording where a
  * household says it came from — and carries no redemption, no ledger entry and no
  * movement of `ReferralCode.redemptionCount`. It becomes a `ReferralRedemption`
- * in `settleFirstAuthenticatedSession`, at the first sign-in that proves the
- * mailbox, through the one canonical writer. `@/server/referral-claim` is where
- * that is argued, including what it does not buy.
+ * only in `settleAcceptedClaim`, called by `acceptReferralClaim` on behalf of
+ * the **authenticated household** that owns the mailbox, through the one
+ * canonical writer. `@/server/referral-claim` is where that is argued, including
+ * what it does not buy.
+ *
+ * Settling automatically at the first sign-in — which is what this used to say —
+ * was the MCV-052 finding. The server cannot tell the genuine prospect's
+ * magic-link sign-in from the victim's, so an automatic settlement paid a
+ * sprayer $50.00 off a victim's own organic sign-in and invoice. Consent is not
+ * a stronger guess at which of them it was; it is the absence of a guess.
  *
  * ## There is no cap, expiry or owner check here, on purpose
  *
@@ -1151,15 +1159,44 @@ async function logEnquiry(
  * whatever the code turns out to be: telling a stranger which codes are live
  * would turn the enquiry form into a way to harvest them.
  *
- * ## Only for a household this call opened
+ * ## Only for an account nobody has ever proved
  *
- * The identity, not a bare id, and `created` only — not because a claim is
- * dangerous, but because a column on a `ClientProfile` belongs to that
- * `ClientProfile`. The rule at the head of this file is that a public submission
- * writes neither a row nor a column of a household that was already ours, and an
- * attribution column is a column. A signed-in caller is refused for the reason
- * they always were: the audited door for an account that already exists is
- * `redeemReferralCode`.
+ * The identity, not a bare id, because a column on a `ClientProfile` belongs to
+ * that `ClientProfile` and a call site must not be able to forget whose it is.
+ * The rule at the head of this file — a public submission writes neither a row
+ * nor a column of a household that was already ours — is enforced here by
+ * {@link isUnprovedPlaceholder}: the write is admitted for an identity of kind
+ * `created`, and for a `matched` identity **only** while `User.unclaimedSince`
+ * is still stamped. That column means "opened by this very path for an address
+ * nobody had proved", and `markMailboxProved` clears it at the first sign-in. So
+ * a household that has ever authenticated — which includes every signed-in
+ * caller, every real client and every member — is untouchable from here, exactly
+ * as before. Their audited door is `redeemReferralCode`.
+ *
+ * ## Why `created` alone was not enough: the precedence finding
+ *
+ * `created` alone made the *first* public submission for an address the only one
+ * that could ever write this column, because the second finds the
+ * `ClientProfile` the first one opened and {@link resolveIdentity} reports
+ * `matched` for ever after. That is first-writer-wins, and round three measured
+ * what it costs: a sprayer posts `HARVEST24` at an address, the household later
+ * types the `GENUINE24` their friend actually gave them, and the code they typed
+ * is silently discarded. They are then shown a stranger's invitation and never
+ * shown their own.
+ *
+ * Refreshing it is safe *now* and would not have been before, and the difference
+ * is the whole of MCV-052: under the automatic settlement this column decided
+ * who got paid, so whoever wrote it last won the money. Under consent it decides
+ * only what the household is *offered*, and the household then accepts or
+ * declines it — see `recordReferralClaim` in `@/server/referral-claim`. Neither
+ * writer outranks the other because neither is ranked: a household shown a code
+ * they do not recognise declines it, and a household whose own code was
+ * overwritten by a later spray still has `redeemReferralCode`. What they cannot
+ * have, and what first-writer-wins gave them, is no way to see their own code at
+ * all.
+ *
+ * Do not reintroduce this refresh if this column is ever given authority again.
+ * The two changes are only jointly safe.
  */
 async function attachReferralClaim(
   tx: Prisma.TransactionClient,
@@ -1167,11 +1204,35 @@ async function attachReferralClaim(
   code: string,
   now: Date
 ): Promise<void> {
-  if (identity.kind !== 'created') {
+  if (
+    identity.kind !== 'created' &&
+    !(await isUnprovedPlaceholder(tx, identity.userId))
+  ) {
     return
   }
 
   await recordReferralClaim(tx, identity.clientProfileId, code, now)
+}
+
+/**
+ * Is this `User` still a row the public path opened and no human has signed
+ * into?
+ *
+ * Asked of the database rather than of {@link ResolvedIdentity}, because the
+ * identity records what *this transaction* did and the question here is what has
+ * ever happened to the row. `isActive` is carried along so a deactivated account
+ * is not written to either; nothing on the public path should be editing one.
+ */
+async function isUnprovedPlaceholder(
+  tx: Prisma.TransactionClient,
+  userId: string
+): Promise<boolean> {
+  const row = await tx.user.findFirst({
+    where: { id: userId, isActive: true, unclaimedSince: { not: null } },
+    select: { id: true },
+  })
+
+  return row !== null
 }
 
 /** The earliest of the times the prospect offered. */

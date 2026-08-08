@@ -75,12 +75,14 @@
  * `verify-referral-preemption.ts`, which is the regression for that — so the
  * public path no longer writes a `ReferralRedemption` under **any**
  * discriminant. It records `ClientProfile.claimedReferralCode`, a string, and
- * `settleFirstAuthenticatedSession` writes the redemption at the household's
- * first sign-in.
+ * `acceptReferralClaim` writes the redemption when the household — signed in,
+ * holding the mailbox — says the invitation is theirs. Settling automatically at
+ * the first sign-in, which is what this said before MCV-052, paid a sprayer off
+ * a victim's own organic sign-in.
  *
  * This harness is unaffected in what it claims and changed in one place: a
- * genuine newcomer (scenario 4) now proves their mailbox before the redemption
- * appears. Every assertion about the *victim* stands exactly as it was, which is
+ * genuine newcomer (scenario 4) now proves their mailbox *and consents* before
+ * the redemption appears. Every assertion about the *victim* stands exactly as it was, which is
  * the point of keeping it — finding A must stay dead independently of the fix
  * that came after it.
  *
@@ -118,12 +120,13 @@ import {
   createReferralCode,
   settleReferralRedemptions,
 } from '@/server/actions/referral'
+import { acceptReferralClaim } from '@/server/actions/referral-claim'
 import type { ActionResult } from '@/server/actions/types'
 import { prisma } from '@/server/db'
-import { settleFirstAuthenticatedSession } from '@/server/referral-claim'
+import { markMailboxProved } from '@/server/referral-claim'
 
 import { legacyRequestConsultation } from './fixtures/intake-legacy'
-import { signInAs } from './fixtures/harness-state'
+import { signInAs, type HarnessUser } from './fixtures/harness-state'
 import {
   ATTACKER,
   OVERSEER,
@@ -502,9 +505,33 @@ async function scenarioNoFalseRefusal(): Promise<void> {
     assert.equal(claim?.code, CODE)
   })
 
-  // The newcomer clicks the magic link in their own inbox. `events.signIn`
-  // calls exactly this.
-  await settleFirstAuthenticatedSession(newcomer.id)
+  // The newcomer clicks the magic link in their own inbox — `events.signIn`
+  // calls exactly this — and then accepts the invitation they typed. Since
+  // MCV-052 those are two acts, and only the second one moves money.
+  await markMailboxProved(newcomer.id)
+
+  const consenting: HarnessUser = {
+    id: newcomer.id,
+    name: 'Iris Calloway',
+    email: NEWCOMER_EMAIL,
+    image: null,
+    role: 'CLIENT',
+    isActive: true,
+    timeZone: 'America/Toronto',
+    locale: 'en-CA',
+    clientProfileId: newcomer.clientProfile?.id ?? null,
+    staffProfileId: null,
+  }
+
+  signInAs(consenting)
+  clearRateLimits()
+  const consented = await acceptReferralClaim({ code: CODE })
+  signInAs(null)
+
+  check('the household accepts the invitation it typed', () => {
+    assert.equal(consented.ok, true)
+    assert.equal(consented.ok ? consented.data.kind : '', 'accepted')
+  })
 
   const shipped = await redemptionsForCode(shippedCodeId)
 

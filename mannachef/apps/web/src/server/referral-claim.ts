@@ -1,13 +1,13 @@
 // mannachef/apps/web/src/server/referral-claim.ts
 
 /**
- * A referral typed into a public form is a **claim**, not a redemption
- * (MCV-050).
+ * A referral typed into a public form is a **claim**, and a claim becomes money
+ * only when the household itself accepts it (MCV-050, superseded by MCV-052).
  *
- * ## The class of defect this module exists to end
+ * ## Four rounds of one defect
  *
- * Three consecutive audit rounds produced the same money hole from the same
- * door, each time with a narrower guard bolted onto it:
+ * Each round closed the hole it was shown and left the same shape one step
+ * earlier:
  *
  *  1. **MCV-030** — a `CLIENT` set their own reward amount. Fixed by taking the
  *     terms from the standing offer (`@/server/referral-program`).
@@ -16,94 +16,149 @@
  *     `resolveIdentity` report `created | matched` and refusing `matched`.
  *  3. **MCV-041 finding F** — three call sites had three different definitions
  *     of "valid redemption". Fixed by `@/server/referral-eligibility`.
+ *  4. **MCV-050** — an anonymous caller named an address that *did not exist
+ *     yet*, `resolveIdentity` reported `created`, and a `PENDING
+ *     ReferralRedemption` was written against a mailbox the caller had never
+ *     touched. Fixed by writing a string here instead of a redemption, and
+ *     settling it from the Auth.js `signIn` event, once the mailbox was proved.
  *
- * Round three of the review then walked through all of it: post the public
- * consultation form, signed out, naming an address that **does not exist yet**.
- * `resolveIdentity` creates the `User`, reports `created`, the MCV-040 guard is
- * satisfied — and a `PENDING ReferralRedemption` is written against a mailbox
- * the caller has never touched. Weeks later the genuine owner of that address
- * signs in by magic link (Auth.js `database` strategy binds to the existing row
- * for that email), subscribes, pays, and the settlement sweep credits the
- * stranger. Measured against a live database: `{examined: 1, qualified: 1,
- * rewarded: 1, creditedCents: 5000}`.
+ * Round four then walked through MCV-050 and produced two findings, which are
+ * one finding:
  *
- * **The discriminant was wrong.** `created` answers "did *this call* insert the
- * `User` row?". The property that decides whether a caller may cause money to
- * move is "has this caller **proved control of this mailbox**?" — and an address
- * nobody has registered is not one anybody has proved. The `ResolvedIdentity`
- * docblock stated the false premise outright ("Nobody else has ever held this
- * account, so there is nothing of anybody's to damage"). Nobody had held it
- * *yet*.
+ *  - **Precedence.** {@link recordReferralClaim}'s docblock promised
+ *    last-writer-wins ("a sprayer's guess must not outrank a genuine invitation
+ *    the household typed afterwards"). The replacement was **unreachable**:
+ *    after the first public submission the `ClientProfile` exists, so
+ *    `resolveIdentity` reports `matched` for ever and `attachReferralClaim`
+ *    returns before this module's writer runs. A sprayed `HARVEST24` therefore
+ *    stood, the household's later `GENUINE24` was dropped on the floor, the
+ *    sprayer was credited 5000 cents at the household's first sign-in, and the
+ *    genuine inviter was then locked out permanently by `ALREADY_REFERRED`.
+ *    Theft plus denial, deterministic rather than racy.
+ *  - **The pre-emption still paid.** One anonymous HTTP call, then the victim's
+ *    own organic magic-link sign-in and payment, measured `{examined: 1,
+ *    rewarded: 1, creditedCents: 5000}`. The claim that MCV-050 had closed it
+ *    rested on a harness artefact: in `verify-referral-preemption.ts`, scenario 2
+ *    ("the pre-emption") never called `firstSignIn` while scenario 5 ("a genuine
+ *    prospect") did, and the two are byte-identical in mechanism. **There was no
+ *    server-side property separating them.** The mitigation the docblock below
+ *    named — an explicit acceptance, offered through
+ *    {@link readPendingReferralClaim} — had exactly two callers, both inside that
+ *    same test file. It was a function nobody called.
  *
- * ## What replaces it
+ * ## Why every round produced the same shape
  *
- * A referral is **accepted only by an authenticated session**. The public path
- * writes no row that carries money, under any discriminant:
+ * Because settlement was **automatic**. In all four designs the last act that
+ * moved money was performed by the server on a schedule of its own — a form
+ * submission, a sweep, a sign-in event — and the only question left was *which
+ * unauthenticated input the server should trust to aim it*. `created` vs
+ * `matched`, "does the address exist", "has a mailbox been proved": every one of
+ * those is a guess at intent made from two HTTP requests that look identical.
+ * The server genuinely cannot tell "the prospect typed the code, then signed in"
+ * from "a stranger typed the code, and the prospect signed in", so any automatic
+ * rule built on that distinction is a rule that can be aimed by whoever sends
+ * the first request.
+ *
+ * ## What replaces it: consent
+ *
+ * The automation is removed. Nothing turns a claim into money except a
+ * deliberate act by the authenticated household:
  *
  *  - {@link recordReferralClaim} stores the code as
  *    `ClientProfile.claimedReferralCode` — a string beside `source` and
  *    `sourceDetail`, with no ledger row, no redemption and no counter movement.
- *    Writing it costs nobody anything, so a caller who has proved nothing cannot
- *    make it cost anybody anything.
- *  - {@link settleFirstAuthenticatedSession} turns that string into a
- *    `ReferralRedemption` at the first sign-in that proves the mailbox, and only
- *    then. It re-runs `resolveRedemptionEligibility` **at that moment** and
- *    writes through `createReferralRedemption`, so there is exactly one writer of
- *    that table and one definition of "valid" — the same pair
+ *    It is a **suggestion to show the household later**, and nothing else reads
+ *    it as authority.
+ *  - {@link readPendingReferralClaim} shows that suggestion to the signed-in
+ *    household. It has a real caller now: the consent surface.
+ *  - {@link settleAcceptedClaim} is the only path from that string to a
+ *    `ReferralRedemption`, and it runs only when the household names the code it
+ *    is accepting. It re-runs `resolveRedemptionEligibility` at that moment and
+ *    writes through `createReferralRedemption`, so there is still exactly one
+ *    writer of that table and one definition of "valid" — the same pair
  *    `redeemReferralCode` and the Stripe webhook go through.
+ *  - {@link declineReferralClaim} is the other half of the choice. A household
+ *    that did not send that enquiry can clear the suggestion instead of waiting
+ *    {@link CLAIM_WINDOW_DAYS} for it to lapse.
+ *  - {@link markMailboxProved} is what is left of the `signIn` event: it clears
+ *    `User.unclaimedSince` and touches nothing that carries money.
  *
- * Because eligibility is decided at settlement rather than at claim time, the
+ * Because eligibility is decided at acceptance rather than at claim time, the
  * public path has no cap check, no expiry check and no owner-identity check of
  * its own. Those were deleted rather than left in place: MCV-040 finding B was
  * caused by exactly that shape — a comparison against a counter nobody moved,
  * which read as a control for two audits — and a check whose result is discarded
  * is worse than no check, because it is why nobody looks.
  *
- * ## What this does and does not buy
+ * ## What this buys, and what it does not
  *
- * Stated plainly, because the previous three rounds were each made possible by a
- * docblock that claimed more than its code delivered.
+ * Stated plainly, because each of the previous four rounds was made possible by
+ * a docblock that claimed more than its code delivered. The immediately previous
+ * version of this list asserted the pre-emption was "Dead" while it still paid
+ * 5000 cents; that sentence is why round four was needed.
  *
- *  - **Dead:** staking a money-bearing row against an address by typing it. No
+ *  - **Closed:** the pre-emption paying anything. A stranger's claim against
+ *    `you@example.org` credits nobody, however you subsequently sign in, pay or
+ *    subscribe, because no sign-in and no payment settles a claim. Only your own
+ *    authenticated acceptance does, and you never sent one. This is the finding
+ *    that survived three previous fixes; it is closed by removing the automatic
+ *    act, not by sharpening a guess about who sent the HTTP request.
+ *  - **Closed:** the precedence hole, by making precedence irrelevant rather
+ *    than by reordering writes. Whatever string the column holds — sprayed,
+ *    genuine, or stale — it is offered to the household and refused or accepted
+ *    by the household. A guess cannot outrank a choice.
+ *  - **Closed:** the `ALREADY_REFERRED` lockout. No redemption exists until the
+ *    household writes one, so a sprayer cannot spend the household's one-time
+ *    eligibility on a code the household never chose, and the genuine inviter
+ *    stays redeemable through `redeemReferralCode`.
+ *  - **Closed:** staking a money-bearing row against an address by typing it. No
  *    `ReferralRedemption`, no counter movement, no ledger entry is reachable
- *    without a session. The reviewer's reproduction now measures
- *    `{examined: 0, rewarded: 0, creditedCents: 0}`.
- *  - **Dead:** touching a household that was already ours. A claim is recorded
- *    only on a profile the same call opened, so the public form still writes not
- *    one column — nor one row — of an existing household's.
- *  - **Dead:** burning a third party's redemption cap, or poisoning their
- *    referral records, by quoting a code that is not yours. The cap moves in
- *    `createReferralRedemption` and nowhere else, and nothing anonymous reaches
- *    it.
- *  - **Dead:** an unbounded attribution. A claim lapses after
- *    {@link CLAIM_WINDOW_DAYS}, so "spray a million addresses and wait" has a
- *    horizon.
- *  - **Not dead, and it cannot be, by any server-side test:** if a stranger
- *    claims a code against `you@example.org` and *you* then sign in within the
- *    window, the attribution is yours-by-address and the claim settles. The
- *    server cannot distinguish "the prospect who typed the code then signed in"
- *    from "somebody else typed it and the prospect signed in", because both are
- *    the same two HTTP requests. What it *can* do is require that a mailbox be
- *    proved before a cent moves, bound how long an unproved attribution lives,
- *    and re-check every rule at the moment it settles. That is what this does.
- *    The complete answer is an explicit acceptance by the signed-in household —
- *    {@link readPendingReferralClaim} is the reader a portal would use to offer
- *    it, and `redeemReferralCode` is the action that would take it.
+ *    without a session *and* an explicit acceptance.
+ *  - **Closed:** touching a household that was already ours. A claim is recorded
+ *    only on a profile the same intake call opened, so the public form still
+ *    writes not one column — nor one row — of an existing household's.
+ *  - **Closed:** an unbounded attribution. A claim lapses after
+ *    {@link CLAIM_WINDOW_DAYS} and can be declined before that.
+ *  - **Residual, and named rather than dismissed:** a sprayer can still cause a
+ *    household to be *shown* an invitation it did not request, and a household
+ *    that accepts it anyway pays the sprayer the reward. That is a phishing
+ *    surface, not a server hole: it requires the human holding the mailbox to
+ *    choose. The consent surface must therefore present the code as
+ *    "your enquiry mentioned X — is that right?", never as an accomplished fact
+ *    with a confirm button.
+ *  - **Residual:** the claim's timestamp still backdates
+ *    `RedemptionEligibilityOptions.establishedAt` when the accepted code is the
+ *    standing one. That decides *when* the invitation counts from, never
+ *    *whether* it counts or *who* is paid, and it is bounded by
+ *    {@link CLAIM_WINDOW_DAYS} and clamped again by `createReferralRedemption`.
+ *
+ * ## What a harness has to prove now
+ *
+ * Round four's mistake was reproducible only because the harness distinguished
+ * "the pre-emption" from "a genuine prospect" by the choice of email literal.
+ * Under consent there **is** a server-side property separating them, and it is
+ * the only one worth asserting: a scenario that never calls
+ * {@link settleAcceptedClaim} must measure `{rewarded: 0, creditedCents: 0}` no
+ * matter how many sign-ins, subscriptions and paid invoices it performs.
+ * `scripts/verify-referral-preemption.ts` has to be rewritten against that
+ * property; until it is, it is asserting against a function that no longer
+ * exists.
  *
  * ## Why this is not in `actions/`
  *
  * Same reason as `@/server/referral-eligibility` and `@/server/referral-program`:
- * a `'use server'` module may only export async functions, and two of this
- * module's consumers are not action modules at all — `server/auth.ts`, which
- * fires it from the Auth.js `signIn` event, and the intake actions. The actions
- * are thin authorised entry points; the rule lives here.
+ * a `'use server'` module may only export async functions, and one of this
+ * module's consumers is not an action module at all — `server/auth.ts`, which
+ * calls {@link markMailboxProved} and {@link adoptUnclaimedAccount} from the
+ * Auth.js callbacks. The actions are thin authorised entry points; the rule
+ * lives here.
  *
  * `server/auth.ts` cannot be imported outside a Next.js runtime (it pulls in
- * `next/server` through `next-auth`), so it holds no logic of its own: both
- * callbacks are three lines that map Auth.js's arguments onto the two functions
- * below. That seam is deliberate — it is what lets
- * `scripts/verify-referral-preemption.ts` drive the real settlement against a
- * real PostgreSQL rather than assert against a mock of it.
+ * `next/server` through `next-auth`), so it holds no logic of its own: its
+ * callbacks are three lines that map Auth.js's arguments onto the functions
+ * below. That seam is deliberate — it is what lets the verification scripts
+ * drive the real writers against a real PostgreSQL rather than assert against a
+ * mock of them.
  */
 
 import { Prisma, prisma } from '@/server/db'
@@ -151,18 +206,19 @@ function claimHasLapsed(claimedAt: Date, now: Date): boolean {
 // =============================================================================
 
 /**
- * Record the invitation code somebody typed, as attribution and nothing else.
+ * Record the invitation code somebody typed, as a suggestion to show the
+ * household later and nothing else.
  *
  * ## Why there is no validation here
  *
  * Not "is the code live", not "has the cap room", not "does the owner exist".
- * None of those questions has a stable answer between now and the moment this
- * claim would settle — a code can be withdrawn, filled or expire in between — so
- * asking them here would be asking at the wrong time, and *acting* on them here
- * would be the MCV-040 finding B shape all over again: a comparison whose result
- * changes nothing, sitting where a reader will mistake it for a control.
- * {@link settleFirstAuthenticatedSession} asks, once, at the only moment the
- * answer binds.
+ * None of those questions has a stable answer between now and the moment the
+ * household might accept this — a code can be withdrawn, filled or expire in
+ * between — so asking them here would be asking at the wrong time, and *acting*
+ * on them here would be the MCV-040 finding B shape all over again: a comparison
+ * whose result changes nothing, sitting where a reader will mistake it for a
+ * control. {@link settleAcceptedClaim} asks, once, at the only moment the answer
+ * binds.
  *
  * The one thing that is enforced is the shape of the string, by
  * `consultationRequestSchema` / `prospectIntakeSchema` at the boundary. A column
@@ -178,10 +234,34 @@ function claimHasLapsed(claimedAt: Date, now: Date): boolean {
  * a real client's file, which is a different promise and one this codebase has
  * broken before.
  *
- * A second claim from the same prospect replaces the first, and re-stamps the
- * date. The most recent thing a household told us about where it came from is
- * the one worth keeping, and the alternative — first claim wins — would let a
- * sprayer's guess outrank a genuine invitation the household typed afterwards.
+ * ## There is no precedence rule, and there is deliberately no longer one
+ *
+ * Earlier versions of this docblock promised last-writer-wins, on the reasoning
+ * that "first claim wins would let a sprayer's guess outrank a genuine
+ * invitation the household typed afterwards". That prose described a rule the
+ * code could not implement. The `update` below has always been last-writer-wins,
+ * but the public path could not reach it twice: after the first submission the
+ * `ClientProfile` existed, `resolveIdentity` reported `matched` for ever, and
+ * `attachReferralClaim` returned before this function was called. The documented
+ * rule and the reachable behaviour disagreed for a whole audit round, and the
+ * sprayer the prose warned about was winning the entire time.
+ *
+ * Under consent the disagreement is settled from both ends. **Write order no
+ * longer decides anything**, because whatever string this column ends up holding
+ * is merely *offered* to the signed-in household by
+ * {@link readPendingReferralClaim}, and only the household's own
+ * {@link settleAcceptedClaim} turns it into money. A sprayer's guess cannot
+ * outrank a genuine invitation because the two are not ranked against each
+ * other — a household shown a code it does not recognise declines it, and a
+ * household whose column holds the wrong code still has `redeemReferralCode`.
+ *
+ * And because write order no longer decides anything, `attachReferralClaim` may
+ * now safely reach this a second time: it admits a public submission for an
+ * account still marked `User.unclaimedSince`, so a household that types their
+ * own code after a sprayer typed theirs is *shown their own*. That refresh and
+ * this column's lack of authority are only jointly safe. Do not give this column
+ * authority again without also removing the refresh, and do not remove the
+ * consent gate while the refresh stands.
  */
 export async function recordReferralClaim(
   tx: Prisma.TransactionClient,
@@ -211,13 +291,21 @@ export interface PendingReferralClaim {
 /**
  * The claim standing against a household, if any.
  *
- * Written for a portal that wants the *stronger* shape the module docblock
- * describes: show the signed-in household the code their enquiry carried and let
- * them accept it through `redeemReferralCode`, rather than settling it for them.
- * Nothing on the public path may call this — a claim read back to an anonymous
- * caller would turn the enquiry form into an oracle over which addresses we
- * hold, which is the property the null receipt ids in `actions/intake.ts` exist
- * to protect.
+ * This is the read the consent surface performs: show the signed-in household
+ * the code their enquiry carried, and let them {@link settleAcceptedClaim} or
+ * {@link declineReferralClaim} it. It is no longer a reader written for a portal
+ * that might one day exist — round four found that its only two callers were
+ * inside a test file while the docblock cited it as the mitigation for a live
+ * money hole. A named mitigation with no production caller is not a mitigation.
+ *
+ * The caller must be the household itself. Nothing on the public path may call
+ * this — a claim read back to an anonymous caller would turn the enquiry form
+ * into an oracle over which addresses we hold, which is the property the null
+ * receipt ids in `actions/intake.ts` exist to protect.
+ *
+ * `lapsed` is reported rather than hidden so the surface can say "this expired"
+ * instead of silently showing nothing; {@link settleAcceptedClaim} refuses a
+ * lapsed claim regardless of what was displayed.
  */
 export async function readPendingReferralClaim(
   userId: string,
@@ -244,23 +332,78 @@ export async function readPendingReferralClaim(
 }
 
 // =============================================================================
-// 4. Settlement, at the first session that proves the mailbox
+// 4. Adoption, at the session that proves the mailbox
+// =============================================================================
+
+/** What {@link markMailboxProved} did. */
+export type MailboxProofOutcome =
+  /** The row was a placeholder and is now an ordinary account. */
+  | { readonly kind: 'newly-proved' }
+  /** Nothing to clear: already proved, gone, or deactivated. */
+  | { readonly kind: 'not-applicable' }
+
+/**
+ * Clear `User.unclaimedSince`, because a sign-in has just proved the mailbox.
+ *
+ * This is everything that is left of what the Auth.js `signIn` event used to do,
+ * and the whole point of the MCV-052 change is what is *not* here: signing in no
+ * longer settles a referral claim, because signing in is not consent to an
+ * attribution somebody else may have typed. See the module docblock.
+ *
+ * What remains is not money and cannot become money. `unclaimedSince` non-null
+ * means "opened by the public intake path for an address nobody had proved"; a
+ * verified magic link or completed OAuth exchange has now proved it, so the
+ * placeholder becomes an ordinary account. Leaving the stamp on a real
+ * household's row would be wrong twice over: `adoptUnclaimedAccount` reads it as
+ * a licence to link an OAuth identity without the usual check, and the CRM reads
+ * it as "this household never showed up".
+ *
+ * `updateMany` guarded on the prior value, so a household's fiftieth sign-in
+ * costs a `WHERE` and no `UPDATE`, and running twice is a no-op rather than a
+ * write. The `isActive` guard is belt-and-braces: `authConfig.callbacks.signIn`
+ * has already refused a deactivated user before the event fires.
+ */
+export async function markMailboxProved(
+  userId: string
+): Promise<MailboxProofOutcome> {
+  const cleared = await prisma.user.updateMany({
+    where: { id: userId, isActive: true, unclaimedSince: { not: null } },
+    data: { unclaimedSince: null },
+  })
+
+  return cleared.count === 1
+    ? { kind: 'newly-proved' }
+    : { kind: 'not-applicable' }
+}
+
+// =============================================================================
+// 5. Settlement, at the household's explicit acceptance
 // =============================================================================
 
 /**
- * What {@link settleFirstAuthenticatedSession} did with the claim.
+ * What {@link settleAcceptedClaim} did with the claim.
  *
- * Every outcome is named rather than collapsed into a boolean, because this runs
- * from an Auth.js event where nothing is returned to a caller: the union *is* the
- * record of what happened, and it is what `verify-referral-preemption.ts`
- * asserts against.
+ * Every outcome is named rather than collapsed into a boolean, because the
+ * consent action has to tell the household which of these happened — "that
+ * invitation expired" and "that code has already been fully redeemed" are
+ * different sentences, and a household that just clicked *accept* is owed the
+ * right one.
  */
 export type ReferralClaimOutcome =
-  /** The account is gone or deactivated between sign-in and this call. */
+  /** The account is gone or deactivated between the read and this call. */
   | { readonly kind: 'no-account' }
-  /** No `ClientProfile`, or no claim on it. The ordinary case. */
+  /** No `ClientProfile`, or no claim on it. Nothing was offered to accept. */
   | { readonly kind: 'nothing-claimed' }
-  /** A concurrent first session consumed the claim; that one settles it. */
+  /**
+   * A claim stands, but not for the code the household named.
+   *
+   * The prompt they answered is stale — the claim was declined, settled or
+   * overwritten between the render and the click. Nothing is consumed, so the
+   * surface can re-read and ask again. Carrying `standing` is safe because the
+   * only caller is the household that owns the profile.
+   */
+  | { readonly kind: 'mismatch'; readonly standing: string }
+  /** A concurrent acceptance consumed the claim; that one settles it. */
   | { readonly kind: 'raced' }
   /** Older than {@link CLAIM_WINDOW_DAYS}. Consumed and discarded. */
   | { readonly kind: 'lapsed'; readonly code: string; readonly claimedAt: Date }
@@ -304,34 +447,58 @@ class RedemptionRacedError extends Error {
 }
 
 /**
- * Adopt the account and settle whatever attribution it is carrying.
+ * Turn the claim standing against a household into a redemption, because the
+ * household said to.
  *
- * Called from `authConfig.events.signIn`, which fires after Auth.js has verified
- * a magic link or completed an OAuth exchange — that is, after the caller has
- * proved control of the mailbox, which is the property the whole module is
- * about. It is *not* called from anywhere a request can reach directly.
+ * ## Who may call this, and why the answer is only ever one person
  *
- * Two things happen, in one transaction:
+ * The consent action, on behalf of the authenticated owner of `userId`, and
+ * nobody else. This function does not check the session — a plain server module
+ * cannot — so its caller must, exactly as CONTRACT.md §5 requires: resolve the
+ * session, then pass that session's own user id. Passing an id taken from client
+ * input would hand an attacker the whole of MCV-052 back, because the one thing
+ * standing between a sprayed claim and a payout is that the party consenting is
+ * the party who holds the mailbox.
  *
- *  1. **Adoption.** `User.unclaimedSince` is cleared. Non-null meant "opened by
- *     the public intake path for an address nobody had proved"; a real sign-in
- *     has now proved it, so the placeholder becomes an ordinary account. The
- *     update is `updateMany` guarded on `unclaimedSince: { not: null }`, so
- *     running twice is a no-op rather than a write.
- *  2. **Settlement.** The claim is *consumed* — both columns compare-and-swapped
- *     back to `NULL`, guarded on the exact code that was read — and then, and
- *     only then, offered to `resolveRedemptionEligibility`. Consuming first is
- *     what makes two concurrent first sessions produce one redemption and one
- *     `raced`, in the same shape `createReferralRedemption` uses for the counter.
+ * It is deliberately **not** called from `authConfig.events.signIn` any more.
+ * That call was the automatic settlement round four measured paying 5000 cents
+ * to a stranger against a victim's organic sign-in, and no narrowing of it
+ * helps: the server cannot tell which of two identical HTTP requests was the
+ * genuine prospect. Consent is not a stronger guess, it is the absence of a
+ * guess.
+ *
+ * ## Why the code is a parameter rather than read from the column
+ *
+ * Because the household is accepting a *specific* invitation, the one it was
+ * shown. If this read the column itself, an acceptance rendered against
+ * `GENUINE24` would bind whatever the column happened to hold at click time, and
+ * a claim overwritten in between would be settled without anybody having agreed
+ * to it — an automatic settlement wearing a consent button. A mismatch is
+ * therefore `mismatch` and consumes nothing; the surface re-reads and asks
+ * again.
+ *
+ * This is also why the accepted code must equal the standing claim rather than
+ * being free-form. A household that wants to redeem a code it was given
+ * privately has `redeemReferralCode`, which is separately audited and rate
+ * limited. This door is narrower on purpose: it converts an attribution the
+ * platform is already holding, and nothing else.
+ *
+ * ## What happens, in one transaction
+ *
+ * The claim is *consumed* — both columns compare-and-swapped back to `NULL`,
+ * guarded on the exact code that was read — and then, and only then, offered to
+ * `resolveRedemptionEligibility`. Consuming first is what makes two concurrent
+ * acceptances produce one redemption and one `raced`, in the same shape
+ * `createReferralRedemption` uses for the counter.
  *
  * ## Why the full predicate is re-run here rather than trusted from claim time
  *
  * Because everything it asks can have changed, and every one of the changes
  * matters: the code may have been withdrawn or expired, its cap may have filled,
- * the household may have accepted a different invitation in the meantime, and —
+ * the household may have redeemed a different invitation in the meantime, and —
  * the case that made MCV-041 finding F a finding — the owner may share a mailbox
- * with the account now settling. A claim carries no privilege forward. It carries
- * a string.
+ * with the account now accepting. A claim carries no privilege forward. It
+ * carries a string and a date.
  *
  * ## Losing the race rolls the whole thing back
  *
@@ -339,23 +506,23 @@ class RedemptionRacedError extends Error {
  * *before* it swaps the counter, so a caller that merely reports the loss
  * commits an orphan redemption and the cap stops binding. Rolling back takes the
  * claim's consumption with it, which is the outcome worth having: nothing was
- * written, so the household's next sign-in may try again.
+ * written, so the household may try again.
  *
- * ## Failure is swallowed, deliberately
+ * ## Failure is *not* swallowed here
  *
- * A sign-in that has otherwise succeeded must not be turned into an error page
- * because a referral could not be settled — the household would read "try again"
- * as a rejection of their sign-in. The same reasoning, and the same shape, as the
- * `lastLoginAt` stamp this runs beside. The claim has already been consumed by
- * then only if the transaction committed, so a failure leaves it settleable on
- * the next sign-in rather than silently spent.
+ * Unlike the sign-in event this replaces, where an error would have read to the
+ * household as a rejected sign-in, this runs inside an action the household
+ * deliberately invoked. Somebody is waiting on the answer, so a thrown error
+ * belongs to the caller to report. Only `RedemptionRacedError` is caught, and
+ * only because it is this module's own rollback signal rather than a fault.
  */
-export async function settleFirstAuthenticatedSession(
+export async function settleAcceptedClaim(
   userId: string,
+  code: string,
   now: Date = new Date()
 ): Promise<ReferralClaimOutcome> {
   try {
-    return await settleInTransaction(userId, now)
+    return await settleInTransaction(userId, code, now)
   } catch (error) {
     if (error instanceof RedemptionRacedError) {
       return { kind: 'raced' }
@@ -367,6 +534,7 @@ export async function settleFirstAuthenticatedSession(
 
 async function settleInTransaction(
   userId: string,
+  acceptedCode: string,
   now: Date
 ): Promise<ReferralClaimOutcome> {
   return prisma.$transaction(async (tx) => {
@@ -389,13 +557,6 @@ async function settleInTransaction(
       return { kind: 'no-account' as const }
     }
 
-    // Adoption. Guarded on the prior value so a household's fiftieth sign-in
-    // costs a `WHERE` and no `UPDATE`.
-    await tx.user.updateMany({
-      where: { id: userId, unclaimedSince: { not: null } },
-      data: { unclaimedSince: null },
-    })
-
     const profile = account.clientProfile
 
     if (
@@ -408,6 +569,10 @@ async function settleInTransaction(
 
     const code = profile.claimedReferralCode
     const claimedAt = profile.claimedReferralCodeAt
+
+    if (code !== acceptedCode) {
+      return { kind: 'mismatch' as const, standing: code }
+    }
 
     // Consume before deciding. A claim is a one-shot token, and the swap is what
     // says so to a second transaction rather than to a reader.
@@ -429,18 +594,21 @@ async function settleInTransaction(
       { kind: 'code', code },
       userId,
       {
-        // The household heuristic applies. This settlement is nobody's escape
+        // The household heuristic applies. This acceptance is nobody's escape
         // hatch: the only caller who may switch it off is an `ADMIN` acting
-        // deliberately through `redeemReferralCode`, and an Auth.js event is not
-        // an administrator.
+        // deliberately through `redeemReferralCode`, and a client consenting on
+        // their own behalf is not an administrator.
         applyHouseholdHeuristic: true,
         // The moment the code was typed into the enquiry form, not the moment
-        // this sign-in proved the mailbox (MCV-051). Those are the same
-        // intention separated by up to `CLAIM_WINDOW_DAYS`, and the claim is
-        // what the household actually did; dating the referral to the sign-in
-        // would let a bill paid in between count as prior custom and refuse a
+        // the household clicked accept (MCV-051). Those are the same intention
+        // separated by up to `CLAIM_WINDOW_DAYS`, and the claim is what the
+        // household actually did; dating the referral to the acceptance would
+        // let a bill paid in between count as prior custom and refuse a
         // perfectly genuine acquisition. `claimHasLapsed` above has already
-        // bounded how far back this can reach.
+        // bounded how far back this can reach, and `createReferralRedemption`
+        // clamps it again. This backdating is the one thing the column carries
+        // forward, and it decides *when* an invitation counts from — never
+        // whether it counts, and never who is paid.
         establishedAt: claimedAt,
       }
     )
@@ -466,7 +634,66 @@ async function settleInTransaction(
 }
 
 // =============================================================================
-// 5. Adoption at an OAuth door
+// 6. The other half of the choice
+// =============================================================================
+
+/** What {@link declineReferralClaim} did. */
+export type ReferralClaimDismissal =
+  /** The claim is gone. Nothing was ever written that needed reversing. */
+  | { readonly kind: 'declined'; readonly code: string }
+  /** No `ClientProfile`, or no claim on it. */
+  | { readonly kind: 'nothing-claimed' }
+  /** A claim stands, but not the one the household was shown. */
+  | { readonly kind: 'mismatch'; readonly standing: string }
+
+/**
+ * Clear the claim, because the household says it is not theirs.
+ *
+ * Consent is a choice, and a choice needs both answers. Without this the only
+ * way to be rid of an invitation a stranger sprayed at your address is to wait
+ * {@link CLAIM_WINDOW_DAYS} for it to lapse, which leaves the prompt in front of
+ * the household for a month — and a prompt that cannot be dismissed is one
+ * people eventually click through.
+ *
+ * Nothing is reversed because nothing was written: a claim is a string. Declining
+ * is a plain compare-and-swap on the same two columns, guarded on the code the
+ * household was shown for the same reason {@link settleAcceptedClaim} is — a
+ * decline rendered against one code must not silently discard another.
+ *
+ * Same caller contract as {@link settleAcceptedClaim}: `userId` is the resolved
+ * session's own id, never an id from client input.
+ */
+export async function declineReferralClaim(
+  userId: string,
+  code: string
+): Promise<ReferralClaimDismissal> {
+  const profile = await prisma.clientProfile.findUnique({
+    where: { userId },
+    select: { id: true, claimedReferralCode: true },
+  })
+
+  if (profile === null || profile.claimedReferralCode === null) {
+    return { kind: 'nothing-claimed' }
+  }
+
+  if (profile.claimedReferralCode !== code) {
+    return { kind: 'mismatch', standing: profile.claimedReferralCode }
+  }
+
+  const cleared = await prisma.clientProfile.updateMany({
+    where: { id: profile.id, claimedReferralCode: code },
+    data: { claimedReferralCode: null, claimedReferralCodeAt: null },
+  })
+
+  // A concurrent decline or acceptance got there first. Either way the claim is
+  // no longer standing, which is what the household asked for.
+  return cleared.count === 1
+    ? { kind: 'declined', code }
+    : { kind: 'nothing-claimed' }
+}
+
+// =============================================================================
+// 7. Adoption at an OAuth door
 // =============================================================================
 
 /**
@@ -540,9 +767,13 @@ export type AccountAdoptionOutcome =
  * rather than the callback having to return some verdict Auth.js has no way to
  * act on.
  *
- * The claim on that profile is untouched here. It settles in
- * {@link settleFirstAuthenticatedSession}, from the `signIn` *event*, which is
- * the one place that decision is made.
+ * The claim on that profile is untouched here, and adopting the row does not
+ * settle it. Proving a mailbox is not consenting to an attribution: the claim
+ * keeps standing until the household accepts it through
+ * {@link settleAcceptedClaim} or clears it through
+ * {@link declineReferralClaim}. Nothing on this path may shortcut that, however
+ * convincing the proof of the mailbox is — that shortcut is exactly what round
+ * four measured paying 5000 cents to a stranger.
  */
 export async function adoptUnclaimedAccount(
   email: string,

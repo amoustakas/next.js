@@ -10,13 +10,19 @@
  * this codebase works to, and a dashboard that merely reports is exactly the
  * case it was chosen for.
  *
- * The three reads are issued together rather than in sequence. They are
+ * The reads are issued together rather than in sequence. They are
  * independent — different tables, different actions — so awaiting them one
  * after another would make the page as slow as their sum for no reason.
  *
  * Each read is allowed to fail on its own. A rate-limited referral read must
  * not blank out the appointment that a household is trying to check the time
  * of, so every section renders either its data or its own named failure.
+ *
+ * The pending-referral-claim read is the exception: it has no section of its
+ * own, no `ActionError` panel, and renders nothing at all on failure or on
+ * "no claim standing" alike. See `ReferralClaimBanner` for why an optional
+ * consent prompt is allowed to fail quietly where the sections above it are
+ * not.
  */
 
 import type * as React from 'react'
@@ -24,6 +30,7 @@ import Link from 'next/link'
 import { ArrowRight, CalendarDays, CreditCard, Gift } from 'lucide-react'
 
 import { ActionError } from '@/components/portal/action-error'
+import { ReferralClaimBanner } from '@/components/portal/referral-claim-banner'
 import {
   AppointmentStatusBadge,
   SubscriptionStatusBadge,
@@ -48,6 +55,7 @@ import { Separator } from '@/components/ui/separator'
 import { listAppointments } from '@/server/actions/booking'
 import { listSubscriptions } from '@/server/actions/billing'
 import { readReferralOverview } from '@/server/actions/referral'
+import { readPendingReferralClaim } from '@/server/actions/referral-claim'
 
 export const metadata = {
   title: 'Overview',
@@ -56,20 +64,27 @@ export const metadata = {
 export default async function PortalOverviewPage(): Promise<React.JSX.Element> {
   const now = new Date()
 
-  const [appointments, subscriptions, referrals] = await Promise.all([
-    listAppointments({ startsFrom: now, sortDirection: 'asc', pageSize: 3 }),
-    listSubscriptions({ pageSize: 5 }),
-    readReferralOverview({ pageSize: 1 }),
-  ])
+  const [appointments, subscriptions, referrals, pendingReferralClaim] =
+    await Promise.all([
+      listAppointments({ startsFrom: now, sortDirection: 'asc', pageSize: 3 }),
+      listSubscriptions({ pageSize: 5 }),
+      readReferralOverview({ pageSize: 1 }),
+      readPendingReferralClaim({}),
+    ])
 
   const upcoming = appointments.ok ? appointments.data.items : []
   const nextAppointment = upcoming[0] ?? null
   const subscription = subscriptions.ok
     ? pickCurrentSubscription(subscriptions.data.items)
     : null
+  const pendingClaim = pendingReferralClaim.ok
+    ? pendingReferralClaim.data
+    : null
 
   return (
     <div className="flex flex-col gap-10">
+      <ReferralClaimBanner claim={pendingClaim} />
+
       {/* ---- The next appointment ------------------------------------- */}
       <section aria-labelledby="next-appointment-heading">
         <Card variant="elevated" as="article">

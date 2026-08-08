@@ -59,10 +59,21 @@
  *    sign-in for that address would fail with `OAuthAccountNotLinked` for ever —
  *    so an anonymous enquiry could deny registration to any mailbox. The `signIn`
  *    **callback** adopts such a placeholder instead, and only such a placeholder.
- *  - A referral code typed into a public form is stored as a string with no
- *    financial meaning. The `signIn` **event** is where it becomes a
- *    `ReferralRedemption`, once, through the same canonical writer every other
- *    path uses — because until this file has run, nobody has proved anything.
+ *  - The `signIn` **event** clears `unclaimedSince`, because the placeholder is
+ *    now a real account.
+ *
+ * ## What this file deliberately does *not* do (MCV-052)
+ *
+ * It does not settle referral claims. Until the fourth audit round the `signIn`
+ * event turned `ClientProfile.claimedReferralCode` into a `ReferralRedemption`,
+ * on the reasoning that a proved mailbox is the earliest safe moment. It is not
+ * a safe moment, because it is not the household's decision: an anonymous caller
+ * sprayed a code at an address, the genuine owner later signed in organically,
+ * and the sprayer was credited 5000 cents by this event. Proving a mailbox says
+ * "I am this person"; it does not say "and I accept that attribution". Only the
+ * household's explicit acceptance does, through
+ * `settleAcceptedClaim` / `declineReferralClaim`. Signing in must never again
+ * create a `ReferralRedemption`, however narrow the guard around it looks.
  *
  * ## Environment
  *
@@ -88,7 +99,7 @@ import { z } from 'zod'
 import { prisma } from '@/server/db'
 import {
   adoptUnclaimedAccount,
-  settleFirstAuthenticatedSession,
+  markMailboxProved,
   type OAuthAccountLink,
 } from '@/server/referral-claim'
 
@@ -495,25 +506,39 @@ export const authConfig = {
      *
      * This event fires after Auth.js has verified a magic link or completed an
      * OAuth exchange, which makes it the earliest point at which the platform
-     * knows the caller controls the address — the property MCV-050 is about, and
-     * the one the `created | matched` discriminant in `actions/intake.ts` was
-     * mistaken for. Two things happen:
+     * knows the caller controls the address. Two things happen, and both are
+     * bookkeeping:
      *
      *  1. `User.lastLoginAt` is stamped. Purely informational — the CRM sorts
      *     dormant households by it.
-     *  2. {@link settleFirstAuthenticatedSession} clears `unclaimedSince` and
-     *     settles whatever referral *claim* the household's public enquiry
-     *     recorded, by re-running the canonical eligibility predicate now and
-     *     writing through `createReferralRedemption`. A claim is a string until
-     *     it gets here; this is the only place it becomes money, and it can
-     *     become money at most once because the claim is consumed by a
-     *     compare-and-swap.
+     *  2. {@link markMailboxProved} clears `User.unclaimedSince`, so a row the
+     *     public intake path opened for an unproved address stops being a
+     *     placeholder.
      *
-     * Both failures are logged and swallowed rather than allowed to break a
-     * sign-in that has otherwise succeeded. A household must never be shown "try
-     * again" — which reads as a rejected sign-in — because an attribution could
-     * not be settled. The claim survives an aborted transaction, so the next
-     * sign-in settles it instead of it being silently spent.
+     * ## No referral is settled here (MCV-052)
+     *
+     * This event used to call `settleFirstAuthenticatedSession`, which wrote a
+     * `ReferralRedemption` from whatever code the household's public enquiry had
+     * carried. That call is gone, and it must not come back in any form.
+     *
+     * The reason is not that the guard around it was too loose. It is that a
+     * sign-in cannot carry the information the decision needs. "A stranger typed
+     * a code against your address, then you signed in" and "you typed a code,
+     * then you signed in" are the same two HTTP requests from the server's side,
+     * so any rule that settles automatically at this point is a rule an
+     * unauthenticated party can aim. Round four measured exactly that: one
+     * anonymous call, then the victim's own organic magic-link sign-in and
+     * payment, `{examined: 1, rewarded: 1, creditedCents: 5000}` to the stranger.
+     *
+     * A claim now becomes money only in `settleAcceptedClaim`, called by the
+     * consent action on behalf of the signed-in household. Nothing in this file
+     * has a use for it: an Auth.js event has no household in front of it to ask.
+     *
+     * Failures are logged and swallowed rather than allowed to break a sign-in
+     * that has otherwise succeeded. A household must never be shown "try again",
+     * which reads as a rejected sign-in, because a bookkeeping write failed.
+     * Neither write carries money, so losing one costs a stale column and not a
+     * cent.
      */
     async signIn({ user }) {
       if (typeof user.id !== 'string') {
@@ -535,32 +560,16 @@ export const authConfig = {
       }
 
       try {
-        const outcome = await settleFirstAuthenticatedSession(userId)
+        const outcome = await markMailboxProved(userId)
 
-        // Record what happened. The outcome union is the only account of a
-        // decision that moves money, and this event returns nothing to anybody,
-        // so leaving it unread would make a settlement — or a refusal a
-        // household will ask about — invisible outside the harness.
-        //
-        // `nothing-claimed` is skipped because it is the outcome of essentially
-        // every sign-in on the platform, and a line printed on all of them is
-        // one nobody reads. The code is included: it is an invitation the owner
-        // hands out, not a credential, and a refusal cannot be investigated
-        // without knowing which code was refused. No reward amount or invoice is
-        // logged — those live in the ledger.
-        if (outcome.kind !== 'nothing-claimed') {
-          console.info('[auth] referral claim settlement', {
-            userId,
-            outcome: outcome.kind,
-            ...('code' in outcome ? { code: outcome.code } : {}),
-            ...(outcome.kind === 'refused' ? { reason: outcome.reason } : {}),
-            ...(outcome.kind === 'settled'
-              ? { redemptionId: outcome.redemptionId }
-              : {}),
-          })
+        // Only the transition is worth a line. `not-applicable` is the outcome
+        // of essentially every sign-in on the platform, and a line printed on
+        // all of them is one nobody reads.
+        if (outcome.kind === 'newly-proved') {
+          console.info('[auth] unclaimed account proved by sign-in', { userId })
         }
       } catch (error) {
-        console.error('[auth] failed to settle a referral claim', {
+        console.error('[auth] failed to clear unclaimedSince', {
           userId,
           error: error instanceof Error ? error.message : 'unknown',
         })

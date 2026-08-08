@@ -45,7 +45,7 @@
  * `attachReferral` is gone. A public enquiry no longer writes a
  * `ReferralRedemption` at all — it records `ClientProfile.claimedReferralCode`,
  * a string with no financial meaning — and the redemption is written by
- * `settleFirstAuthenticatedSession` at the household's first sign-in, through
+ * `acceptReferralClaim` when the household consents to it, through
  * `createReferralRedemption`. So the cap moved *with the write*, which is the
  * only place a cap can be enforced, and the public path carries no cap check at
  * all: it writes nothing a cap could bound.
@@ -75,12 +75,13 @@ import assert from 'node:assert/strict'
 
 import { requestConsultation } from '@/server/actions/intake'
 import { createReferralCode } from '@/server/actions/referral'
+import { acceptReferralClaim } from '@/server/actions/referral-claim'
 import type { ActionResult } from '@/server/actions/types'
 import { prisma } from '@/server/db'
-import { settleFirstAuthenticatedSession } from '@/server/referral-claim'
+import { markMailboxProved } from '@/server/referral-claim'
 
 import { legacyRequestConsultation } from './fixtures/intake-legacy'
-import { signInAs } from './fixtures/harness-state'
+import { asUser, signInAs, type HarnessUser } from './fixtures/harness-state'
 import {
   ATTACKER,
   assertDisposableDatabase,
@@ -178,22 +179,68 @@ function guestEmail(index: number): string {
 }
 
 /**
- * The first authenticated session for each address, in the order they enquired.
+ * The session a guest holds once they have clicked the magic link in their own
+ * inbox.
  *
- * This is the step MCV-050 inserted between an enquiry and a redemption: the
- * guest clicks the magic link in their own inbox, and *that* is when the code
- * they typed is offered to `resolveRedemptionEligibility` and, if it is still
- * open, written. `authConfig.events.signIn` calls exactly this function with
- * exactly this argument; `server/auth.ts` cannot be imported outside a Next.js
- * runtime, which is why the decision lives in a plain server module.
+ * `markMailboxProved` is what `authConfig.events.signIn` calls; the
+ * `HarnessUser` is what the `auth: 'SESSION'` actions read through the stubbed
+ * `getSessionUser`. Both are needed, because since MCV-052 proving the mailbox
+ * and accepting the invitation are two separate acts by the same person.
  */
-async function signInEach(emails: readonly string[]): Promise<void> {
+async function provedSessionFor(email: string): Promise<HarnessUser> {
+  const row = await prisma.user.findUniqueOrThrow({
+    where: { email },
+    select: {
+      id: true,
+      name: true,
+      email: true,
+      role: true,
+      clientProfile: { select: { id: true } },
+    },
+  })
+
+  await markMailboxProved(row.id)
+
+  return {
+    id: row.id,
+    name: row.name,
+    email: row.email,
+    image: null,
+    role: row.role,
+    isActive: true,
+    timeZone: 'America/Toronto',
+    locale: 'en-CA',
+    clientProfileId: row.clientProfile?.id ?? null,
+    staffProfileId: null,
+  }
+}
+
+/**
+ * Each guest signs in and accepts the invitation they typed, in the order they
+ * enquired.
+ *
+ * This is the step that writes the redemption. MCV-050 moved it off the public
+ * enquiry and onto the first authenticated session; MCV-052 moved it again, off
+ * the session and onto the household's **explicit acceptance** — an automatic
+ * settlement at sign-in paid a sprayer for a victim's own organic sign-in, and
+ * no narrowing of it helped, because the server cannot tell the two apart.
+ *
+ * Nothing about *this* regression changed with it: the cap still binds where the
+ * redemption is written, and this is still one guest doing one guest's worth of
+ * things.
+ */
+async function signInAndAcceptEach(emails: readonly string[]): Promise<void> {
   for (const email of emails) {
     const userId = await userIdForEmail(email)
 
     assert.notEqual(userId, null, `no account was opened for ${email}`)
 
-    await settleFirstAuthenticatedSession(userId ?? '')
+    const guest = await provedSessionFor(email)
+
+    signInAs(guest)
+    clearRateLimits()
+    await acceptReferralClaim({ code: CODE })
+    signInAs(null)
   }
 }
 
@@ -310,7 +357,7 @@ async function scenarioFixed(): Promise<CapOutcome> {
 
   const claimed = await readOutcome(codeId, ATTEMPTS)
 
-  await signInEach(emails)
+  await signInAndAcceptEach(emails)
 
   const outcome = await readOutcome(codeId, ATTEMPTS)
 
@@ -406,8 +453,23 @@ async function scenarioConcurrent(): Promise<void> {
     userIds.push(userId ?? '')
   }
 
+  // Every mailbox is proved first, sequentially, because that is not the step
+  // under contention. The four acceptances are what race for the two seats.
+  const guests: HarnessUser[] = []
+
+  for (let index = 0; index < CONCURRENT; index += 1) {
+    guests.push(await provedSessionFor(guestEmail(100 + index)))
+  }
+
+  clearRateLimits()
+
   await Promise.all(
-    userIds.map(async (userId) => settleFirstAuthenticatedSession(userId))
+    guests.map(async (guest) =>
+      // `asUser` rather than `signInAs`: four households accepting at the same
+      // instant are four sessions, and a process-wide caller slot could only
+      // name one of them.
+      asUser(guest, async () => acceptReferralClaim({ code: CODE }))
+    )
   )
 
   const outcome = await readOutcome(codeId, CONCURRENT)
@@ -474,7 +536,7 @@ async function scenarioUncapped(): Promise<void> {
     )
   }
 
-  await signInEach(emails)
+  await signInAndAcceptEach(emails)
 
   const outcome = await readOutcome(codeId, 3)
 

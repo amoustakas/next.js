@@ -462,10 +462,10 @@ export async function unclaimedSinceOf(userId: string): Promise<Date | null> {
 /**
  * Age a claim, so the lapse window can be crossed without waiting a month.
  *
- * The column is moved rather than the clock, because
- * `settleFirstAuthenticatedSession` takes `now` as an argument and a harness
- * that passed a future date would be testing its own arithmetic. This moves the
- * *data* into the past and lets the real default `now` decide.
+ * The column is moved rather than the clock, because `settleAcceptedClaim` takes
+ * `now` as an argument and a harness that passed a future date would be testing
+ * its own arithmetic. This moves the *data* into the past and lets the real
+ * default `now` decide.
  */
 export async function backdateReferralClaim(
   clientProfileId: string,
