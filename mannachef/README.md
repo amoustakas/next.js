@@ -311,3 +311,18 @@ DATABASE_URL='postgresql://…@localhost:5432/mannachef_harness' \
 
 Neither writes to the database `DATABASE_URL` names; both derive their own
 scratch database from its name. See `packages/db/README.md`.
+
+## Building
+
+`next build` requires a reachable `DATABASE_URL`: `generateStaticParams` for
+`/menu/[slug]` reads real dishes, and it fails loudly rather than silently
+prerendering nothing. Point it at any database with the migrations applied:
+
+```bash
+createdb mannachef_build
+DATABASE_URL=postgresql://…/mannachef_build pnpm --filter @mannachef/db exec prisma migrate deploy
+DATABASE_URL=postgresql://…/mannachef_build pnpm --filter @mannachef/web build
+```
+
+Verified: 6 migrations apply clean, `next build` exits 0, and `/`, `/about`
+and `/contact` prerender static while `/menu/[slug]` is SSG.
