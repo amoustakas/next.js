@@ -59,6 +59,7 @@ import {
 } from 'lucide-react'
 
 import {
+  MAX_EXPANSION_DAYS,
   occupiedInterval,
   resolveWallClock,
   timeZoneOffsetMs,
@@ -95,6 +96,12 @@ const DEFAULT_WINDOW_END_MINUTE = 22 * 60
 
 /** Below this height a band cannot carry a legible label, only its texture. */
 const MIN_LABELLED_BAND_PX = 22
+
+/** A stable identity, so an omitted `rules` prop cannot churn memos. */
+const EMPTY_RULES: readonly CalendarAvailabilityRule[] = []
+
+/** A stable identity, so an omitted `blackouts` prop cannot churn memos. */
+const EMPTY_BLACKOUTS: readonly CalendarBlackout[] = []
 
 /** Below this height a block collapses to a single line. */
 const MIN_DETAILED_BLOCK_PX = 64
@@ -241,11 +248,18 @@ const SERVICE_TYPE_LABELS: Readonly<Record<ServiceType, string>> = {
 
 /** What a block is called: an explicit title, else the service, else a noun. */
 function appointmentLabel(appointment: CalendarAppointment): string {
-  if (appointment.title !== null && appointment.title !== undefined && appointment.title !== '') {
+  if (
+    appointment.title !== null &&
+    appointment.title !== undefined &&
+    appointment.title !== ''
+  ) {
     return appointment.title
   }
 
-  if (appointment.serviceType !== null && appointment.serviceType !== undefined) {
+  if (
+    appointment.serviceType !== null &&
+    appointment.serviceType !== undefined
+  ) {
     return SERVICE_TYPE_LABELS[appointment.serviceType]
   }
 
@@ -262,7 +276,11 @@ function appointmentPlace(appointment: CalendarAppointment): string | null {
     return appointment.locationLabel
   }
 
-  if (appointment.city !== null && appointment.city !== undefined && appointment.city !== '') {
+  if (
+    appointment.city !== null &&
+    appointment.city !== undefined &&
+    appointment.city !== ''
+  ) {
     return appointment.city
   }
 
@@ -313,6 +331,51 @@ function civilDateIn(timeZone: string, instant: Date): CivilDate {
     month: shifted.getUTCMonth() + 1,
     day: shifted.getUTCDate(),
   }
+}
+
+const DATE_KEY_PATTERN = /^(\d{4})-(\d{2})-(\d{2})$/
+
+/**
+ * `2026-03-08` as a civil date, or `null` for anything else.
+ *
+ * Returning `null` rather than throwing matters: the key usually comes from a
+ * query string, where a person can type anything, and a mistyped `?date=` should
+ * fall back to today rather than take the page down.
+ */
+function parseDateKey(key: string): CivilDate | null {
+  const match = DATE_KEY_PATTERN.exec(key)
+
+  if (match === null) {
+    return null
+  }
+
+  const [, yearText, monthText, dayText] = match
+
+  if (
+    yearText === undefined ||
+    monthText === undefined ||
+    dayText === undefined
+  ) {
+    return null
+  }
+
+  const year = Number(yearText)
+  const month = Number(monthText)
+  const day = Number(dayText)
+
+  if (month < 1 || month > 12 || day < 1 || day > 31) {
+    return null
+  }
+
+  // Rejects 31 April and 29 February in a common year: `Date.UTC` rolls them
+  // into the next month, so a round trip that changes the day was not a date.
+  const roundTrip = new Date(Date.UTC(year, month - 1, day))
+
+  if (roundTrip.getUTCMonth() + 1 !== month || roundTrip.getUTCDate() !== day) {
+    return null
+  }
+
+  return { year, month, day }
 }
 
 /** 0 = Sunday … 6 = Saturday, for a civil date. */
@@ -465,6 +528,33 @@ function offsetLabel(formatters: ZoneFormatters, instant: Date): string {
     .find((candidate) => candidate.type === 'timeZoneName')
 
   return part === undefined ? '' : part.value
+}
+
+/**
+ * A window's provenance, for its native tooltip.
+ *
+ * `AvailabilityWindow.sourceRuleIds` names the rules `expandAvailability`
+ * combined to produce the window. Showing them turns "the chef is free here"
+ * into "the chef is free here *because* of the Tuesday evening rule", which is
+ * the difference between a calendar you read and one you can edit.
+ */
+function describeRules(
+  ruleIds: readonly string[],
+  rulesById: ReadonlyMap<string, CalendarAvailabilityRule>
+): string | undefined {
+  const described = ruleIds
+    .map((ruleId) => rulesById.get(ruleId))
+    .filter((rule): rule is CalendarAvailabilityRule => rule !== undefined)
+    .map((rule) => {
+      const name =
+        rule.reason === null || rule.reason === undefined || rule.reason === ''
+          ? 'Open'
+          : rule.reason
+
+      return `${name} ${rulerLabel(rule.startMinute)}–${rulerLabel(rule.endMinute)}`
+    })
+
+  return described.length === 0 ? undefined : described.join(' · ')
 }
 
 /** `09:00` for a ruler minute, from arithmetic rather than a formatter. */
@@ -752,6 +842,50 @@ function buildColumns(
   )
 }
 
+/**
+ * The civil days a caller-supplied half-open instant range covers.
+ *
+ * Walked day by day rather than divided, because a range crossing a transition
+ * is not a whole number of 24-hour days and dividing would drop or duplicate
+ * one. `MAX_EXPANSION_DAYS` — the engine's own ceiling on how much calendar it
+ * will materialise at once — bounds the walk, so a caller that passes a decade
+ * gets a clipped grid instead of a frozen tab.
+ */
+function buildColumnsForRange(
+  timeZone: string,
+  rangeStart: Date,
+  rangeEnd: Date,
+  focusMonth: number | null,
+  now: Date
+): readonly DayColumn[] {
+  const todayKeyMs = civilKeyMs(civilDateIn(timeZone, now))
+  const columns: DayColumn[] = []
+
+  let civil = civilDateIn(timeZone, rangeStart)
+
+  while (columns.length < MAX_EXPANSION_DAYS) {
+    const column = buildDayColumn(timeZone, civil, todayKeyMs, focusMonth)
+
+    if (column.start >= rangeEnd) {
+      break
+    }
+
+    columns.push(column)
+    civil = addCivilDays(civil, 1)
+  }
+
+  return columns.length === 0
+    ? [
+        buildDayColumn(
+          timeZone,
+          civilDateIn(timeZone, rangeStart),
+          todayKeyMs,
+          focusMonth
+        ),
+      ]
+    : columns
+}
+
 function shiftAnchor(
   timeZone: string,
   view: CalendarView,
@@ -843,7 +977,7 @@ interface PositionedAppointment {
 interface ColumnData {
   readonly column: DayColumn
   readonly positioned: readonly PositionedAppointment[]
-  readonly availability: readonly TimeInterval[]
+  readonly availability: readonly AvailabilityWindow[]
   readonly blackouts: readonly CalendarBlackout[]
 }
 
@@ -960,11 +1094,15 @@ export function CalendarGrid({
   timeZone,
   anchorDate,
   defaultAnchorDate,
+  focusedDate,
   view,
   defaultView = 'week',
+  rangeStart,
+  rangeEnd,
   appointments,
   availabilityWindows,
   blackouts,
+  rules,
   weekStartsOn = 0,
   slotMinutes = 30,
   hourHeight = 64,
@@ -993,10 +1131,33 @@ export function CalendarGrid({
     React.useState<CalendarView>(defaultView)
   const activeView = view ?? internalView
 
+  // `focusedDate` is a calendar date, not an instant: it is resolved at midday
+  // in the chef's zone so no transition can push it onto the neighbouring day.
+  const focusedAnchor = React.useMemo(() => {
+    if (focusedDate === undefined) {
+      return null
+    }
+
+    const parsed = parseDateKey(focusedDate)
+
+    return parsed === null
+      ? null
+      : resolveWallClock(parsed, 12 * 60, zone).instant
+  }, [focusedDate, zone])
+
   const [internalAnchor, setInternalAnchor] = React.useState<Date>(
     () => defaultAnchorDate ?? effectiveNow
   )
-  const activeAnchor = anchorDate ?? internalAnchor
+  const activeAnchor = anchorDate ?? focusedAnchor ?? internalAnchor
+
+  // A control this grid cannot actually operate is not rendered. A Server
+  // Component that owns the range in the URL passes `view`/`focusedDate` with
+  // no setters and draws its own links; duplicating dead chrome under them
+  // would be worse than showing none.
+  const canChangeView = view === undefined || onViewChange !== undefined
+  const canChangeRange =
+    (anchorDate === undefined && focusedDate === undefined) ||
+    onAnchorDateChange !== undefined
 
   const changeView = React.useCallback(
     (next: CalendarView) => {
@@ -1010,20 +1171,59 @@ export function CalendarGrid({
 
   const changeAnchor = React.useCallback(
     (next: Date) => {
-      if (anchorDate === undefined) {
+      if (anchorDate === undefined && focusedDate === undefined) {
         setInternalAnchor(next)
       }
       onAnchorDateChange?.(next)
     },
-    [anchorDate, onAnchorDateChange]
+    [anchorDate, focusedDate, onAnchorDateChange]
+  )
+
+  const rulesById = React.useMemo(() => {
+    const map = new Map<string, CalendarAvailabilityRule>()
+
+    ;(rules ?? EMPTY_RULES).forEach((rule) => {
+      map.set(rule.id, rule)
+    })
+
+    return map
+  }, [rules])
+
+  const blackoutRuleCount = React.useMemo(
+    () => (rules ?? EMPTY_RULES).filter((rule) => rule.isBlackout).length,
+    [rules]
   )
 
   const formatters = React.useMemo(() => buildFormatters(zone), [zone])
 
   const columns = React.useMemo(
     () =>
-      buildColumns(zone, activeView, activeAnchor, weekStartsOn, effectiveNow),
-    [zone, activeView, activeAnchor, weekStartsOn, effectiveNow]
+      rangeStart !== undefined && rangeEnd !== undefined
+        ? buildColumnsForRange(
+            zone,
+            rangeStart,
+            rangeEnd,
+            activeView === 'month'
+              ? civilDateIn(zone, activeAnchor).month
+              : null,
+            effectiveNow
+          )
+        : buildColumns(
+            zone,
+            activeView,
+            activeAnchor,
+            weekStartsOn,
+            effectiveNow
+          ),
+    [
+      zone,
+      activeView,
+      activeAnchor,
+      weekStartsOn,
+      effectiveNow,
+      rangeStart,
+      rangeEnd,
+    ]
   )
 
   const columnData = React.useMemo(
@@ -1033,7 +1233,7 @@ export function CalendarGrid({
         columns,
         appointments,
         availabilityWindows,
-        blackouts
+        blackouts ?? EMPTY_BLACKOUTS
       ),
     [zone, columns, appointments, availabilityWindows, blackouts]
   )
@@ -1148,21 +1348,24 @@ export function CalendarGrid({
       switch (event.key) {
         case 'ArrowRight':
           event.preventDefault()
-          if (day >= lastDay) {
+          if (day < lastDay) {
+            moveFocus({ day: day + 1, slot })
+          } else if (canChangeRange) {
+            // At the right edge, stepping the range is the only way "next day"
+            // can mean anything. When the range is not this component's to
+            // change, focus stays put rather than appearing to do nothing.
             changeAnchor(shiftAnchor(zone, activeView, activeAnchor, 1))
             moveFocus({ day: activeView === 'day' ? 0 : lastDay, slot })
-          } else {
-            moveFocus({ day: day + 1, slot })
           }
           break
 
         case 'ArrowLeft':
           event.preventDefault()
-          if (day <= 0) {
-            changeAnchor(shiftAnchor(zone, activeView, activeAnchor, -1))
-            moveFocus({ day: activeView === 'day' ? 0 : 0, slot })
-          } else {
+          if (day > 0) {
             moveFocus({ day: day - 1, slot })
+          } else if (canChangeRange) {
+            changeAnchor(shiftAnchor(zone, activeView, activeAnchor, -1))
+            moveFocus({ day: 0, slot })
           }
           break
 
@@ -1187,13 +1390,17 @@ export function CalendarGrid({
           break
 
         case 'PageUp':
-          event.preventDefault()
-          changeAnchor(shiftAnchor(zone, activeView, activeAnchor, -1))
+          if (canChangeRange) {
+            event.preventDefault()
+            changeAnchor(shiftAnchor(zone, activeView, activeAnchor, -1))
+          }
           break
 
         case 'PageDown':
-          event.preventDefault()
-          changeAnchor(shiftAnchor(zone, activeView, activeAnchor, 1))
+          if (canChangeRange) {
+            event.preventDefault()
+            changeAnchor(shiftAnchor(zone, activeView, activeAnchor, 1))
+          }
           break
 
         case 'Enter':
@@ -1209,6 +1416,7 @@ export function CalendarGrid({
     [
       activeAnchor,
       activeView,
+      canChangeRange,
       changeAnchor,
       clampedFocus,
       columns.length,
@@ -1264,7 +1472,7 @@ export function CalendarGrid({
   const hasAnything =
     appointments.length > 0 ||
     availabilityWindows.length > 0 ||
-    blackouts.length > 0
+    (blackouts ?? EMPTY_BLACKOUTS).length > 0
 
   const minuteToPx = hourHeight / 60
   const bodyHeight =
@@ -1316,6 +1524,8 @@ export function CalendarGrid({
         <CalendarHeader
           activeView={activeView}
           anchorOffset={anchorOffset}
+          canChangeRange={canChangeRange}
+          canChangeView={canChangeView}
           onGoToToday={() => {
             changeAnchor(effectiveNow)
           }}
@@ -1375,6 +1585,7 @@ export function CalendarGrid({
             onGridKeyDown={onGridKeyDown}
             onSelectAppointment={onSelectAppointment}
             openAt={openAt}
+            rulesById={rulesById}
             setFocus={setFocus}
             slotCount={slotCount}
             slotMinutes={slotMinutes}
@@ -1384,7 +1595,7 @@ export function CalendarGrid({
         )}
 
         <Separator variant="hairline" />
-        <BandLegend />
+        <BandLegend blackoutRuleCount={blackoutRuleCount} />
       </section>
     </TooltipProvider>
   )
@@ -1397,6 +1608,8 @@ export function CalendarGrid({
 interface CalendarHeaderProps {
   activeView: CalendarView
   anchorOffset: string
+  canChangeRange: boolean
+  canChangeView: boolean
   onGoToToday: () => void
   onStep: (direction: number) => void
   onViewChange: (view: CalendarView) => void
@@ -1408,6 +1621,8 @@ interface CalendarHeaderProps {
 function CalendarHeader({
   activeView,
   anchorOffset,
+  canChangeRange,
+  canChangeView,
   onGoToToday,
   onStep,
   onViewChange,
@@ -1421,31 +1636,35 @@ function CalendarHeader({
   return (
     <header className="flex flex-wrap items-center justify-between gap-4 px-4 py-3">
       <div className="flex items-center gap-2">
-        <Button
-          aria-label={`Previous ${stepNoun}`}
-          onClick={() => {
-            onStep(-1)
-          }}
-          size="icon"
-          variant="ghost"
-        >
-          <ChevronLeft aria-hidden="true" />
-        </Button>
-        <Button
-          aria-label={`Next ${stepNoun}`}
-          onClick={() => {
-            onStep(1)
-          }}
-          size="icon"
-          variant="ghost"
-        >
-          <ChevronRight aria-hidden="true" />
-        </Button>
-        <Button onClick={onGoToToday} size="sm" variant="outline">
-          Today
-        </Button>
+        {canChangeRange ? (
+          <>
+            <Button
+              aria-label={`Previous ${stepNoun}`}
+              onClick={() => {
+                onStep(-1)
+              }}
+              size="icon"
+              variant="ghost"
+            >
+              <ChevronLeft aria-hidden="true" />
+            </Button>
+            <Button
+              aria-label={`Next ${stepNoun}`}
+              onClick={() => {
+                onStep(1)
+              }}
+              size="icon"
+              variant="ghost"
+            >
+              <ChevronRight aria-hidden="true" />
+            </Button>
+            <Button onClick={onGoToToday} size="sm" variant="outline">
+              Today
+            </Button>
+          </>
+        ) : null}
 
-        <div className="ml-2 min-w-0">
+        <div className={cn('min-w-0', canChangeRange && 'ml-2')}>
           {/* The one champagne element in this group is the range title. */}
           <h2 className="truncate font-display text-xl leading-tight text-champagne">
             {rangeLabel}
@@ -1478,18 +1697,20 @@ function CalendarHeader({
         </div>
       </div>
 
-      <Tabs
-        onValueChange={(value) => {
-          onViewChange(value as CalendarView)
-        }}
-        value={activeView}
-      >
-        <TabsList aria-label="Calendar range">
-          <TabsTrigger value="day">Day</TabsTrigger>
-          <TabsTrigger value="week">Week</TabsTrigger>
-          <TabsTrigger value="month">Month</TabsTrigger>
-        </TabsList>
-      </Tabs>
+      {!canChangeView ? null : (
+        <Tabs
+          onValueChange={(value) => {
+            onViewChange(value as CalendarView)
+          }}
+          value={activeView}
+        >
+          <TabsList aria-label="Calendar range">
+            <TabsTrigger value="day">Day</TabsTrigger>
+            <TabsTrigger value="week">Week</TabsTrigger>
+            <TabsTrigger value="month">Month</TabsTrigger>
+          </TabsList>
+        </Tabs>
+      )}
     </header>
   )
 }
@@ -1512,7 +1733,7 @@ const LEGEND_DESCRIPTIONS: Readonly<Record<BandKind, string>> = {
   travelAfter: 'Coarse diagonal hatch, dashed edge — the drive home.',
 }
 
-function BandLegend() {
+function BandLegend({ blackoutRuleCount }: { blackoutRuleCount: number }) {
   return (
     <div className="flex flex-wrap items-center gap-x-5 gap-y-2 px-4 py-2.5">
       <span className="text-xs font-medium tracking-wide text-stone uppercase">
@@ -1534,6 +1755,13 @@ function BandLegend() {
       <p className="text-xs text-stone">
         Bands differ by texture and edge style as well as by colour.
       </p>
+      {blackoutRuleCount > 0 ? (
+        <p className="text-xs text-stone">
+          {blackoutRuleCount} blackout{' '}
+          {blackoutRuleCount === 1 ? 'rule' : 'rules'} already subtracted from
+          the open windows below.
+        </p>
+      ) : null}
     </div>
   )
 }
@@ -1555,6 +1783,7 @@ interface TimeGridProps {
   onGridKeyDown: (event: React.KeyboardEvent<HTMLDivElement>) => void
   onSelectAppointment: ((appointment: CalendarAppointment) => void) | undefined
   openAt: (dayIndex: number, slotIndex: number) => void
+  rulesById: ReadonlyMap<string, CalendarAvailabilityRule>
   setFocus: React.Dispatch<React.SetStateAction<{ day: number; slot: number }>>
   slotCount: number
   slotMinutes: number
@@ -1575,6 +1804,7 @@ function TimeGrid({
   onGridKeyDown,
   onSelectAppointment,
   openAt,
+  rulesById,
   setFocus,
   slotCount,
   slotMinutes,
@@ -1668,6 +1898,7 @@ function TimeGrid({
               now={now}
               onSelectAppointment={onSelectAppointment}
               openAt={openAt}
+              rulesById={rulesById}
               setFocus={setFocus}
               slotCount={slotCount}
               slotMinutes={slotMinutes}
@@ -1693,6 +1924,7 @@ interface DayColumnBodyProps {
   now: Date
   onSelectAppointment: ((appointment: CalendarAppointment) => void) | undefined
   openAt: (dayIndex: number, slotIndex: number) => void
+  rulesById: ReadonlyMap<string, CalendarAvailabilityRule>
   setFocus: React.Dispatch<React.SetStateAction<{ day: number; slot: number }>>
   slotCount: number
   slotMinutes: number
@@ -1712,6 +1944,7 @@ function DayColumnBody({
   now,
   onSelectAppointment,
   openAt,
+  rulesById,
   setFocus,
   slotCount,
   slotMinutes,
@@ -1774,6 +2007,7 @@ function DayColumnBody({
               top: `${String(top(startMinute))}px`,
               height: `${String(heightOf(startMinute, endMinute))}px`,
             }}
+            title={describeRules(availabilityWindow.sourceRuleIds, rulesById)}
           />
         )
       })}
@@ -1862,7 +2096,7 @@ function DayColumnBody({
           firstHit === undefined
             ? 'no engagements'
             : hits.length === 1
-              ? `1 engagement: ${firstHit.appointment.title}`
+              ? `1 engagement: ${appointmentLabel(firstHit.appointment)}`
               : `${String(hits.length)} overlapping engagements`
 
         const isFocused =
@@ -1984,8 +2218,9 @@ function AppointmentBlock({
     })
     .join(', ')
 
+  const place = appointmentPlace(appointment)
   const description = [
-    appointment.title,
+    appointmentLabel(appointment),
     appointment.clientName ?? null,
     `${STATUS_LABELS[appointment.status]}.`,
     `Service ${formatters.time.format(appointment.startsAt)} to ${formatters.time.format(
@@ -1995,10 +2230,7 @@ function AppointmentBlock({
       occupied.end
     )}, ${String(totalMinutes)} minutes in total.`,
     `${bandSentence}.`,
-    appointment.locationLabel === null ||
-    appointment.locationLabel === undefined
-      ? null
-      : `At ${appointment.locationLabel}.`,
+    place === null ? null : `At ${place}.`,
     appointment.guestCount === null || appointment.guestCount === undefined
       ? null
       : `${String(appointment.guestCount)} guests.`,
@@ -2091,7 +2323,7 @@ function AppointmentBlock({
               }}
             >
               <p className="truncate font-display text-sm leading-snug text-linen">
-                {appointment.title}
+                {appointmentLabel(appointment)}
               </p>
               {detailed ? (
                 <>
@@ -2112,16 +2344,13 @@ function AppointmentBlock({
                     </p>
                   )}
                   <p className="mt-0.5 flex items-center gap-2 text-[0.625rem] text-stone">
-                    {appointment.locationLabel === null ||
-                    appointment.locationLabel === undefined ? null : (
+                    {place === null ? null : (
                       <span className="flex min-w-0 items-center gap-1">
                         <MapPin
                           aria-hidden="true"
                           className="size-2.5 shrink-0"
                         />
-                        <span className="truncate">
-                          {appointment.locationLabel}
-                        </span>
+                        <span className="truncate">{place}</span>
                       </span>
                     )}
                     {appointment.guestCount === null ||
@@ -2360,7 +2589,7 @@ function MonthChip({ entry, formatters, onSelect, timeZone }: MonthChipProps) {
   return (
     <li>
       <button
-        aria-label={`${appointment.title}. ${STATUS_LABELS[appointment.status]}. Service ${formatters.time.format(
+        aria-label={`${appointmentLabel(appointment)}. ${STATUS_LABELS[appointment.status]}. Service ${formatters.time.format(
           appointment.startsAt
         )} to ${formatters.time.format(appointment.endsAt)} ${timeZone}. Chef committed from ${formatters.time.format(
           occupied.start
@@ -2398,7 +2627,7 @@ function MonthChip({ entry, formatters, onSelect, timeZone }: MonthChipProps) {
             {formatters.time.format(appointment.startsAt)}
           </span>
           <span className="truncate text-[0.6875rem] text-linen">
-            {appointment.title}
+            {appointmentLabel(appointment)}
           </span>
         </span>
         <Badge

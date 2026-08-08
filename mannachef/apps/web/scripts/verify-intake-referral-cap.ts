@@ -54,7 +54,8 @@
  * is precisely why the ceiling on the *redemptions* has to hold — fresh email
  * addresses cost nothing, so a code capped at five is still a code a scraper
  * would try to settle twelve times. The scenarios below therefore drive the
- * enquiry **and** the sign-in, which together are what one guest now does.
+ * enquiry, the sign-in **and** the acceptance, which together are what one guest
+ * now does — the redemption is written by the last of the three, not the second.
  *
  * The compare-and-swap is unchanged and is `createReferralRedemption`'s: the
  * counter is bumped with `updateMany` guarded on the value that was read, so a
@@ -66,9 +67,9 @@
  * | # | Shape                                                | Proves                              |
  * | - | ---------------------------------------------------- | ----------------------------------- |
  * | 1 | twelve enquiries, pre-fix source, cap 5              | twelve redemptions, counter at zero |
- * | 2 | twelve enquiries + twelve sign-ins, cap 5            | five redemptions, counter at five   |
- * | 3 | four enquiries, then four *simultaneous* sign-ins    | the cap holds under concurrency     |
- * | 4 | three enquiries + sign-ins, no cap at all            | an open code is not throttled       |
+ * | 2 | twelve enquiries + twelve acceptances, cap 5         | five redemptions, counter at five   |
+ * | 3 | four enquiries, then four *simultaneous* acceptances | the cap holds under concurrency     |
+ * | 4 | three enquiries + acceptances, no cap at all         | an open code is not throttled       |
  */
 
 import assert from 'node:assert/strict'
@@ -78,7 +79,6 @@ import { createReferralCode } from '@/server/actions/referral'
 import { acceptReferralClaim } from '@/server/actions/referral-claim'
 import type { ActionResult } from '@/server/actions/types'
 import { prisma } from '@/server/db'
-import { markMailboxProved } from '@/server/referral-claim'
 
 import { legacyRequestConsultation } from './fixtures/intake-legacy'
 import { asUser, signInAs, type HarnessUser } from './fixtures/harness-state'
@@ -92,6 +92,7 @@ import {
   disconnect,
   note,
   printTable,
+  provedSessionFor,
   redemptionCountOf,
   redemptionsForCode,
   resetDatabase,
@@ -176,43 +177,6 @@ async function stage(cap: number | null): Promise<string> {
 /** A distinct, previously unknown address. Fresh addresses are what make a cap matter. */
 function guestEmail(index: number): string {
   return `guest${index.toString().padStart(2, '0')}@example.org`
-}
-
-/**
- * The session a guest holds once they have clicked the magic link in their own
- * inbox.
- *
- * `markMailboxProved` is what `authConfig.events.signIn` calls; the
- * `HarnessUser` is what the `auth: 'SESSION'` actions read through the stubbed
- * `getSessionUser`. Both are needed, because since MCV-052 proving the mailbox
- * and accepting the invitation are two separate acts by the same person.
- */
-async function provedSessionFor(email: string): Promise<HarnessUser> {
-  const row = await prisma.user.findUniqueOrThrow({
-    where: { email },
-    select: {
-      id: true,
-      name: true,
-      email: true,
-      role: true,
-      clientProfile: { select: { id: true } },
-    },
-  })
-
-  await markMailboxProved(row.id)
-
-  return {
-    id: row.id,
-    name: row.name,
-    email: row.email,
-    image: null,
-    role: row.role,
-    isActive: true,
-    timeZone: 'America/Toronto',
-    locale: 'en-CA',
-    clientProfileId: row.clientProfile?.id ?? null,
-    staffProfileId: null,
-  }
 }
 
 /**
@@ -326,7 +290,7 @@ async function scenarioLegacy(): Promise<CapOutcome> {
 
 async function scenarioFixed(): Promise<CapOutcome> {
   section(
-    '2. the same twelve, enquiry then sign-in, against the shipped path, cap 5'
+    '2. the same twelve, enquiry then acceptance, against the shipped path, cap 5'
   )
 
   const codeId = await stage(CAP)
@@ -373,7 +337,7 @@ async function scenarioFixed(): Promise<CapOutcome> {
     assert.equal(claimed.counter, 0)
   })
 
-  check('but only five survive the twelve sign-ins', () => {
+  check('but only five survive the twelve acceptances', () => {
     assert.equal(outcome.redemptions, CAP)
   })
 
@@ -413,12 +377,22 @@ const SMALL_CAP = 2
  * A cap enforced by "read the counter, decide, then write" is not a cap; it is
  * a race with a comment on it. `createReferralRedemption`'s compare-and-swap is
  * conditioned on the exact value that was read, so a transaction whose counter
- * moved underneath it updates nothing, reports `raced`, and the settlement
- * writes no redemption — silently, because nobody is waiting on the answer: this
- * runs from an Auth.js event.
+ * moved underneath it updates nothing and reports `raced`, and the settlement
+ * writes no redemption.
+ *
+ * Somebody **is** waiting on that answer. This ran from an Auth.js `signIn`
+ * event when the sentence above was written, and a lost race could be dropped on
+ * the floor because no caller was listening. Since MCV-052 it runs from
+ * `acceptReferralClaim`, a `SESSION` action the household invoked by pressing
+ * *accept*, and every outcome is a named branch of `ReferralClaimAcceptanceView`
+ * that reaches them: a caller who loses this compare-and-swap is told
+ * `already-answered` rather than told nothing. That is why the assertions below
+ * read the *rows* the four acceptances left and not their return values — the
+ * cap is a property of the table — but a silent loss would now be a defect in
+ * its own right rather than the design.
  *
  * The contention moved with the write. Before MCV-050 the four racing callers
- * were four anonymous enquiries; now they are four first sign-ins, which is what
+ * were four anonymous enquiries; now they are four acceptances, which is what
  * four guests accepting the same invitation actually looks like.
  *
  * `Promise.all` here is genuinely concurrent: each call opens its own Prisma
@@ -426,7 +400,7 @@ const SMALL_CAP = 2
  * PostgreSQL backends contending for one `ReferralCode` row.
  */
 async function scenarioConcurrent(): Promise<void> {
-  section('3. four simultaneous first sign-ins against a cap of two')
+  section('3. four simultaneous acceptances against a cap of two')
 
   const codeId = await stage(SMALL_CAP)
 
@@ -575,9 +549,10 @@ function printReport(before: CapOutcome, after: CapOutcome): void {
     ],
     '  Both columns are the same database, the same twelve addresses and the\n' +
       '  same minted code. The pre-fix column wrote its redemptions from the\n' +
-      '  anonymous enquiry; the shipped column writes them at each guest’s first\n' +
-      '  sign-in. The difference the table measures is whether the number the cap\n' +
-      '  is compared against is a number anybody writes.'
+      '  anonymous enquiry; the shipped column writes them when each guest, signed\n' +
+      '  in and holding the mailbox, accepts the invitation. The difference the\n' +
+      '  table measures is whether the number the cap is compared against is a\n' +
+      '  number anybody writes.'
   )
 }
 

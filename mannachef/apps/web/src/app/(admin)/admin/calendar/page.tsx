@@ -4,10 +4,13 @@ import type { Metadata } from 'next'
 import Link from 'next/link'
 import { CalendarClock, CalendarOff, ShieldAlert } from 'lucide-react'
 
+import type { AppointmentView } from '@mannachef/api-contract'
 import {
   appointmentFilterSchema,
   DEFAULT_TIME_ZONE,
+  MINUTES_PER_DAY,
   type AppointmentFilterInput,
+  type ServiceType,
 } from '@mannachef/validators'
 
 import { Badge } from '@/components/ui/badge'
@@ -212,9 +215,7 @@ function addZonedDays(instant: Date, timeZone: string, days: number): Date {
 function zonedDayOfWeek(instant: Date, timeZone: string): number {
   const parts = zonedParts(instant, timeZone)
 
-  return new Date(
-    Date.UTC(parts.year, parts.month - 1, parts.day)
-  ).getUTCDay()
+  return new Date(Date.UTC(parts.year, parts.month - 1, parts.day)).getUTCDay()
 }
 
 /** `2026-02-16` for the calendar date `instant` falls on in `timeZone`. */
@@ -252,7 +253,11 @@ function rangeFor(
   const dayStart = startOfZonedDay(focused, timeZone)
 
   if (view === 'day') {
-    return { start: dayStart, end: addZonedDays(dayStart, timeZone, 1), days: 1 }
+    return {
+      start: dayStart,
+      end: addZonedDays(dayStart, timeZone, 1),
+      days: 1,
+    }
   }
 
   if (view === 'week') {
@@ -347,7 +352,176 @@ function describeRange(
 }
 
 // =============================================================================
-// 3. Failure copy
+// 3. Feeding the grid
+// =============================================================================
+
+/** What a block on the grid is called when the engagement has no other name. */
+const SERVICE_TITLES: Readonly<Record<ServiceType, string>> = {
+  IN_HOME_DINNER: 'Dinner at home',
+  MEAL_PREP: 'Meal preparation',
+  PRIVATE_EVENT: 'Private event',
+  COOKING_CLASS: 'Cooking class',
+  TASTING: 'Tasting',
+  CATERING: 'Catering',
+  CONSULTATION: 'Consultation',
+  DELIVERY_DROP_OFF: 'Delivery drop-off',
+}
+
+/**
+ * An `AppointmentView` in the shape the grid — and therefore the conflict
+ * engine — consumes.
+ *
+ * The five timing fields are passed through untouched: `CalendarAppointment`
+ * extends the engine's own `AppointmentLike`, so what the grid draws as
+ * occupied is computed by the same `occupiedInterval` the engine refuses
+ * bookings with. There is no second idea of what an engagement occupies.
+ */
+function toCalendarAppointment(
+  appointment: AppointmentView
+): CalendarAppointment {
+  const city = appointment.address?.city ?? null
+
+  return {
+    id: appointment.id,
+    status: appointment.status,
+    startsAt: new Date(appointment.startsAt),
+    endsAt: new Date(appointment.endsAt),
+    prepStartsAt:
+      appointment.prepStartsAt === null
+        ? null
+        : new Date(appointment.prepStartsAt),
+    travelBufferBeforeMinutes: appointment.travelBufferBeforeMinutes,
+    travelBufferAfterMinutes: appointment.travelBufferAfterMinutes,
+    title: SERVICE_TITLES[appointment.serviceType],
+    clientName: appointment.staffName,
+    locationLabel: city,
+    guestCount: appointment.guestCount,
+  }
+}
+
+/**
+ * The blackout rules, expanded into the instants they cover inside the range.
+ *
+ * `previewAvailabilityWindows` has already *subtracted* these — what it returns
+ * is the calendar with the blackouts taken out. The grid wants them back as
+ * bands in their own right, because "closed for a funeral" and "never open on a
+ * Monday" look identical as an absence and mean entirely different things.
+ *
+ * Each window is built from its rule's own zone, at whole wall-clock minutes,
+ * so a blackout written as 18:00–midnight is 18:00–midnight on the Sunday the
+ * clocks change as well as on every other Sunday.
+ */
+function expandBlackouts(
+  rules: readonly AvailabilityRuleRow[],
+  range: CalendarRange,
+  timeZone: string
+): readonly CalendarBlackout[] {
+  const blackouts: CalendarBlackout[] = []
+  const seen = new Set<string>()
+
+  for (let index = 0; index < range.days; index += 1) {
+    // Midday, so that reading the day's civil date in another zone cannot land
+    // on the neighbouring day for any offset the world actually uses.
+    const midday = new Date(
+      addZonedDays(range.start, timeZone, index).getTime() + MS_PER_DAY / 2
+    )
+
+    for (const rule of rules) {
+      if (!rule.isBlackout) {
+        continue
+      }
+
+      const local = zonedParts(midday, rule.timeZone)
+
+      if (rule.kind === 'RECURRING_WEEKLY') {
+        const weekday = new Date(
+          Date.UTC(local.year, local.month - 1, local.day)
+        ).getUTCDay()
+
+        if (rule.dayOfWeek !== weekday) {
+          continue
+        }
+      } else {
+        const on = rule.specificDate
+
+        if (
+          on === null ||
+          on.getUTCFullYear() !== local.year ||
+          on.getUTCMonth() + 1 !== local.month ||
+          on.getUTCDate() !== local.day
+        ) {
+          continue
+        }
+      }
+
+      const dayStart = zonedWallClockToInstant(
+        local.year,
+        local.month,
+        local.day,
+        0,
+        0,
+        rule.timeZone
+      )
+
+      if (
+        (rule.effectiveFrom !== null &&
+          dayStart.getTime() < rule.effectiveFrom.getTime()) ||
+        (rule.effectiveUntil !== null &&
+          dayStart.getTime() > rule.effectiveUntil.getTime())
+      ) {
+        continue
+      }
+
+      const start = zonedWallClockToInstant(
+        local.year,
+        local.month,
+        local.day,
+        Math.floor(rule.startMinute / 60),
+        rule.startMinute % 60,
+        rule.timeZone
+      )
+
+      // `1440` closes the window at midnight, which is the *next* civil day at
+      // 00:00. `Date.UTC` normalises the overflowing day for us.
+      const end = zonedWallClockToInstant(
+        local.year,
+        local.month,
+        local.day + (rule.endMinute === MINUTES_PER_DAY ? 1 : 0),
+        rule.endMinute === MINUTES_PER_DAY
+          ? 0
+          : Math.floor(rule.endMinute / 60),
+        rule.endMinute === MINUTES_PER_DAY ? 0 : rule.endMinute % 60,
+        rule.timeZone
+      )
+
+      if (
+        end.getTime() <= range.start.getTime() ||
+        start.getTime() >= range.end.getTime()
+      ) {
+        continue
+      }
+
+      const key = `${rule.id}:${String(start.getTime())}`
+
+      if (seen.has(key)) {
+        continue
+      }
+
+      seen.add(key)
+      blackouts.push({
+        id: key,
+        start,
+        end,
+        label: rule.reason ?? rule.note ?? 'Closed',
+      })
+    }
+  }
+
+  return blackouts
+}
+
+// =============================================================================
+// 4. Failure copy
 // =============================================================================
 
 interface FailureCopy {
@@ -565,7 +739,10 @@ export default async function CalendarPage({
     addZonedDays(focused, timeZone, -step),
     timeZone
   )
-  const nextKey = toZonedDateKey(addZonedDays(focused, timeZone, step), timeZone)
+  const nextKey = toZonedDateKey(
+    addZonedDays(focused, timeZone, step),
+    timeZone
+  )
   const chefParam = isMine ? undefined : chef.id
 
   // The composer's first guess: seven in the evening, on the later of the day
@@ -768,12 +945,10 @@ export default async function CalendarPage({
             <CalendarGrid
               view={view}
               timeZone={timeZone}
-              focusedDate={focusedKey}
-              rangeStart={range.start}
-              rangeEnd={range.end}
-              appointments={appointments.data.items}
+              anchorDate={focused}
+              appointments={appointments.data.items.map(toCalendarAppointment)}
               availabilityWindows={windowViews}
-              rules={ruleRows}
+              blackouts={expandBlackouts(ruleRows, range, timeZone)}
             />
           </>
         ) : (

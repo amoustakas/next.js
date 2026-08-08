@@ -44,6 +44,7 @@ import type {
   submitProspectIntake,
 } from '@/server/actions/intake'
 import { prisma } from '@/server/db'
+import { markMailboxProved } from '@/server/referral-claim'
 
 import { clearRateLimits } from './database'
 import { signInAs, type HarnessUser } from './harness-state'
@@ -287,6 +288,50 @@ export async function seedProgram(seed: SeedProgram): Promise<void> {
   })
 }
 
+/**
+ * The session a household holds once it has clicked the magic link in its own
+ * inbox, whoever it is.
+ *
+ * `markMailboxProved` is what `authConfig.events.signIn` calls; the
+ * `HarnessUser` is what the `auth: 'SESSION'` actions read through the stubbed
+ * `getSessionUser`. Both are needed, because since MCV-052 proving the mailbox
+ * and accepting an invitation are two separate acts by the same person.
+ *
+ * Deliberately indifferent to *which* household this is. A harness scenario
+ * that wanted to sign in "the victim" and one that wanted to sign in "the
+ * genuine newcomer" would otherwise reach for two different helpers, and the
+ * difference between the two scenarios would live in the harness's vocabulary
+ * rather than in the database. It is the row this reads back — placeholder or
+ * not, the very thing `isUnprovedPlaceholder` asks about — that differs.
+ */
+export async function provedSessionFor(email: string): Promise<HarnessUser> {
+  const row = await prisma.user.findUniqueOrThrow({
+    where: { email },
+    select: {
+      id: true,
+      name: true,
+      email: true,
+      role: true,
+      clientProfile: { select: { id: true } },
+    },
+  })
+
+  await markMailboxProved(row.id)
+
+  return {
+    id: row.id,
+    name: row.name,
+    email: row.email,
+    image: null,
+    role: row.role,
+    isActive: true,
+    timeZone: 'America/Toronto',
+    locale: 'en-CA',
+    clientProfileId: row.clientProfile?.id ?? null,
+    staffProfileId: null,
+  }
+}
+
 // =============================================================================
 // 5. Reading the world back
 // =============================================================================
@@ -357,7 +402,28 @@ export async function intakeSnapshot(
   return row
 }
 
-/** The columns a public form must never move on an account it did not open. */
+/**
+ * The columns a public form must never move on an account it did not open.
+ *
+ * ## Why the attribution columns are in here
+ *
+ * They were not, for three rounds, and that omission is MCV-054 finding 2. The
+ * anonymous intake path writes exactly **one** thing to a household it merely
+ * matched: `ClientProfile.claimedReferralCode` and its timestamp. Those were the
+ * two columns this select did not ask for, so an assertion phrased "not one
+ * column of the household's account moved" was true of every column except the
+ * two the attack moves — and deleting the guard in `attachReferralClaim` left
+ * `verify-intake-referral-hijack.ts` printing a pass with a stranger's code
+ * standing on a paying household's file.
+ *
+ * A snapshot whose select omits the column under attack is not a weaker
+ * assertion than none. It is worse than none, because it reads like one.
+ *
+ * `User.unclaimedSince` is here for the same reason at one remove: it is the
+ * column {@link ReferralClaimSnapshot}'s guard consults, so a change that made a
+ * real household look like a placeholder again would be a way back in, and
+ * nothing else in the snapshot would notice.
+ */
 export interface AccountSnapshot {
   readonly name: string | null
   readonly email: string | null
@@ -366,6 +432,11 @@ export interface AccountSnapshot {
   readonly status: string | null
   readonly displayName: string | null
   readonly source: string | null
+  /** @see referralClaimOf — the column the public path can write. */
+  readonly claimedReferralCode: string | null
+  readonly claimedReferralCodeAt: Date | null
+  /** Non-null only while the row is a placeholder nobody has signed into. */
+  readonly unclaimedSince: Date | null
 }
 
 export async function accountSnapshot(
@@ -378,8 +449,15 @@ export async function accountSnapshot(
       email: true,
       phone: true,
       role: true,
+      unclaimedSince: true,
       clientProfile: {
-        select: { status: true, displayName: true, source: true },
+        select: {
+          status: true,
+          displayName: true,
+          source: true,
+          claimedReferralCode: true,
+          claimedReferralCodeAt: true,
+        },
       },
     },
   })
@@ -392,6 +470,9 @@ export async function accountSnapshot(
     status: row.clientProfile?.status ?? null,
     displayName: row.clientProfile?.displayName ?? null,
     source: row.clientProfile?.source ?? null,
+    claimedReferralCode: row.clientProfile?.claimedReferralCode ?? null,
+    claimedReferralCodeAt: row.clientProfile?.claimedReferralCodeAt ?? null,
+    unclaimedSince: row.unclaimedSince,
   }
 }
 

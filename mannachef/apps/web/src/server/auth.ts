@@ -60,7 +60,13 @@
  *    so an anonymous enquiry could deny registration to any mailbox. The `signIn`
  *    **callback** adopts such a placeholder instead, and only such a placeholder.
  *  - The `signIn` **event** clears `unclaimedSince`, because the placeholder is
- *    now a real account.
+ *    now a real account. That clearing is bookkeeping in what it writes and not
+ *    in what it decides: `attachReferralClaim` in `actions/intake.ts` treats a
+ *    standing `unclaimedSince` as a licence for an anonymous form to write
+ *    `ClientProfile.claimedReferralCode`, so this event is what shuts the public
+ *    writer off once an account has a session behind it. See
+ *    `markMailboxProved` in `@/server/referral-claim` and the oracle argument in
+ *    `actions/referral-claim.ts` for what depends on it.
  *
  * ## What this file deliberately does *not* do (MCV-052)
  *

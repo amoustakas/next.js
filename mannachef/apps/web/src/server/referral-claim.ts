@@ -114,9 +114,22 @@
  *  - **Closed:** staking a money-bearing row against an address by typing it. No
  *    `ReferralRedemption`, no counter movement, no ledger entry is reachable
  *    without a session *and* an explicit acceptance.
- *  - **Closed:** touching a household that was already ours. A claim is recorded
- *    only on a profile the same intake call opened, so the public form still
- *    writes not one column — nor one row — of an existing household's.
+ *  - **Narrowed, and stated as narrowed:** touching a household that was already
+ *    ours. The bullet that stood here said a claim is recorded "only on a profile
+ *    the same intake call opened". That is not what `attachReferralClaim`
+ *    (`actions/intake.ts`) does. It admits the write for an identity of kind
+ *    `created`, *and* for a `matched` identity while `User.unclaimedSince` is
+ *    still stamped — a `ClientProfile` some **earlier** public call opened for an
+ *    address nobody has ever authenticated as. So two successive anonymous
+ *    consultation requests at one address both write these two columns, and the
+ *    second overwrites the first; that refresh is deliberate and is argued at
+ *    {@link recordReferralClaim}. What is actually closed is narrower and is the
+ *    thing worth having: a household that has ever proved its mailbox is
+ *    untouchable from the public path, because {@link markMailboxProved} clears
+ *    `unclaimedSince` at the first sign-in, and from that moment the public form
+ *    writes not one column — nor one row — of that household's. No column other
+ *    than these two is reachable from the public path at any point, and neither
+ *    of these two carries money.
  *  - **Closed:** an unbounded attribution. A claim lapses after
  *    {@link CLAIM_WINDOW_DAYS} and can be declined before that.
  *  - **Residual, and named rather than dismissed:** a sprayer can still cause a
@@ -224,15 +237,23 @@ function claimHasLapsed(claimedAt: Date, now: Date): boolean {
  * `consultationRequestSchema` / `prospectIntakeSchema` at the boundary. A column
  * is not a place to put arbitrary caller text.
  *
- * ## Why the caller must pass a profile it opened
+ * ## Which profiles the caller may pass
  *
  * `claimedReferralCode` is a column on a `ClientProfile`, and the rule at the
- * head of `actions/intake.ts` is that a public submission writes neither a row
- * nor a column of a household that was already ours. So the intake path calls
- * this only for an identity of kind `created`. That is not what makes the money
- * safe — nothing here is money — it is what keeps a stranger from scribbling on
- * a real client's file, which is a different promise and one this codebase has
- * broken before.
+ * head of `actions/intake.ts` bounds what a public submission may write. The
+ * bound this function relies on is enforced by its only caller,
+ * `attachReferralClaim`, and it is **not** "a profile this call opened". It is:
+ * an identity of kind `created`, *or* a `matched` identity whose `User` still
+ * carries `unclaimedSince` — a row the public path itself opened for an address
+ * nobody has ever authenticated as. {@link markMailboxProved} clears that stamp
+ * at the first sign-in, so every signed-in caller, every real client and every
+ * member is out of reach from here; their audited door is `redeemReferralCode`.
+ *
+ * State the bound that way round, because the weaker one is the true one and the
+ * stronger one was in this docblock for a round while the code did the weaker
+ * thing. What it buys is unchanged: it keeps a stranger from scribbling on a
+ * real client's file. That is not what makes the money safe — nothing here is
+ * money — it is a different promise, and one this codebase has broken before.
  *
  * ## There is no precedence rule, and there is deliberately no longer one
  *
@@ -258,10 +279,19 @@ function claimHasLapsed(claimedAt: Date, now: Date): boolean {
  * And because write order no longer decides anything, `attachReferralClaim` may
  * now safely reach this a second time: it admits a public submission for an
  * account still marked `User.unclaimedSince`, so a household that types their
- * own code after a sprayer typed theirs is *shown their own*. That refresh and
- * this column's lack of authority are only jointly safe. Do not give this column
- * authority again without also removing the refresh, and do not remove the
- * consent gate while the refresh stands.
+ * own code after a sprayer typed theirs can be *shown their own*.
+ *
+ * That remedy is partial, and saying so is the point of this paragraph. It is
+ * reachable through `requestConsultation` only. `submitProspectIntake` returns
+ * `withheld` for an anonymous caller whose identity is `matched`, several
+ * statements before its own call to `attachReferralClaim`, so a household that
+ * types their genuine code into the *questionnaire* form after a sprayer typed
+ * theirs is still shown the sprayer's. What they have then is the same thing
+ * every household has: decline it, and use `redeemReferralCode`.
+ *
+ * That refresh and this column's lack of authority are only jointly safe. Do not
+ * give this column authority again without also removing the refresh, and do not
+ * remove the consent gate while the refresh stands.
  */
 export async function recordReferralClaim(
   tx: Prisma.TransactionClient,
@@ -354,9 +384,23 @@ export type MailboxProofOutcome =
  * means "opened by the public intake path for an address nobody had proved"; a
  * verified magic link or completed OAuth exchange has now proved it, so the
  * placeholder becomes an ordinary account. Leaving the stamp on a real
- * household's row would be wrong twice over: `adoptUnclaimedAccount` reads it as
- * a licence to link an OAuth identity without the usual check, and the CRM reads
- * it as "this household never showed up".
+ * household's row would be wrong three times over: `adoptUnclaimedAccount` reads
+ * it as a licence to link an OAuth identity without the usual check, the CRM
+ * reads it as "this household never showed up", and — the one that is not
+ * bookkeeping — `attachReferralClaim` reads it as a licence for an anonymous
+ * form to overwrite `ClientProfile.claimedReferralCode` on a row that now has a
+ * session behind it.
+ *
+ * That last one is load-bearing and is argued at length in
+ * `actions/referral-claim.ts`. This call is what separates the anonymous writer
+ * of that column from the authenticated reader of it: once it has run, the
+ * account's claim can no longer be re-aimed from the public path, which is what
+ * bounds `readPendingReferralClaim` to one code per proved mailbox rather than
+ * one per public POST. It is a runtime fact, not a database constraint, and
+ * `authConfig.events.signIn` logs and swallows a failure here rather than
+ * failing the sign-in — so a failed call leaves that door open until the next
+ * sign-in re-runs this. See the oracle argument in `actions/referral-claim.ts`
+ * for what that window is worth to an attacker.
  *
  * `updateMany` guarded on the prior value, so a household's fiftieth sign-in
  * costs a `WHERE` and no `UPDATE`, and running twice is a no-op rather than a

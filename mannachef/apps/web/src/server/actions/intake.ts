@@ -24,7 +24,20 @@
  *
  * ## The rule the first two exist to obey
  *
- * **A public submission never writes to an existing household's record.**
+ * **A public submission never writes to the record of a household that has ever
+ * proved its mailbox — and never writes a row that carries money to any
+ * household at all.**
+ *
+ * Two clauses rather than one, because one clause was not true and this file
+ * spent an audit round asserting it. The only columns a public submission may
+ * write on a household it did not open this instant are
+ * `ClientProfile.claimedReferralCode` and `.claimedReferralCodeAt`, and only
+ * while that household's `User` still carries `unclaimedSince` — the stamp
+ * meaning "opened by this path for an address nobody has authenticated as",
+ * which `markMailboxProved` clears at the first sign-in and nothing ever
+ * restores. Every real client, every member and every signed-in caller is
+ * outside that set. The bullets below enumerate the whole surface, exception
+ * included.
  *
  * The prospect entry points are reachable by anyone with a browser, and the one
  * piece of identity they carry is an email address the sender has not proved
@@ -59,11 +72,24 @@
  *    therefore never open or touch a record belonging to a different address.
  *  - When the caller is anonymous and the address is already ours — an identity
  *    of kind `matched` — the existing `User` and `ClientProfile` are read and
- *    **not one of their columns is written**. No name, no phone, no source, no
- *    status. The enquiry is recorded *alongside* them as a
- *    `ConsultationInterview` and an `InteractionLog`, which is what the
- *    concierge needs and what a stranger cannot use to vandalise a real
- *    client's file.
+ *    **no column carrying the household's own account of itself is written**. No
+ *    name, no phone, no source, no status, ever. The enquiry is recorded
+ *    *alongside* them as a `ConsultationInterview` and an `InteractionLog`,
+ *    which is what the concierge needs and what a stranger cannot use to
+ *    vandalise a real client's file.
+ *
+ *    There is exactly one exception and it is enumerated rather than glossed,
+ *    because the previous version of this bullet said "not one of their columns
+ *    is written" and that was false. `ClientProfile.claimedReferralCode` and
+ *    `.claimedReferralCodeAt` **are** written for a `matched` identity, by
+ *    {@link attachReferralClaim}, for as long as the household's `User` still
+ *    carries `unclaimedSince` — that is, only on a row this same public path
+ *    opened for an address nobody has ever authenticated as, which is a set that
+ *    contains no real client, no member and no signed-in caller. `markMailboxProved`
+ *    empties it at the household's first sign-in and it never refills. Those two
+ *    columns are a suggestion shown back to the household and refused or accepted
+ *    by them; see {@link attachReferralClaim} for why the refresh exists and
+ *    `@/server/referral-claim` for why it carries no authority.
  *  - When the caller is anonymous and the identity is `matched`, **no
  *    `ClientIntakeForm` is written either** — not amended, and not created. It
  *    makes no difference whether the household has already returned its
@@ -76,11 +102,14 @@
  *    this call opened a moment ago. There is no `ReferralRedemption` on this
  *    path any more, under any discriminant. {@link attachReferralClaim} writes
  *    the code the prospect typed as a *string* on their own `ClientProfile`, and
- *    `@/server/referral-claim` turns that string into a redemption at the first
- *    sign-in that proves the mailbox, through the same canonical writer
- *    `redeemReferralCode` uses. It still takes the whole
- *    {@link ResolvedIdentity} rather than a bare id, because the *column* is
- *    still somebody's and a call site must not be able to forget whose.
+ *    that string becomes a redemption only when the signed-in household is shown
+ *    it and accepts it, through `acceptReferralClaim` and `settleAcceptedClaim`
+ *    in `@/server/referral-claim` — the same canonical writer `redeemReferralCode`
+ *    uses. **Not at the first sign-in**, which is what this bullet said until
+ *    MCV-052 and is the automatic settlement round four measured paying a
+ *    stranger 5000 cents off a victim's own organic sign-in. It still takes the
+ *    whole {@link ResolvedIdentity} rather than a bare id, because the *column*
+ *    is still somebody's and a call site must not be able to forget whose.
  *  - Row identifiers are withheld from anonymous callers — {@link
  *    ConsultationReceipt} and {@link ProspectIntakeReceipt} both carry `null`
  *    ids for them — and neither the response shape *nor its values* vary with
@@ -548,9 +577,15 @@ interface ProspectContact {
  * ## What this discriminant is, and what it is not (MCV-050)
  *
  * It is a statement about **rows**: whether this transaction inserted the `User`,
- * or found one. It is therefore the right question to ask before writing a
- * *column* — a stranger must not scribble on a household that was already ours,
- * and that is the promise the file docblock makes.
+ * or found one. It is therefore *a* question worth asking before writing a
+ * column, but it is not by itself the test, and describing it as the test is how
+ * two other docblocks in this repository came to assert a protection the code
+ * does not implement. `created` answers "did this call open the row"; it does
+ * not answer "has anybody ever authenticated as it", and the second is the one
+ * that decides whether a public caller may write. {@link attachReferralClaim} —
+ * the only public writer of a column on a `matched` household — asks both, and
+ * the second by reading `User.unclaimedSince` from the database rather than from
+ * this discriminant.
  *
  * It is **not** a statement about **consent**, and for one audit round it was
  * read as one. The note that used to sit on `created` said: *"Nobody else has
@@ -564,9 +599,13 @@ interface ProspectContact {
  * settled an invoice.
  *
  * So nothing that carries money branches on this any more. The question that
- * decides money is *"has this caller proved control of this mailbox?"*, it is
- * answered by a session and not by a row count, and it is asked in
- * `@/server/referral-claim` at the first authenticated sign-in.
+ * decides money is not even *"has this caller proved control of this mailbox?"*
+ * — proving a mailbox is not consenting to an attribution somebody else typed,
+ * and settling at the first authenticated sign-in, which is what this paragraph
+ * said until MCV-052, is exactly what paid a stranger 5000 cents off a victim's
+ * own organic sign-in. The question is *"has the household holding this mailbox
+ * said yes?"*, it is answered by `acceptReferralClaim`, and nothing on this path
+ * can answer it.
  *
  * `clientProfileId` accompanies both, because every caller needs it.
  */
@@ -702,7 +741,10 @@ async function resolveIdentity(
     // An `upsert` rather than a `create` purely so a profile opened by a
     // concurrent request is returned instead of raising a unique violation.
     // The update branch is empty on purpose: reaching it means the record was
-    // already ours, and this path does not rewrite one.
+    // already ours, and *this statement* rewrites nothing of it. That is a
+    // claim about this `upsert` and not about the enclosing action — see
+    // `attachReferralClaim`, which does write two columns of an already-ours
+    // profile while its `User` is still unproved.
     update: {},
     select: { id: true },
   })
@@ -1195,8 +1237,31 @@ async function logEnquiry(
  * have, and what first-writer-wins gave them, is no way to see their own code at
  * all.
  *
+ * ## How far the repair actually reaches
+ *
+ * Only through {@link requestConsultation}. This function admits the refresh,
+ * but {@link submitProspectIntake} never calls it for the case that needs it:
+ * an anonymous caller whose identity is `matched` hits the finding-D guard and
+ * returns `withheld` several statements earlier. So a household that types their
+ * genuine code into the *questionnaire* form, after a sprayer typed theirs into
+ * either form, is still shown the sprayer's code and not their own.
+ *
+ * That is a real limit and not an oversight to be quietly widened: relaxing the
+ * finding-D guard to let a referral column through would put a second write on
+ * the anonymous-`matched` path, and the reason that path writes nothing is
+ * MCV-040 finding D. The household's remedy is the one every household has —
+ * decline what they were shown, and redeem their own code through
+ * `redeemReferralCode`.
+ *
+ * ## The two changes are only jointly safe
+ *
  * Do not reintroduce this refresh if this column is ever given authority again.
- * The two changes are only jointly safe.
+ * And note the second thing the refresh depends on: because it admits a write to
+ * a `matched` household, the only thing that ever closes this door on an account
+ * is `markMailboxProved` clearing `unclaimedSince` at the first sign-in. That
+ * makes an Auth.js bookkeeping write load-bearing for the bound argued in
+ * `actions/referral-claim.ts` — the argument that `readPendingReferralClaim` is
+ * not a cheap oracle over the code space. Weakening either end weakens that.
  */
 async function attachReferralClaim(
   tx: Prisma.TransactionClient,
@@ -1299,8 +1364,17 @@ async function requireHouseholdAccess(
  * `unclaimedSince` — an `OnboardingFlow` moved to `CONSULTATION_SCHEDULED` when
  * the ladder permits it, a `ConsultationInterview` for the earliest time
  * offered, an `InteractionLog` recording the enquiry and the consent that came
- * with it, and — silently, on a profile this call opened — the referral code as
- * an *attribution string*.
+ * with it, and — silently — the referral code as an *attribution string*.
+ *
+ * That last write is **not** confined to a profile this call opened, and saying
+ * it was is the error this docblock has just had corrected. It lands on any
+ * profile whose `User` still carries `unclaimedSince`, which includes one an
+ * earlier anonymous enquiry opened, so a second request at the same address
+ * overwrites the string a first one left. This is the only action from which
+ * that refresh is reachable: {@link submitProspectIntake} withholds everything
+ * for an anonymous `matched` identity long before its own call to
+ * {@link attachReferralClaim}. See {@link attachReferralClaim} for why the
+ * refresh was wanted and what it costs.
  *
  * It writes **no `ReferralRedemption`**, which is the whole of MCV-050.
  * {@link attachReferralClaim} says why a public form may not, whatever it knows
@@ -1571,9 +1645,15 @@ export const submitProspectIntake = withAction(
         // The identity, not the id — see {@link attachReferralClaim}. Reaching
         // this statement does not by itself mean the identity is new: a
         // signed-in caller writes their own questionnaire here and is
-        // `matched`, and the refusal that keeps their referral on the audited
-        // path lives inside the callee rather than in a condition somebody has
-        // to remember.
+        // `matched`. What keeps their referral on the audited path is not the
+        // discriminant but `User.unclaimedSince`, which their own sign-in
+        // cleared, and the callee reads it from the database rather than
+        // trusting a condition somebody at this call site has to remember.
+        //
+        // An anonymous `matched` caller never arrives here at all: the
+        // finding-D guard above returned `withheld`. So the refresh that
+        // {@link attachReferralClaim} documents is reachable only through
+        // `requestConsultation`, not through this action.
         await attachReferralClaim(tx, identity, input.contact.referralCode, now)
       }
 

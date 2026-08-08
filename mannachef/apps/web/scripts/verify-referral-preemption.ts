@@ -67,6 +67,9 @@
  * |   | enquiry naming a different code  | received last, before it was proved   |
  * | 5 | genuine invitation, end to end   | a second sweep over settled rows      |
  * | 6 | four simultaneous acceptances    | concurrency against one claim token   |
+ * | 7 | the same spray, aged one day     | the age of the claim, and nothing     |
+ * |   | inside and one day outside the   | else — see §12                        |
+ * |   | window, and accepted both times  |                                       |
  *
  * ## What is real here
  *
@@ -79,6 +82,13 @@
  * the real rate limiter, against a real PostgreSQL. Only the session and the
  * three request-scoped Next.js modules are substituted, at module resolution, by
  * `scripts/action-resolver.mjs`.
+ *
+ * Two scenarios reach past the actions and write a column directly, and both say
+ * so where they do it: scenario 2 forges a claim back onto a profile to prove
+ * the tombstone outranks the column, and scenario 7 ages `claimedAt` with
+ * `backdateReferralClaim` so the lapse window can be crossed without waiting a
+ * month. Neither substitutes a decision — the clock stays the real one, and
+ * every verdict in both scenarios is the shipped action's own.
  *
  * Every scenario asserts on **rows**: redemptions, `ReferralCode.redemptionCount`,
  * `RewardBalance`, `RewardLedgerEntry`, the two claim columns on `ClientProfile`,
@@ -108,7 +118,7 @@ import {
   settleReferralRedemptions,
 } from '@/server/actions/referral'
 import { prisma } from '@/server/db'
-import { markMailboxProved } from '@/server/referral-claim'
+import { CLAIM_WINDOW_DAYS, markMailboxProved } from '@/server/referral-claim'
 
 import { asUser, signInAs, type HarnessUser } from './fixtures/harness-state'
 import {
@@ -117,6 +127,7 @@ import {
   PATRON,
   accountSnapshot,
   assertDisposableDatabase,
+  backdateReferralClaim,
   balanceCentsOf,
   check,
   checkCount,
@@ -1291,7 +1302,347 @@ async function scenarioIdempotence(): Promise<void> {
 }
 
 // =============================================================================
-// 12. The report
+// 12. Scenario 7 — the claim window, at both edges
+// =============================================================================
+
+/**
+ * The window the design promises, in days.
+ *
+ * ## Why this is a literal here and not an import
+ *
+ * `CLAIM_WINDOW_DAYS` is imported above, and it is used for exactly one thing:
+ * the tripwire in {@link scenarioClaimWindow} that pins it to this number. It is
+ * deliberately **not** used to compute the two ages below, and that is the whole
+ * reason this scenario exists at all.
+ *
+ * A harness that aged its claims to `CLAIM_WINDOW_DAYS ± 1` would move with the
+ * constant. Widen the window to 30_000 and such a harness would faithfully
+ * backdate one claim 29_999 days and another 30_001, observe the second lapse,
+ * and print a pass — while a two-year-old sprayed claim, the actual thing the
+ * bound exists to stop, settled for $50.00. The expectation has to be written
+ * down independently of the value under test or it is not an expectation, it is
+ * a restatement.
+ *
+ * Thirty is therefore the *promise*, transcribed from the `CLAIM_WINDOW_DAYS`
+ * docblock: "the ordinary gap between 'I asked for a consultation' and 'I signed
+ * in' is days, not seasons". Changing the shipped constant is allowed; changing
+ * it without coming here and changing this one too is not, because that is the
+ * change nobody would otherwise notice.
+ */
+const PROMISED_WINDOW_DAYS = 30
+
+/** One day inside the promise. Must still be acceptable, and must still pay. */
+const INSIDE_EDGE_DAYS = PROMISED_WINDOW_DAYS - 1
+
+/** One day outside it. Must be refused, consumed, and credit nothing. */
+const OUTSIDE_EDGE_DAYS = PROMISED_WINDOW_DAYS + 1
+
+const MILLISECONDS_PER_DAY = 24 * 60 * 60 * 1_000
+
+function daysAgo(days: number): Date {
+  return new Date(Date.now() - days * MILLISECONDS_PER_DAY)
+}
+
+/** Whole days between two instants, as an operator would say them. */
+function daysBetween(from: Date, to: Date): number {
+  return Math.round((to.getTime() - from.getTime()) / MILLISECONDS_PER_DAY)
+}
+
+/**
+ * Everything one aged claim did, gathered before anything is asserted.
+ *
+ * A value rather than a sequence of awaited assertions for the reason the module
+ * docblock gives: `check` does not await, so every row these scenarios turn on
+ * is read first and compared afterwards, synchronously.
+ */
+interface AgedClaimObservation {
+  readonly ageDays: number
+  /** The banner's standing: `acceptable`, `lapsed`, `unacceptable` — or `none`. */
+  readonly standing: string
+  /**
+   * `expiresAt − claimedAt` in whole days, as the household was *told* it.
+   *
+   * Asserted as well as the behaviour, because this is the number the consent
+   * surface renders. A window the server enforces at thirty days and states as
+   * eighty-two years would be a lie told to the one party the whole design puts
+   * in charge of the decision.
+   */
+  readonly windowShownDays: number
+  /** The acceptance's own verdict — `accepted`, `expired`, `refused`, … */
+  readonly acceptance: string
+  readonly redemptionsAtAcceptance: readonly HouseholdRedemption[]
+  readonly redemptionsAfterSweep: readonly HouseholdRedemption[]
+  readonly answers: readonly string[]
+  /** `true` if the claim columns still hold something after the acceptance. */
+  readonly claimStillStanding: boolean
+  readonly sprayedCounter: number
+  readonly swept: SweepRecord
+  readonly attackerBalanceCents: number
+  readonly attackerLedger: readonly LedgerRow[]
+}
+
+/**
+ * Everything the sprayer got out of one aged claim, in one shape.
+ *
+ * Deliberately not {@link MoneySnapshot}: that one asserts *nothing moved
+ * anywhere*, which is the right question for an attack scenario and the wrong
+ * one here, because the household on the inside edge legitimately moves half of
+ * it. This narrows to the sprayer's side of the ledger so that both edges can be
+ * asserted with the same `deepEqual` against two different constants — which is
+ * what lets the failure message name the amount rather than a field.
+ */
+interface SprayerTake {
+  readonly redemptions: number
+  readonly counter: number
+  readonly sweptExamined: number
+  readonly sweptRewarded: number
+  readonly creditedCents: number
+  readonly balanceCents: number
+  readonly ledgerEntries: number
+}
+
+/** What a lapsed claim must be worth: nothing, in every column at once. */
+const PAID_NOTHING: SprayerTake = {
+  redemptions: 0,
+  counter: 0,
+  sweptExamined: 0,
+  sweptRewarded: 0,
+  creditedCents: 0,
+  balanceCents: 0,
+  ledgerEntries: 0,
+}
+
+/** What a live claim the household accepted must be worth: the reward, once. */
+const PAID_ONE_REWARD: SprayerTake = {
+  redemptions: 1,
+  counter: 1,
+  sweptExamined: 1,
+  sweptRewarded: 1,
+  creditedCents: REWARD_CENTS,
+  balanceCents: REWARD_CENTS,
+  ledgerEntries: 1,
+}
+
+function sprayerTake(observation: AgedClaimObservation): SprayerTake {
+  return {
+    redemptions: observation.redemptionsAtAcceptance.length,
+    counter: observation.sprayedCounter,
+    sweptExamined: observation.swept.examined,
+    sweptRewarded: observation.swept.rewarded,
+    creditedCents: observation.swept.creditedCents,
+    balanceCents: observation.attackerBalanceCents,
+    ledgerEntries: observation.attackerLedger.length,
+  }
+}
+
+/**
+ * The whole attack again, with the claim aged `ageDays` days before the
+ * household is asked.
+ *
+ * The prefix is {@link sprayedAtAProvedHousehold}, unchanged and uncopied — the
+ * same anonymous POST, the same address, the same code, the same magic-link
+ * sign-in, the same paid invoice. Then one column is moved into the past and the
+ * household accepts.
+ *
+ * ## Why the column is moved and not the clock
+ *
+ * `backdateReferralClaim`'s own docblock says it: `settleAcceptedClaim` takes
+ * `now` as an argument, so a harness that passed itself a future date would be
+ * testing its own arithmetic rather than the server's. This moves the *data*
+ * into the past and lets the real default `now` — the one the shipped action
+ * computes — decide. Nothing in this scenario passes a clock to anything.
+ *
+ * The backdate lands after the invoice is paid, which is the arrangement that
+ * matters: the household's money arrives *after* the moment the invitation is
+ * dated to, so `ALREADY_A_CUSTOMER` has nothing to catch and
+ * `findQualifyingInvoice` has a qualifying invoice to find. The only reason the
+ * outside edge can fail to pay is its age.
+ */
+async function observeAgedClaim(
+  ageDays: number
+): Promise<AgedClaimObservation> {
+  const world = await sprayedAtAProvedHousehold()
+
+  await backdateReferralClaim(world.clientProfileId, daysAgo(ageDays))
+
+  const banner = await readBanner(world.household)
+  const accepted = await acceptAs(world.household, SPRAYED_CODE)
+
+  const redemptionsAtAcceptance = await redemptionsOf(world.household.id)
+  const claim = await referralClaimOf(world.clientProfileId)
+  const answers = await claimAnswersOf(world.clientProfileId)
+
+  const swept = await sweep()
+
+  const redemptionsAfterSweep = await redemptionsOf(world.household.id)
+  const sprayedCounter = await redemptionCountOf(world.sprayedCodeId)
+  const attackerBalanceCents = await balanceCentsOf(ATTACKER.id)
+  const attackerLedger = await ledgerOf(ATTACKER.id)
+
+  return {
+    ageDays,
+    standing: banner === null ? 'none' : banner.standing.kind,
+    windowShownDays:
+      banner === null ? -1 : daysBetween(banner.claimedAt, banner.expiresAt),
+    acceptance: accepted.ok ? accepted.data.kind : `error:${accepted.code}`,
+    redemptionsAtAcceptance,
+    redemptionsAfterSweep,
+    answers,
+    claimStillStanding: claim !== null,
+    sprayedCounter,
+    swept,
+    attackerBalanceCents,
+    attackerLedger,
+  }
+}
+
+/**
+ * `CLAIM_WINDOW_DAYS` is the only bound left on the residual this module's
+ * subject names as its principal risk — so it is measured, at both edges, by
+ * what it does to money.
+ *
+ * ## What was wrong before this scenario existed
+ *
+ * The bound shipped, and was documented as *the* mitigation for "claim a million
+ * mailboxes, wait however long it takes for any of them to become a customer,
+ * collect". No harness exercised it. `backdateReferralClaim` — the fixture
+ * written for precisely this, with the docblock explaining precisely this — had
+ * no caller anywhere in the repository.
+ *
+ * That is the shape `referral-claim.ts` condemns one layer in ("a named
+ * mitigation with no production caller is not a mitigation"), reproduced one
+ * layer out: a named mitigation with no *test* caller. Measured, it read exactly
+ * as it reads when it is broken. Widening the constant from 30 to 30_000 — 82
+ * years, `tsc`-clean, every symbol still used — let a two-year-old sprayed claim
+ * settle and credit the sprayer $50.00, and the whole suite still printed four
+ * of four green.
+ *
+ * ## Why both edges, and why they are one paragraph apart
+ *
+ * The two runs below share the prefix function, the address, the code, the
+ * invoice and the acceptance. **The only difference between them is two days of
+ * `claimedAt`.** A window that never expires and a window that expires
+ * immediately are both catastrophes — the first is the standing bet, the second
+ * quietly deletes the feature for every household that took a fortnight to
+ * answer the concierge — so a single-edge assertion could be satisfied by either
+ * failure. Asserting one edge accepts and the neighbouring edge refuses is what
+ * pins the bound to a number rather than to a direction.
+ *
+ * ## What the outside edge must show, beyond "not paid"
+ *
+ * Three separate things, because "the sprayer was not paid" is true of a great
+ * many broken servers:
+ *
+ *  - the acceptance answers `expired` and *consumes* the claim, so the prompt
+ *    does not survive to be clicked again tomorrow;
+ *  - a tombstone records the expiry, which is what makes the refusal outlive the
+ *    columns it cleared (scenario 2's property, at a different door);
+ *  - no redemption row, no counter movement, no ledger entry and no balance —
+ *    the {@link SprayerTake} shape, asserted in one `deepEqual`.
+ *
+ * ## The order of the assertions below is load-bearing
+ *
+ * `check` throws on the first failure, so whatever is asserted first is what a
+ * reader sees when this scenario goes red — and the point of the scenario is
+ * that they should see **money**, not a constant.
+ *
+ * So both runs are taken first, then their two {@link SprayerTake} verdicts are
+ * asserted side by side, then the narrative detail, and the equality against
+ * `CLAIM_WINDOW_DAYS` runs dead last. Every mutation of the bound therefore
+ * reports itself as an amount:
+ *
+ *  - widened to 30_000, this fails on `{creditedCents: 5000, balanceCents:
+ *    5000, …} !== {…: 0, …}` — the two-year-old sprayed claim settling;
+ *  - narrowed to 7, it fails on the neighbouring line, `{…: 0, …} !==
+ *    {creditedCents: 5000, …}` — the feature deleted for anybody who took a
+ *    fortnight to answer the concierge.
+ *
+ * Both are evidence. `30000 !== 30` is a spelling test, and a scenario that led
+ * with it would have taught the next reader exactly the wrong lesson about what
+ * this file is for.
+ */
+async function scenarioClaimWindow(): Promise<{
+  readonly inside: AgedClaimObservation
+  readonly outside: AgedClaimObservation
+}> {
+  section('7. the claim window — one day outside it, and one day inside')
+
+  // Both runs happen before anything is asserted, so that the two money
+  // verdicts can be adjacent. Each `observeAgedClaim` empties the tables it
+  // starts from, which is safe here because an observation is a value read out
+  // before the next run begins.
+  const outside = await observeAgedClaim(OUTSIDE_EDGE_DAYS)
+  const inside = await observeAgedClaim(INSIDE_EDGE_DAYS)
+
+  // --- the two money verdicts, first and side by side ------------------------
+  check(
+    `the sprayer takes nothing from a claim ${String(OUTSIDE_EDGE_DAYS)} days old`,
+    () => {
+      assert.deepEqual(sprayerTake(outside), PAID_NOTHING)
+    }
+  )
+
+  check(
+    `and takes the whole reward from one ${String(INSIDE_EDGE_DAYS)} days old`,
+    () => {
+      assert.deepEqual(sprayerTake(inside), PAID_ONE_REWARD)
+    }
+  )
+
+  // --- then how each of them got there --------------------------------------
+  check('the lapsed claim is shown as lapsed, against the stated window', () => {
+    assert.equal(outside.standing, 'lapsed')
+    assert.equal(outside.windowShownDays, PROMISED_WINDOW_DAYS)
+  })
+
+  check('accepting it answers expired, and consumes the claim anyway', () => {
+    assert.equal(outside.acceptance, 'expired')
+    assert.equal(outside.claimStillStanding, false)
+    assert.deepEqual(outside.answers, [
+      `referral-claim:expired:${SPRAYED_CODE}`,
+    ])
+    assert.deepEqual(outside.redemptionsAfterSweep, [])
+  })
+
+  check('the live claim is offered, against the same stated window', () => {
+    assert.equal(inside.standing, 'acceptable')
+    assert.equal(inside.windowShownDays, PROMISED_WINDOW_DAYS)
+  })
+
+  check('the acceptance settles, and the sweep carries it to REWARDED', () => {
+    assert.equal(inside.acceptance, 'accepted')
+    assert.equal(inside.claimStillStanding, false)
+    assert.deepEqual(inside.answers, [`referral-claim:accepted:${SPRAYED_CODE}`])
+    assert.deepEqual(inside.redemptionsAtAcceptance, [
+      { code: SPRAYED_CODE, status: 'PENDING' },
+    ])
+    assert.deepEqual(inside.redemptionsAfterSweep, [
+      { code: SPRAYED_CODE, status: 'REWARDED' },
+    ])
+    assert.deepEqual(inside.attackerLedger, ONE_REFERRAL_CREDIT)
+  })
+
+  // --- and only now, the constant -------------------------------------------
+  // Deliberately last. On its own this says the constant holds a number, not
+  // that the number does anything — and a bound that nothing exercises is the
+  // exact defect this scenario exists to close, so leading with it would
+  // reproduce that defect in the harness. It survives only because it makes the
+  // diagnosis one line long once the two runs above have already gone red.
+  check('the shipped window is the thirty days the design promises', () => {
+    assert.equal(CLAIM_WINDOW_DAYS, PROMISED_WINDOW_DAYS)
+  })
+
+  note(
+    `${money(inside.attackerBalanceCents)} at ${String(INSIDE_EDGE_DAYS)} days, ` +
+      `${money(outside.attackerBalanceCents)} at ${String(OUTSIDE_EDGE_DAYS)} days — ` +
+      'two days of claimedAt, and nothing else, between them.'
+  )
+
+  return { inside, outside }
+}
+
+// =============================================================================
+// 13. The report
 // =============================================================================
 
 function printReport(
@@ -1330,8 +1681,59 @@ function printReport(
   )
 }
 
+/**
+ * The window, as two columns that differ by two days of `claimedAt`.
+ *
+ * Printed separately from {@link printReport} because it answers a different
+ * question. That table asks what the *household* did; this one holds the
+ * household's behaviour fixed — it accepts in both columns — and varies only how
+ * long the invitation had been sitting there.
+ */
+function printClaimWindowReport(
+  inside: AgedClaimObservation,
+  outside: AgedClaimObservation
+): void {
+  printTable(
+    'One spray, one address, one code, accepted in both columns — ' +
+      `${String(OUTSIDE_EDGE_DAYS - INSIDE_EDGE_DAYS)} days apart`,
+    [
+      [
+        '',
+        `claimed ${String(inside.ageDays)} days ago`,
+        `claimed ${String(outside.ageDays)} days ago`,
+      ],
+      [
+        'window shown to the household',
+        `${String(inside.windowShownDays)} days`,
+        `${String(outside.windowShownDays)} days`,
+      ],
+      ['standing on the banner', inside.standing, outside.standing],
+      ['what the acceptance answered', inside.acceptance, outside.acceptance],
+      [
+        'redemptions written',
+        String(inside.redemptionsAtAcceptance.length),
+        String(outside.redemptionsAtAcceptance.length),
+      ],
+      [
+        'credited by the sweep',
+        money(inside.swept.creditedCents),
+        money(outside.swept.creditedCents),
+      ],
+      [
+        'sprayer’s balance',
+        money(inside.attackerBalanceCents),
+        money(outside.attackerBalanceCents),
+      ],
+    ],
+    '  CLAIM_WINDOW_DAYS is the only bound on "claim a million mailboxes, wait\n' +
+      '  however long it takes for any of them to become a customer, collect".\n' +
+      '  The right-hand column is what stops the waiting being free, and the\n' +
+      '  left-hand one is what stops the bound from having deleted the feature.'
+  )
+}
+
 // =============================================================================
-// 13. Entry point
+// 14. Entry point
 // =============================================================================
 
 async function main(): Promise<void> {
@@ -1352,7 +1754,10 @@ async function main(): Promise<void> {
 
   await scenarioIdempotence()
 
+  const window = await scenarioClaimWindow()
+
   printReport(noConsent, declined, accepted, legitimate)
+  printClaimWindowReport(window.inside, window.outside)
 
   console.log(`\nPASS — ${String(checkCount())} assertions, 0 failures.`)
 }

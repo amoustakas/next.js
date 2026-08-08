@@ -25,7 +25,11 @@
  *     `attachReferralClaim` returns before the writer for a `matched` identity,
  *     the sprayer was credited 5000 cents, and the genuine inviter was then
  *     locked out for ever by `ALREADY_REFERRED`. Theft plus denial,
- *     deterministic rather than racy.
+ *     deterministic rather than racy. Both halves are answered below — the
+ *     lockout by consent, the dropped write by `attachReferralClaim` now
+ *     admitting a `matched` identity while `User.unclaimedSince` stands. That
+ *     second repair reaches through `requestConsultation` only; see
+ *     `recordReferralClaim` in `@/server/referral-claim` for where it does not.
  *  2. **The unauthenticated pre-emption still paid.** One anonymous HTTP call,
  *     then the victim's own organic magic-link sign-in and payment, measured
  *     `examined=1 rewarded=1 creditedCents=5000`. The belief that MCV-050 had
@@ -77,20 +81,74 @@
  *
  * Disclosing even the name is a disclosure, so it is made only when the standing
  * claim is *currently acceptable by this caller* — exactly the state a completed
- * `redeemReferralCode` would have revealed anyway. Every refusal returns the
- * guest sentence from `REDEMPTION_REFUSALS`, which deliberately cannot tell "no
- * such code" from "withdrawn", and no name at all.
+ * `redeemReferralCode` would have revealed anyway. Every refusal returns no name
+ * at all, and the *sentence* it returns is the guest one from
+ * `REDEMPTION_REFUSALS`, which deliberately cannot tell "no such code" from
+ * "withdrawn".
  *
- * That still leaves the question of whether this read is an oracle over the code
- * space, and the answer is that the caller cannot choose what it reads. There is
- * no code parameter: the string comes from the caller's own
- * `ClientProfile.claimedReferralCode`, and the only writer of that column is
- * `attachReferralClaim`, which writes it once, for an identity of kind
- * `created` — a household that did not exist a statement earlier. So probing one
- * guessed code through this door costs one fresh address, one fresh account and
- * one proved mailbox, which is a far worse trade than the ten-an-hour
- * `redeemReferralCode` already offers. The rate limits below are defence in
- * depth on top of that bound, not the bound itself.
+ * The refusal *reason* is a different matter and is not obscured — see the next
+ * section, which does not claim it is.
+ *
+ * ## Is this read an oracle over the code space?
+ *
+ * It has to be asked, because a refusal here is more informative than the guest
+ * message suggests: `ReferralClaimRefusalView` carries the machine-readable
+ * `RedemptionRefusal`, and `EXPIRED`, `FULLY_REDEEMED`, `OWN_CODE` and
+ * `SAME_HOUSEHOLD` all distinguish a code that **exists** from one that does
+ * not. Only `UNKNOWN_CODE` collapses "no such code" with "withdrawn". So one
+ * successful read is worth roughly one probe, and the whole question is how many
+ * probes a caller can buy.
+ *
+ * The answer starts where it did: the caller cannot choose what it reads. There
+ * is no code parameter — the string comes from the caller's own
+ * `ClientProfile.claimedReferralCode`. What has to be corrected is the next
+ * clause. This docblock used to say the column's only writer is
+ * `attachReferralClaim`, "which writes it once, for an identity of kind
+ * `created` — a household that did not exist a statement earlier". That is false
+ * and was the load-bearing sentence of this whole argument.
+ * `attachReferralClaim` (`actions/intake.ts`) also admits the write for a
+ * `matched` identity while `User.unclaimedSince` is still stamped, so a second
+ * anonymous `requestConsultation` at the same address overwrites the column a
+ * first one wrote. The real bound is not **written once**; it is **written only
+ * while `unclaimedSince` stands**.
+ *
+ * Re-derived from that weaker property, the conclusion survives — but it now
+ * rests on a different fact, and one worth naming because it is not a database
+ * constraint:
+ *
+ *  - This action is `auth: 'SESSION'`, so a caller who reads has signed in.
+ *  - `authConfig.events.signIn` calls `markMailboxProved`, which clears
+ *    `unclaimedSince` at that first sign-in.
+ *  - `attachReferralClaim` refuses a `matched` identity once that stamp is gone.
+ *
+ * So for any account that can reach this door, the public writer was shut off at
+ * the moment the reader was opened. The code standing at first sign-in is the
+ * one and only code that account can ever read here. A second guess still costs
+ * a second address, a second account and a second proved mailbox — a far worse
+ * trade than the ten-an-hour `redeemReferralCode` already offers. The bound
+ * holds; it is just held by `markMailboxProved` rather than by the writer.
+ *
+ * ## The residual that the weaker property creates, named rather than dismissed
+ *
+ * `markMailboxProved` is called inside a `try`/`catch` in the `signIn` event and
+ * a failure is logged and swallowed, correctly — a bookkeeping write must not
+ * read to a household as a rejected sign-in. But a sign-in whose call failed
+ * leaves `unclaimedSince` standing on an account that now holds a session, and
+ * for as long as it stands the two ends are no longer separated: the attacker
+ * posts a fresh guess at their own address through `requestConsultation`, then
+ * re-reads it here, without a new mailbox each time.
+ *
+ * In that window the bound is the rate limits and nothing else — five public
+ * form posts an hour per IP (`PUBLIC_FORM_RATE_LIMIT`, `scope: 'ip'`, and IP is
+ * rotatable) against {@link CLAIM_READ_RATE_LIMIT}'s 120 reads an hour for the
+ * one signed-in user. So the sentence that used to close this paragraph —
+ * "the rate limits below are defence in depth on top of that bound, not the
+ * bound itself" — is wrong in exactly the case that matters. They are defence in
+ * depth on the ordinary path and they are the *whole* bound in the degenerate
+ * one. The window is one failed database write wide and self-heals at the next
+ * sign-in, which re-runs `markMailboxProved`; that is why this is a residual and
+ * not a finding. Making it structural would mean giving the claim columns a
+ * write condition the database enforces, which is a migration.
  *
  * ## What is recorded, and why a decline leaves a mark
  *
@@ -104,11 +162,21 @@
  * against the household, keyed by a deterministic `externalRef`. The row is the
  * CRM record an operator needs, and it is also a **tombstone**: a claim for a
  * code this household has already answered is never offered again and can never
- * be accepted, whatever the column later says. Today the public path cannot
- * rewrite that column at all — `attachReferralClaim` returns early for a
- * `matched` identity — but that is precisely the reasoning each of the previous
- * three rounds relied on and each of them turned out to be one step from a hole.
- * The tombstone does not depend on it.
+ * be accepted, whatever the column later says.
+ *
+ * That last clause is not hypothetical, and the version of this paragraph that
+ * said "today the public path cannot rewrite that column at all —
+ * `attachReferralClaim` returns early for a `matched` identity" was simply
+ * wrong. The public path *can* rewrite it: `attachReferralClaim` admits a
+ * `matched` identity while `User.unclaimedSince` stands. What makes the
+ * tombstone hold anyway is that it does not consult the column. A household that
+ * has answered for `HARVEST24` has an `InteractionLog` row saying so, and
+ * {@link readPendingReferralClaim} and {@link acceptReferralClaim} both check
+ * that row *before* the column and clear the column when the two disagree — so a
+ * resurrected claim is discarded on sight whether it arrived by a route that
+ * exists today or one that does not. The tombstone was written not to depend on
+ * the writer's guard, and that turned out to be the right decision rather than a
+ * cautious one.
  */
 
 import {
@@ -209,6 +277,15 @@ const referralClaimDecisionSchema = z
 
 /** Why a standing claim cannot be turned into a redemption right now. */
 export interface ReferralClaimRefusalView {
+  /**
+   * The machine-readable refusal, so a screen can branch on it.
+   *
+   * More informative than {@link message}: `EXPIRED`, `FULLY_REDEEMED`,
+   * `OWN_CODE` and `SAME_HOUSEHOLD` each imply the code exists. That is
+   * deliberate and it is what the module docblock's oracle section is bounding —
+   * the caller cannot choose which code is examined, so a reason is worth one
+   * probe and a probe costs a proved mailbox.
+   */
   readonly reason: RedemptionRefusal
   /** The guest sentence from `REDEMPTION_REFUSALS`. Never a Prisma message. */
   readonly message: string
@@ -276,7 +353,17 @@ export interface PendingReferralClaimView {
    */
   readonly expiresAt: Date
   readonly standing: ReferralClaimStanding
-  /** Where the claim came from. There is only one writer, and it is anonymous. */
+  /**
+   * Where the claim came from.
+   *
+   * A constant, and it is honest as one: `recordReferralClaim` is the only
+   * writer of a non-null value into that column, and it is reachable only
+   * through the two public intake actions. A *signed-in* caller of those actions
+   * never reaches it, because `resolveIdentity` reports `matched` for a session
+   * and `attachReferralClaim` then requires `User.unclaimedSince`, which that
+   * caller's own sign-in cleared. So every claim this view can describe was
+   * typed by somebody who had proved nothing.
+   */
   readonly provenance: 'public-enquiry-form'
   /** Nobody has verified that the party who typed this knows this household. */
   readonly assurance: 'unverified'

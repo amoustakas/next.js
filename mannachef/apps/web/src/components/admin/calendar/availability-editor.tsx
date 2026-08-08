@@ -30,7 +30,7 @@
 
 import * as React from 'react'
 import { useRouter } from 'next/navigation'
-import { useForm } from 'react-hook-form'
+import { useForm, type Resolver } from 'react-hook-form'
 import {
   CalendarClock,
   CalendarOff,
@@ -410,11 +410,6 @@ interface RuleFormValues {
   readonly note: string
 }
 
-/** What a valid submit yields: which action to call, and with what. */
-type RuleSubmitPayload =
-  | { readonly mode: 'create'; readonly rule: ChefAvailabilityRuleInput }
-  | { readonly mode: 'edit'; readonly update: ChefAvailabilityUpdateInput }
-
 const ruleFormShape = {
   availabilityId: z.string(),
   staffProfileId: z.string(),
@@ -498,31 +493,64 @@ function toRuleUpdatePayload(
 }
 
 /**
- * The dialog's two resolvers, both ending in a real validator.
+ * The dialog's two validators, each ending in a real schema.
  *
  * The projection is a `.transform()` in front of a `.pipe()`, so every issue
  * the schema raises still carries the schema's own path — `endMinute`,
- * `reason`, `specificDate` — and lands under the right input. The trailing
- * transform tags the parsed value with the branch, so one `handleSubmit` can
- * dispatch to three different actions without a second form.
+ * `reason`, `specificDate` — and lands under the right input rather than in a
+ * single lump above the form.
  *
- * A note on the create schema: `chefAvailabilityRuleSchema` is a union, and a
- * failing union reports one issue at the root rather than per field. That is
+ * A note on the create validator: `chefAvailabilityRuleSchema` is a union, and
+ * a failing union reports one issue at the root rather than per field. That is
  * what `<FormRootError>` above the buttons is for. The server re-validates and
  * answers with a proper `fieldErrors` map, which `useAction` puts back on the
  * individual inputs, so a rejected rule always ends up marked field by field.
  */
-const createRuleResolverSchema: z.ZodType<RuleSubmitPayload, RuleFormValues> = z
+const createRuleValidator: z.ZodType<
+  ChefAvailabilityRuleInput,
+  RuleFormValues
+> = z
   .object(ruleFormShape)
   .transform(toRulePayload)
   .pipe(chefAvailabilityRuleSchema)
-  .transform((rule) => ({ mode: 'create' as const, rule }))
 
-const editRuleResolverSchema: z.ZodType<RuleSubmitPayload, RuleFormValues> = z
+const editRuleValidator: z.ZodType<
+  ChefAvailabilityUpdateInput,
+  RuleFormValues
+> = z
   .object(ruleFormShape)
   .transform(toRuleUpdatePayload)
   .pipe(chefAvailabilityUpdateSchema)
-  .transform((update) => ({ mode: 'edit' as const, update }))
+
+/**
+ * The resolver for whichever validator applies, asked for **raw** values.
+ *
+ * `raw` is normally the wrong choice — parsed output is what makes a coerced
+ * field arrive at an action already narrowed. Here it is the right one, and for
+ * a specific reason: the dialog holds a superset of both branches of the rule
+ * schema, so the parsed output is a *different shape* from the fields on
+ * screen. Handing that back to React Hook Form would make `handleSubmit` and
+ * `form.setValue` disagree about what a field is called. Instead the dialog
+ * keeps its own shape end to end and applies {@link toRulePayload} /
+ * {@link toRuleUpdatePayload} at the moment of dispatch — the same two
+ * functions the validator above ran, so what is validated is what is sent.
+ *
+ * The cast narrows the validator's declared output to the shape `raw: true`
+ * actually returns. It changes no behaviour: with `raw` set, `zodResolver`
+ * resolves with the values it was given.
+ */
+function ruleResolverFor(
+  isEdit: boolean
+): Resolver<RuleFormValues, unknown, RuleFormValues> {
+  const validator = (isEdit
+    ? editRuleValidator
+    : createRuleValidator) as unknown as z.ZodType<
+    RuleFormValues,
+    RuleFormValues
+  >
+
+  return zodResolver(validator, { raw: true })
+}
 
 /** Which of the three lists a rule belongs in. */
 type RuleGroup = 'weekly' | 'override' | 'blackout'
@@ -613,7 +641,9 @@ export function AvailabilityEditor({
   rules,
 }: AvailabilityEditorProps): React.JSX.Element {
   const [editing, setEditing] = React.useState<
-    { readonly mode: 'create' } | { readonly mode: 'edit'; readonly rule: AvailabilityRuleRow } | null
+    | { readonly mode: 'create' }
+    | { readonly mode: 'edit'; readonly rule: AvailabilityRuleRow }
+    | null
   >(null)
   const [pendingDelete, setPendingDelete] =
     React.useState<AvailabilityRuleRow | null>(null)
@@ -670,7 +700,13 @@ export function AvailabilityEditor({
       ))}
 
       <RuleDialog
-        key={editing === null ? 'closed' : editing.mode === 'edit' ? editing.rule.id : 'new'}
+        key={
+          editing === null
+            ? 'closed'
+            : editing.mode === 'edit'
+              ? editing.rule.id
+              : 'new'
+        }
         state={editing}
         staffProfileId={staffProfileId}
         chefName={chefName}
@@ -902,10 +938,8 @@ function RuleDialog({
   const isEdit = state !== null && state.mode === 'edit'
   const rule = state !== null && state.mode === 'edit' ? state.rule : null
 
-  const form = useForm<RuleFormValues, unknown, RuleSubmitPayload>({
-    resolver: zodResolver(
-      isEdit ? editRuleResolverSchema : createRuleResolverSchema
-    ),
+  const form = useForm<RuleFormValues>({
+    resolver: ruleResolverFor(isEdit),
     defaultValues: defaultRuleValues(staffProfileId, calendarTimeZone, rule),
   })
 
@@ -918,15 +952,20 @@ function RuleDialog({
    * distinction. Choosing here rather than at three call sites keeps the
    * pending state, the live region and the field errors in one place.
    */
-  const saveRule = React.useCallback(async (payload: RuleSubmitPayload) => {
-    if (payload.mode === 'edit') {
-      return updateAvailabilityRule(payload.update)
-    }
+  const saveRule = React.useCallback(
+    async (values: RuleFormValues) => {
+      if (isEdit) {
+        return updateAvailabilityRule(toRuleUpdatePayload(values))
+      }
 
-    return payload.rule.isBlackout
-      ? createAvailabilityBlackout(payload.rule)
-      : createAvailabilityRule(payload.rule)
-  }, [])
+      const payload = toRulePayload(values)
+
+      return values.isBlackout
+        ? createAvailabilityBlackout(payload)
+        : createAvailabilityRule(payload)
+    },
+    [isEdit]
+  )
 
   const { execute, isPending, statusMessage, error } = useAction(saveRule, {
     form,
@@ -960,7 +999,10 @@ function RuleDialog({
           </DialogTitle>
           <DialogDescription>
             Times are wall-clock time in the zone named below — {chefName}
-            &rsquo;s own clock, not yours. {isEdit ? 'What sort of rule this is cannot be changed; remove it and write a new one instead.' : ''}
+            &rsquo;s own clock, not yours.{' '}
+            {isEdit
+              ? 'What sort of rule this is cannot be changed; remove it and write a new one instead.'
+              : ''}
           </DialogDescription>
         </DialogHeader>
 
@@ -1072,9 +1114,7 @@ function RuleDialog({
                         step={300}
                         value={minutesToTimeValue(field.value)}
                         onChange={(event) => {
-                          const minutes = timeValueToMinutes(
-                            event.target.value
-                          )
+                          const minutes = timeValueToMinutes(event.target.value)
 
                           if (minutes !== null) {
                             field.onChange(minutes)
@@ -1106,9 +1146,7 @@ function RuleDialog({
                         disabled={closesAtMidnight}
                         value={minutesToTimeValue(field.value)}
                         onChange={(event) => {
-                          const minutes = timeValueToMinutes(
-                            event.target.value
-                          )
+                          const minutes = timeValueToMinutes(event.target.value)
 
                           if (minutes !== null) {
                             field.onChange(minutes)
@@ -1194,9 +1232,7 @@ function RuleDialog({
               name="reason"
               render={({ field }) => (
                 <FormItem>
-                  <FormLabel>
-                    Reason{isBlackout ? '' : ' (optional)'}
-                  </FormLabel>
+                  <FormLabel>Reason{isBlackout ? '' : ' (optional)'}</FormLabel>
                   <FormControl>
                     <Textarea
                       rows={2}
@@ -1547,7 +1583,9 @@ function parseRefusal(failure: ActionFailure): ParsedRefusal {
   for (const [field, messages] of Object.entries(fieldErrors)) {
     for (const message of messages) {
       if (field === 'startsAt' && message.startsWith(ALTERNATIVE_PREFIX)) {
-        suggestions.push(message.slice(ALTERNATIVE_PREFIX.length).replace(/\.$/, ''))
+        suggestions.push(
+          message.slice(ALTERNATIVE_PREFIX.length).replace(/\.$/, '')
+        )
         continue
       }
 
@@ -1656,7 +1694,8 @@ async function findAlternatives(
 
   const occupiedStart =
     prepStart - timing.travelBufferBeforeMinutes * MS_PER_MINUTE
-  const occupiedEnd = serviceEnd + timing.travelBufferAfterMinutes * MS_PER_MINUTE
+  const occupiedEnd =
+    serviceEnd + timing.travelBufferAfterMinutes * MS_PER_MINUTE
   const durationMs = occupiedEnd - occupiedStart
 
   if (!Number.isFinite(durationMs) || durationMs <= 0) {
@@ -1665,7 +1704,8 @@ async function findAlternatives(
 
   const leadMs = serviceStart - occupiedStart
   const serviceMs = serviceEnd - serviceStart
-  const prepLeadMs = timing.prepStartsAt === null ? null : serviceStart - prepStart
+  const prepLeadMs =
+    timing.prepStartsAt === null ? null : serviceStart - prepStart
 
   const preview = await previewAvailabilityWindows({
     staffProfileId,
@@ -1805,7 +1845,8 @@ export function BookingComposer({
   )
 
   const refusal = React.useMemo(
-    () => (error === null || error.code !== 'CONFLICT' ? null : parseRefusal(error)),
+    () =>
+      error === null || error.code !== 'CONFLICT' ? null : parseRefusal(error),
     [error]
   )
 
@@ -1841,7 +1882,8 @@ export function BookingComposer({
       {
         startsAt,
         endsAt,
-        prepStartsAt: prep === null || Number.isNaN(prep.getTime()) ? null : prep,
+        prepStartsAt:
+          prep === null || Number.isNaN(prep.getTime()) ? null : prep,
         travelBufferBeforeMinutes: Number(
           values.travelBufferBeforeMinutes ?? 0
         ),
@@ -1897,8 +1939,8 @@ export function BookingComposer({
     <Card>
       <CardHeader>
         <CardTitle className="flex items-center gap-2">
-          <CalendarClock aria-hidden="true" className="size-4 text-stone" />
-          A new engagement
+          <CalendarClock aria-hidden="true" className="size-4 text-stone" />A
+          new engagement
         </CardTitle>
         <CardDescription>
           The calendar checks this against {chefName}&rsquo;s published
@@ -2412,8 +2454,7 @@ function RefusalPanel({
           <p className="font-sans text-xs leading-relaxed text-stone">
             Nothing in the published availability over the next week can take
             this engagement at its current length. Open a window in the editor
-            beside this, shorten the travel buffers, or choose a different
-            chef.
+            beside this, shorten the travel buffers, or choose a different chef.
           </p>
         ) : (
           <ul
