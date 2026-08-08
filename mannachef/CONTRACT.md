@@ -142,7 +142,18 @@ Rules:
 - Elevation is expressed with **borders + subtle inner light**, not heavy drop shadows.
 - Motion: 150–250 ms, `cubic-bezier(0.16, 1, 0.3, 1)`. Respect `prefers-reduced-motion`
   in every Framer Motion component.
-- Every interactive element has a visible `focus-visible` ring in champagne at 40% opacity.
+- Every interactive element has a visible `focus-visible` ring in **solid** champagne
+  (no alpha). An earlier revision of this contract specified 40% opacity; that was
+  wrong and shipped a product-wide defect. Champagne at 40% composites to roughly
+  2.65:1 against every surface token here, and WCAG SC 1.4.11 requires **3:1** for a
+  focus indicator. Alpha does not preserve a token's nominal contrast — always compute
+  the ratio against the composited value, on the actual parent surface.
+- **Contrast is a hard requirement, not a preference.** Any token used for text must
+  clear 4.5:1 against the surface it sits on (3:1 for text ≥24px or ≥19px bold).
+  `claret`, `terracotta` and `sage` at their base values do NOT clear it on these dark
+  surfaces and must be lightened before use as text — see the semantic ramp in
+  `globals.css`. This applies to tinted badge washes too: `bg-x/12 text-x` raises the
+  background luminance and lowers the ratio below the token's nominal figure.
 
 ---
 
