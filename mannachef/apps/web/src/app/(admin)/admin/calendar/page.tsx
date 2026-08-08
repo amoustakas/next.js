@@ -1,6 +1,6 @@
 // mannachef/apps/web/src/app/(admin)/admin/calendar/page.tsx
 import * as React from 'react'
-import type { Metadata } from 'next'
+import type { Metadata, Route } from 'next'
 import Link from 'next/link'
 import { CalendarClock, CalendarOff, ShieldAlert } from 'lucide-react'
 
@@ -598,7 +598,7 @@ function CalendarFailure({
   readonly code: string
   readonly message: string
   readonly subject: string
-  readonly retryHref: string
+  readonly retryHref: Route
 }): React.JSX.Element {
   const copy = calendarFailureCopy(code, subject)
 
@@ -626,7 +626,7 @@ function calendarHref(params: {
   readonly view: CalendarView
   readonly date: string
   readonly chef?: string | undefined
-}): string {
+}): Route {
   const search = new URLSearchParams({
     view: params.view,
     date: params.date,

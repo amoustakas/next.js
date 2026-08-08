@@ -28,6 +28,7 @@
  */
 
 import * as React from 'react'
+import type { Route } from 'next'
 import { useRouter } from 'next/navigation'
 import {
   AlertCircle,
@@ -349,7 +350,7 @@ export interface PipelineBoardProps {
   readonly columns: readonly PipelineColumnData[]
   readonly filters: PipelineFilterDraft
   /** Base pathname the filter bar navigates against. */
-  readonly basePath: string
+  readonly basePath: Route
 }
 
 interface PendingTransition {
@@ -387,7 +388,11 @@ export function PipelineBoard({ columns, filters, basePath }: PipelineBoardProps
     (next: PipelineFilterDraft) => {
       const query = buildPipelineQuery(next)
       startNavigation(() => {
-        router.push(query.length > 0 ? `${basePath}?${query}` : basePath)
+        // `basePath` is itself a checked `Route`; appending a query string
+        // keeps it one, but the template literal widens to `string`.
+        router.push(
+          (query.length > 0 ? `${basePath}?${query}` : basePath) as Route
+        )
       })
     },
     [basePath, router]

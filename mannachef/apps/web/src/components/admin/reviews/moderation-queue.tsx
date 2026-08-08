@@ -2,6 +2,7 @@
 'use client'
 
 import * as React from 'react'
+import type { Route } from 'next'
 import { useRouter } from 'next/navigation'
 import { useForm } from 'react-hook-form'
 import {
@@ -138,7 +139,7 @@ function buildQuery(next: {
   readonly verifiedOnly: boolean
   readonly page: number
   readonly pageSize: number
-}): string {
+}): Route {
   const params = new URLSearchParams()
   params.set('tab', next.tab)
 

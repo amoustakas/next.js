@@ -1,5 +1,7 @@
 // mannachef/apps/web/src/components/marketing/menu-filter-state.ts
 
+import type { Route } from 'next'
+
 import { MAX_FILTER_TAGS } from '@mannachef/validators'
 
 /**
@@ -142,7 +144,7 @@ export function parseMenuFilters(
  * The keys are emitted in a fixed order for the same reason: two identical
  * filters must produce one identical string.
  */
-export function menuFilterHref(state: MenuFilterState): string {
+export function menuFilterHref(state: MenuFilterState): Route {
   const params = new URLSearchParams()
 
   if (state.categorySlug !== null) {

@@ -8,7 +8,7 @@
     "build": "next build",
     "start": "next start",
     "lint": "eslint .",
-    "typecheck": "tsc --noEmit",
+    "typecheck": "next typegen && tsc --noEmit",
     "test": "node --experimental-strip-types --disable-warning=ExperimentalWarning --import ./scripts/register.mjs --test \"src/**/*.test.ts\"",
     "verify:referral": "node --experimental-strip-types --disable-warning=ExperimentalWarning --import ./scripts/stub-register.mjs ./scripts/verify-referral-privilege.ts",
     "verify:superadmin": "node --experimental-strip-types --disable-warning=ExperimentalWarning --import ./scripts/race-register.mjs ./scripts/verify-superadmin-race.ts",

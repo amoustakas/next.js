@@ -2,6 +2,7 @@
 'use client'
 
 import * as React from 'react'
+import type { Route } from 'next'
 import { useRouter } from 'next/navigation'
 import {
   CalendarPlus,
@@ -62,7 +63,8 @@ interface QuickAction {
   readonly id: string
   readonly label: string
   readonly description: string
-  readonly href: string
+  /** Typed as `Route` so a shortcut to a screen nobody built fails the build. */
+  readonly href: Route
   readonly icon: LucideIcon
   /** The role at or above which this shortcut may be offered. */
   readonly minRole: Role
@@ -174,7 +176,7 @@ export function CommandBar({
   }, [open, handleOpenChange])
 
   const navigateTo = React.useCallback(
-    (href: string) => {
+    (href: Route) => {
       handleOpenChange(false)
       router.push(href)
     },

@@ -1,6 +1,6 @@
 // mannachef/apps/web/src/app/(admin)/admin/intake/page.tsx
 import * as React from 'react'
-import type { Metadata } from 'next'
+import type { Metadata, Route } from 'next'
 import Link from 'next/link'
 import {
   AlertTriangle,
@@ -152,7 +152,7 @@ function buildQueueHref(params: {
   readonly page?: number
   readonly allergiesOnly?: boolean
   readonly intakeFormId?: string
-}): string {
+}): Route {
   const query = new URLSearchParams()
 
   if (params.page !== undefined && params.page > 1) {

@@ -39,6 +39,7 @@
  *    another's engagement, and no navigation decision can or should do that.
  */
 
+import type { Route } from 'next'
 import {
   CalendarDays,
   ClipboardList,
@@ -62,8 +63,14 @@ import { hasRoleAtLeast, type Role } from '@mannachef/validators'
 
 /** One destination in the business OS. */
 export interface AdminNavItem {
-  /** Absolute path. Also the identity used for prefix matching. */
-  readonly href: string
+  /**
+   * Absolute path. Also the identity used for prefix matching.
+   *
+   * Typed as `Route` rather than `string` so `next typegen` proves every
+   * destination on the rail actually exists — a nav entry pointing at a route
+   * nobody built is a compile error here rather than a 404 for an operator.
+   */
+  readonly href: Route
   /** The word on the rail. Kept to one or two. */
   readonly label: string
   /** One line, shown in the command bar and in the collapsed rail's tooltip. */
@@ -330,7 +337,7 @@ export function canReachPathname(role: Role, pathname: string): boolean {
 export interface AdminBreadcrumb {
   readonly label: string
   /** `null` for the final crumb, which is the page you are already on. */
-  readonly href: string | null
+  readonly href: Route | null
 }
 
 /** Matches a cuid/cuid2 well enough to know it is an id rather than a word. */
@@ -379,7 +386,9 @@ export function breadcrumbsForPathname(pathname: string): AdminBreadcrumb[] {
   let walked = consumed
 
   for (const segment of rest) {
-    walked = `${walked}/${segment}`
+    // Reconstructed from the live pathname, so it is a real route by
+    // construction; the template literal is what widens it to `string`.
+    walked = `${walked}/${segment}` as Route
     crumbs.push({ label: humanizeSegment(segment), href: walked })
   }
 

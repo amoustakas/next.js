@@ -1,6 +1,6 @@
 // mannachef/apps/web/src/app/(admin)/admin/invoices/page.tsx
 import * as React from 'react'
-import type { Metadata } from 'next'
+import type { Metadata, Route } from 'next'
 import Link from 'next/link'
 import { FileText, Receipt, ServerCrash, ShieldAlert } from 'lucide-react'
 
@@ -148,7 +148,7 @@ function parseInvoiceFilters(raw: RawSearchParams): InvoiceFilterInput {
 function buildInvoicesHref(
   raw: RawSearchParams,
   overrides: Readonly<Record<string, string>>
-): string {
+): Route {
   const params = new URLSearchParams()
 
   for (const [key, value] of Object.entries(raw)) {

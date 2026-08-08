@@ -23,6 +23,7 @@
  */
 
 import * as React from 'react'
+import type { Route } from 'next'
 import Link from 'next/link'
 import { usePathname } from 'next/navigation'
 import {
@@ -39,7 +40,8 @@ import {
 import { cn } from '@/lib/utils'
 
 interface PortalLink {
-  readonly href: string
+  /** Typed as `Route` so a destination nobody built fails the typecheck. */
+  readonly href: Route
   readonly label: string
   readonly icon: LucideIcon
 }

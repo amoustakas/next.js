@@ -32,6 +32,7 @@
  */
 
 import * as React from 'react'
+import type { Route } from 'next'
 import { usePathname, useRouter, useSearchParams } from 'next/navigation'
 import { Check, ImageOff, Search as SearchIcon } from 'lucide-react'
 import { toast } from 'sonner'
@@ -340,7 +341,12 @@ export function MenuTable({
       }
 
       const query = next.toString()
-      router.push(query.length > 0 ? `${pathname}?${query}` : pathname)
+      // `usePathname()` is typed `string`, so the typed-routes checker cannot
+      // narrow it. The value is the router's own current path, so it is a real
+      // route by construction.
+      router.push(
+        (query.length > 0 ? `${pathname}?${query}` : pathname) as Route
+      )
     },
     [pathname, rawSearchParams, router]
   )

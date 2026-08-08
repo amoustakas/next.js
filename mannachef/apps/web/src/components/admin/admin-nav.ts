@@ -28,12 +28,14 @@ import {
   UsersRound,
   UtensilsCrossed,
 } from 'lucide-react'
+import type { Route } from 'next'
 import { hasRoleAtLeast, type Role } from '@mannachef/validators'
 
 /** One destination in the business OS rail / command bar. */
 export interface AdminNavItem {
   readonly label: string
-  readonly href: string
+  /** Typed as `Route` so a destination nobody built fails the typecheck. */
+  readonly href: Route
   readonly icon: LucideIcon
   /** The role at or above which this destination may be reached. */
   readonly minimumRole: Role

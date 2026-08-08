@@ -1,7 +1,7 @@
 // mannachef/apps/web/src/app/(admin)/admin/page.tsx
 import { cache, Suspense, type ReactNode } from 'react'
 import Link from 'next/link'
-import type { Metadata } from 'next'
+import type { Metadata, Route } from 'next'
 import {
   AlertTriangle,
   ArrowUpRight,
@@ -126,7 +126,7 @@ function TileShell({
 }: {
   icon: LucideIcon
   label: string
-  href?: string
+  href?: Route
   cta?: string
   children: ReactNode
 }) {
